@@ -106,9 +106,12 @@
 /* File path buffer for current group */
 #define GROUP_FILE_PATH_LEN           128
 
-/* WiFi config — ★ 请修改为你的热点信息 */
-#define WIFI_SSID                "421"
-#define WIFI_PASSWORD            "1"
+/* WiFi 凭据改为从 Kconfig / sdkconfig 读取（CONFIG_WIFI_SSID / CONFIG_WIFI_PASSWORD），
+   不再硬编码在源码里。真实热点信息只放在本地 sdkconfig（已被 .gitignore 忽略，
+   不会随代码提交）。设置方法：idf.py menuconfig → "Project WiFi Configuration"，
+   或编辑项目根目录的 sdkconfig 后重新编译（保持占位符即可安全提交）。 */
+#define WIFI_SSID                CONFIG_WIFI_SSID
+#define WIFI_PASSWORD            CONFIG_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5
 
 #define WIFI_CONNECTED_BIT       BIT0

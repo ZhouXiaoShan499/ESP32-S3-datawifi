@@ -1,0 +1,21 @@
+menu "Project WiFi Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "YOUR_WIFI_SSID"
+        help
+            SSID of the WiFi access point this device connects to.
+            Set your real SSID via "idf.py menuconfig" or by editing the
+            local "sdkconfig" file (that file is git-ignored and NOT
+            committed). Keep placeholder values for any committed config.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "YOUR_WIFI_PASSWORD"
+        help
+            Password of the WiFi access point.
+            Set your real password via "idf.py menuconfig" or by editing
+            the local "sdkconfig" file (git-ignored, NOT committed).
+            Keep placeholder values for any committed config.
+
+endmenu
