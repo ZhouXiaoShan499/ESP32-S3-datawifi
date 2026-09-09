@@ -1,0 +1,14 @@
+CONFIG_IDF_TARGET="esp32s3"
+# 选择目标芯片为 ESP32-S3（影响可用外设、Kconfig 默认值、编译工具链等）
+
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# 使用 “single app large” 分区方案：给应用留更大的 Flash 空间，适合带 LVGL/BSP 的工程
+
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=4096
+# FATFS 通过 VFS 报告的块大小（用于 fstat 等接口，偏性能/兼容性参数）
+
+CONFIG_FATFS_LFN_HEAP=y
+# 启用 FATFS 长文件名（LFN），并使用堆内存作为 LFN 工作缓冲区
+
+# CONFIG_FATFS_LFN_NONE is not set
+# 关闭 “仅 8.3 短文件名” 模式（否则像 capture_123456.csv 这类文件名会因超长而无法创建）
