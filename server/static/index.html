@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3 IMU 实时监控</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --border: #dfe3e8;
+    --text: #1f2933;
+    --muted: #6b7280;
+    --ok: #1a7f37;
+    --warn: #b8860b;
+    --err: #cf222e;
+    --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+  header h1 { font-size: 20px; margin: 0; }
+  .poll-hint { color: var(--muted); font-size: 13px; }
+
+  .controls {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .controls label { font-size: 14px; color: var(--muted); }
+  select, button {
+    font: inherit; padding: 7px 12px; border: 1px solid var(--border);
+    border-radius: 6px; background: #fff; color: var(--text);
+  }
+  select:focus { outline: 2px solid var(--accent); }
+  button { cursor: pointer; border-color: var(--accent); color: var(--accent); background: #fff; }
+  button:hover { background: #eaf1ff; }
+  button:active { background: #dbe7ff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #lastPoll { margin-left: auto; color: var(--muted); font-size: 13px; }
+
+  .notice {
+    border: 1px dashed var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px;
+    text-align: center; color: var(--muted); background: var(--card);
+  }
+  .notice .big { display: block; font-size: 16px; color: var(--err); margin-bottom: 6px; font-weight: 600; }
+  .notice.no-device .big { color: var(--muted); }
+  .hidden { display: none !important; }
+
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    color: #fff; font-weight: 600; margin-left: 6px; vertical-align: 1px;
+  }
+  .badge.ok   { background: var(--ok); }
+  .badge.warn { background: var(--warn); }
+  .badge.err  { background: var(--err); }
+  .badge.off  { background: var(--muted); }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 18px;
+  }
+  .kv { font-size: 13px; }
+  .kv .k { display: block; color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+  .kv .v { font-size: 15px; font-weight: 600; word-break: break-all; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  caption { text-align: left; color: var(--muted); font-size: 12px; padding: 6px 0; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  tr:last-child td { border-bottom: none; }
+  .samples-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+  .err-msg { color: var(--err); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32-S3 IMU 传感数据 · 实时监控</h1>
+  <span class="poll-hint">自动轮询 · 每 2 秒</span>
+</header>
+
+<section class="controls">
+  <label for="deviceSel">设备</label>
+  <select id="deviceSel" disabled><option value="">加载中…</option></select>
+  <button id="refreshBtn" type="button" disabled>立即刷新</button>
+  <span id="lastPoll">—</span>
+</section>
+
+<section id="noDeviceMsg" class="notice no-device hidden">
+  <span class="big">尚未发现任何设备</span>
+  暂无设备上报数据。请确认板端已连接 WiFi 并开始采集，或检查服务端数据库。
+</section>
+
+<div id="statusBar"></div>
+
+<section id="noDataMsg" class="notice hidden">
+  <span class="big">该设备暂无数据（NO DATA）</span>
+  等待开发板首次上传……（若已上传过，请点击“立即刷新”查看）
+</section>
+
+<section id="dataCard" class="card hidden">
+  <h2 id="cardTitle">最新数据<span id="stateBadge"></span></h2>
+  <div class="grid">
+    <div class="kv"><span class="k">设备 ID</span><span class="v" id="vDevice">—</span></div>
+    <div class="kv"><span class="k">数据源 / 单位</span><span class="v" id="vSourceUnit">—</span></div>
+    <div class="kv"><span class="k">本批样本数</span><span class="v" id="vCount">—</span></div>
+    <div class="kv"><span class="k">批次起点时间 (ts_ms)</span><span class="v" id="vTsMs">—</span></div>
+    <div class="kv"><span class="k">服务端接收时间</span><span class="v" id="vReceived">—</span></div>
+    <div class="kv"><span class="k">来源 IP</span><span class="v" id="vIp">—</span></div>
+  </div>
+
+  <div class="samples-grid">
+    <div>
+      <table>
+        <caption>本批前 5 个样本</caption>
+        <thead><tr><th>t(ms)</th><th>ax</th><th>ay</th><th>az</th></tr></thead>
+        <tbody id="tbHead"></tbody>
+      </table>
+    </div>
+    <div>
+      <table>
+        <caption>本批末 5 个样本</caption>
+        <thead><tr><th>t(ms)</th><th>ax</th><th>ay</th><th>az</th></tr></thead>
+        <tbody id="tbTail"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<footer>
+  查询接口：/api/v1/devices · /api/v1/latest?device_id=… 　|　
+  <a href="/" target="_blank" rel="noopener">服务端首页</a>
+</footer>
+
+<script src="./app.js" defer></script>
+</body>
+</html>

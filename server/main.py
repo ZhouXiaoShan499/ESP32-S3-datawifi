@@ -36,11 +36,12 @@ from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-HOST = os.environ.get("SENSOR_HOST", "127.0.0.1")
+HOST = os.environ.get("SENSOR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("SENSOR_PORT", "8000"))
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +62,11 @@ app = FastAPI(
     description="接收并存储开发板 IMU 传感数据，提供查询接口。",
     version="1.0.0",
 )
+
+# 交互式实时监控页（server/static 下静态文件，托管于 http://host:port/ui/）
+_UI_DIR = os.path.join(_BASE_DIR, "static")
+os.makedirs(_UI_DIR, exist_ok=True)
+app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
 
 # sqlite 连接：多线程下为每个请求单独建连接，见 get_db()
 _db_init_lock = threading.Lock()
@@ -500,6 +506,8 @@ def index():
         "<title>传感数据接收平台</title></head><body>"
         f"{body}<hr><p>刷新本页查看最新。接口：/api/v1/health · "
         "/api/v1/devices · /api/v1/latest?device_id=...</p>"
+        "<p>实时监控面板（设备选择 / 自动刷新）："
+        '<a href="/ui/">/ui/</a></p>'
         "</body></html>"
     )
 
