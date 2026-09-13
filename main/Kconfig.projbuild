@@ -19,3 +19,24 @@ menu "Project WiFi Configuration"
             Keep placeholder values for any committed config.
 
 endmenu
+
+menu "Real-Sensor Upload Configuration"
+
+    config SENSOR_DEVICE_ID
+        string "Device ID"
+        default "esp32s3-eye-0001"
+        help
+            Unique identifier reported to the server in each upload batch.
+            Server stores it as uploads.device_id.
+
+    config SENSOR_SERVER_URL
+        string "Server upload URL"
+        default "http://192.168.1.100:8000/api/v1/upload"
+        help
+            Full URL of the FastAPI receiver running on the PC
+            (server/main.py). Use the PC's LAN IP (not 127.0.0.1) so the
+            board can reach it. Set via "idf.py menuconfig" or by editing
+            the local "sdkconfig" file (git-ignored, NOT committed).
+            Keep placeholder values for any committed config.
+
+endmenu

@@ -1,0 +1,5 @@
+# Web 平台接收服务依赖（Python 3.9+）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# 仅自测 test_receive.py 需要（FastAPI TestClient 底层走 httpx）
+httpx>=0.27

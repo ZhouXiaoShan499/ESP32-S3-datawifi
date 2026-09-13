@@ -5,6 +5,8 @@
  *  - QMA6100P accelerometer reading (from display_rotation)
  *  - Wi-Fi STA connection (from tcp_server)
  *  - SNTP time sync (from tcp_server)
+ *  - Real-sensor upload: every 1 s batches the m/s² accelerometer samples
+ *    as JSON and POSTs them to a local FastAPI receiver via esp_http_client
  *  - Button A start/stop SD card CSV logging (from data_capture_sim)
  *  - LVGL real-time display (from data_capture_sim)
  *  - 6-face calibration mode: +X, -X, +Y, -Y, +Z, -Z, 10s each
@@ -38,9 +40,13 @@
 #include "esp_wifi.h"
 #include "iot_button.h"
 #include "lvgl.h"
+#include "cJSON.h"
+#include "esp_http_client.h"
 #include "nvs_flash.h"
 #include "qma6100p.h"
 #include "sdmmc_cmd.h"
+#include <stdlib.h>
+#include "freertos/queue.h"
 
 /* ================================================================
  *  Common Config
@@ -55,6 +61,21 @@
 /* Data format config */
 #define GRAVITY_ACCEL            9.80665f /* 1 g = 9.80665 m/s² */
 #define DATA_LABEL               "raw"    /* Default label for data */
+
+/* Real-sensor upload config */
+#define UPLOAD_WINDOW_SIZE       100      /* 1 s at 100 Hz per POST batch */
+#define UPLOAD_QUEUE_LEN         2        /* bound pending batches (drop if full) */
+#define UPLOAD_SOURCE            "qma6100p"
+#define UPLOAD_UNIT              "m/s^2"
+
+/* Device identity / server URL come from Kconfig (see Kconfig.projbuild).
+ * Fallbacks keep the code compiling if the config header is stale. */
+#ifndef CONFIG_SENSOR_DEVICE_ID
+#define CONFIG_SENSOR_DEVICE_ID "esp32s3-eye-0001"
+#endif
+#ifndef CONFIG_SENSOR_SERVER_URL
+#define CONFIG_SENSOR_SERVER_URL "http://192.168.1.100:8000/api/v1/upload"
+#endif
 
 /* 6-face calibration config */
 #define FACE_DURATION_SEC        10       /* Each face: 10 seconds */
@@ -1905,6 +1926,142 @@ static void init_sdcard(void)
 }
 
 /* ================================================================
+ *  Real-Sensor WiFi Upload (esp_http_client)
+ *
+ *  sampler_task samples at 100 Hz. Every second (= UPLOAD_WINDOW_SIZE
+ *  samples) it snapshots the m/s² accelerometer values into a heap batch
+ *  and queues it. A lower-priority uploader_task then performs the blocking
+ *  HTTP POST, so the round-trip never stalls the drift-free 100 Hz loop.
+ *  The JSON body matches server/main.py POST /api/v1/upload.
+ * ================================================================ */
+typedef struct {
+    uint64_t ts_ms;    /* absolute epoch ms of this sample */
+    float    ax;       /* m/s² */
+    float    ay;       /* m/s² */
+    float    az;       /* m/s² */
+} upload_sample_t;
+
+typedef struct {
+    uint64_t ts_ms;                     /* epoch ms of first sample in window */
+    uint32_t count;                     /* samples in this batch */
+    upload_sample_t samples[UPLOAD_WINDOW_SIZE];
+} upload_batch_t;
+
+static QueueHandle_t s_upload_queue = NULL;    /* carries upload_batch_t* */
+static upload_sample_t s_upload_buf[UPLOAD_WINDOW_SIZE];
+static uint32_t s_upload_count = 0;
+
+/* Accumulate one sample; when a full second is collected, enqueue a copy. */
+static void upload_accumulate(uint64_t ts_ms, float ax, float ay, float az)
+{
+    if (s_upload_count >= UPLOAD_WINDOW_SIZE) {
+        return;    /* safety guard */
+    }
+
+    s_upload_buf[s_upload_count].ts_ms = ts_ms;
+    s_upload_buf[s_upload_count].ax    = ax;
+    s_upload_buf[s_upload_count].ay    = ay;
+    s_upload_buf[s_upload_count].az    = az;
+    s_upload_count++;
+
+    if (s_upload_count == UPLOAD_WINDOW_SIZE) {
+        /* One full second collected → hand a private copy to the uploader. */
+        upload_batch_t *batch = malloc(sizeof(upload_batch_t));
+        if (batch) {
+            batch->ts_ms = s_upload_buf[0].ts_ms;
+            batch->count = UPLOAD_WINDOW_SIZE;
+            memcpy(batch->samples, s_upload_buf, sizeof(s_upload_buf));
+            if (xQueueSend(s_upload_queue, &batch, 0) != pdTRUE) {
+                free(batch);   /* queue full → drop this batch, keep sampling */
+            }
+        }
+        s_upload_count = 0;
+    }
+}
+
+/* Build JSON and POST one batch to the configured FastAPI receiver. */
+static void upload_post_batch(upload_batch_t *batch)
+{
+    if (!batch || batch->count == 0) {
+        return;
+    }
+
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "[upload] skip: WiFi not connected");
+        return;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return;
+    }
+    cJSON_AddStringToObject(root, "device_id", CONFIG_SENSOR_DEVICE_ID);
+    cJSON_AddStringToObject(root, "source",    UPLOAD_SOURCE);
+    cJSON_AddStringToObject(root, "unit",      UPLOAD_UNIT);
+    cJSON_AddNumberToObject(root, "ts_ms",     (double)batch->ts_ms);
+
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "samples", arr);
+    for (uint32_t k = 0; k < batch->count; k++) {
+        const upload_sample_t *sm = &batch->samples[k];
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "i", (double)k);
+        cJSON_AddNumberToObject(o, "t_ms",
+            (double)((int64_t)sm->ts_ms - (int64_t)batch->ts_ms));
+        cJSON_AddNumberToObject(o, "ax", sm->ax);
+        cJSON_AddNumberToObject(o, "ay", sm->ay);
+        cJSON_AddNumberToObject(o, "az", sm->az);
+        cJSON_AddItemToArray(arr, o);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) {
+        return;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url         = CONFIG_SENSOR_SERVER_URL,
+        .method      = HTTP_METHOD_POST,
+        .timeout_ms  = 10000,
+        .buffer_size = 4096,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_err_t err = ESP_FAIL;
+    int status = 0;
+    if (client) {
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, payload, (int)strlen(payload));
+        err = esp_http_client_perform(client);
+        status = esp_http_client_get_status_code(client);
+        esp_http_client_cleanup(client);
+    }
+    free(payload);
+
+    if (err == ESP_OK && status >= 200 && status < 300) {
+        ESP_LOGI(TAG, "[upload] OK ts=%" PRIu64 " n=%" PRIu32 " http=%d",
+                 batch->ts_ms, batch->count, status);
+    } else {
+        ESP_LOGW(TAG, "[upload] FAIL ts=%" PRIu64 " n=%" PRIu32
+                      " err=%s http=%d", batch->ts_ms, batch->count,
+                      esp_err_to_name(err), status);
+    }
+}
+
+/* Uploader task: drain the queue and POST batches one at a time. */
+static void uploader_task(void *arg)
+{
+    (void)arg;
+    upload_batch_t *batch;
+    while (true) {
+        if (xQueueReceive(s_upload_queue, &batch, portMAX_DELAY) == pdTRUE) {
+            upload_post_batch(batch);
+            free(batch);
+        }
+    }
+}
+
+/* ================================================================
  *  Sampler Task — reads IMU + SNTP time → writes CSV
  * ================================================================ */
 static void sampler_task(void *arg)
@@ -1937,6 +2094,8 @@ static void sampler_task(void *arg)
                     struct timeval tv;
                     gettimeofday(&tv, NULL);
                     s_base_timestamp_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+                    /* New capture session: start a fresh 1 s upload window. */
+                    s_upload_count = 0;
                 }
                 
                 /* Generate strictly monotonic timestamp: base + sample_index * 10ms
@@ -2004,6 +2163,11 @@ static void sampler_task(void *arg)
                     s_latest_accel_y = ay_ms2;
                     s_latest_accel_z = az_ms2;
                     s_sample_count++;
+
+                    /* Feed this sample into the 1 s upload window (WiFi only). */
+                    if (s_wifi_connected) {
+                        upload_accumulate(timestamp_ms, ax_ms2, ay_ms2, az_ms2);
+                    }
                     
                     /* Accumulate calibration data if in calibration mode */
                     if (s_current_face != FACE_IDLE && s_current_face != FACE_COMPLETE) {
@@ -2620,6 +2784,11 @@ void app_main(void)
 
     /* 8. Start sampler task */
     xTaskCreate(sampler_task, "sampler_task", 6144, NULL, 5, NULL);
+
+    /* 9. Real-sensor upload queue + task (lower priority than sampler) */
+    s_upload_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_batch_t *));
+    assert(s_upload_queue != NULL);
+    xTaskCreate(uploader_task, "upload_task", 8192, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "System ready. Button A: start/stop normal IMU logging");
     ESP_LOGI(TAG, "Protocol toggle: Long-press Button B (2s) cycles through 5 protocols");

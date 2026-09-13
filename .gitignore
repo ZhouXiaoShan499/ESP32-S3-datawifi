@@ -20,3 +20,11 @@ Thumbs.db
 *.bin
 *.elf
 *.map
+
+# ---- Web/server runtime artifacts ----
+server/data/
+server/__pycache__/
+__pycache__/
+*.db
+*.sqlite3
+
