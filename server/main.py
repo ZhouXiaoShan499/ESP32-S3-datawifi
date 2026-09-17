@@ -23,9 +23,11 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
 
 运行（本地电脑）：
   python server/main.py          # 默认 http://127.0.0.1:8000
-可用环境变量覆盖：SENSOR_HOST / SENSOR_PORT / SENSOR_DB
+可用环境变量覆盖：SENSOR_HOST / SENSOR_PORT / SENSOR_DB / SENSOR_TOKEN
+（SENSOR_TOKEN 为空=不鉴权，仅局域网联调；非空=要求 Bearer Token）
 """
 
+import hmac
 import json
 import os
 import re
@@ -44,6 +46,9 @@ from fastapi.staticfiles import StaticFiles
 HOST = os.environ.get("SENSOR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("SENSOR_PORT", "8000"))
 
+# 可选上传鉴权：为空则不做校验（仅局域网联调）；非空则要求 Bearer Token
+SENSOR_TOKEN = os.environ.get("SENSOR_TOKEN", "").strip()
+
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_BASE_DIR, "data")
 DB_PATH = os.environ.get(
@@ -56,6 +61,11 @@ MAX_SOURCE_LEN = 32
 MAX_SAMPLES_PER_BATCH = 2000          # 单批最多样本数（板端约 100 Hz，分批上传）
 MAX_BODY_BYTES = 2 * 1024 * 1024      # 单次请求体上限 2 MB
 SUPPORTED_AXES = ("ax", "ay", "az")
+
+# /api/v1/window（实时波形）上限：
+#   300 s × 100 Hz = 30000 点，这里限 12000 点（约 120 s @100Hz）避免响应过大
+MAX_WINDOW_SECONDS = 300
+MAX_WINDOW_POINTS = 12000
 
 app = FastAPI(
     title="ESP32-S3 IMU Sensor Receiver",
@@ -108,6 +118,14 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_uploads_device_ts
                     ON uploads (device_id, ts_ms);
+                -- /api/v1/window 按服务端入库时间做范围过滤，需要这个索引，
+                -- 否则库变大后每 800ms 一次的轮询会退化成全表扫描。
+                CREATE INDEX IF NOT EXISTS idx_uploads_received
+                    ON uploads (received_at);
+                -- 带 device_id 过滤时的窗口查询走 (device_id, received_at) 范围扫描，
+                -- 代价只与「窗口内的批次数」有关，与历史总量无关。
+                CREATE INDEX IF NOT EXISTS idx_uploads_device_received
+                    ON uploads (device_id, received_at);
                 CREATE TABLE IF NOT EXISTS samples (
                     upload_id INTEGER NOT NULL REFERENCES uploads(id),
                     device_id TEXT NOT NULL,
@@ -260,6 +278,17 @@ def _fmt_time(epoch_s):
 @app.post("/api/v1/upload")
 async def upload(request: Request):
     """接收开发板上传的传感数据批次。"""
+    # 可选鉴权：仅当服务端设置了 SENSOR_TOKEN 时校验（恒定时比较，避免时序侧信道）
+    if SENSOR_TOKEN:
+        got = request.headers.get("authorization", "")
+        want = f"Bearer {SENSOR_TOKEN}"
+        if not hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8")):
+            return JSONResponse(
+                status_code=401,
+                content={"code": "UNAUTHORIZED", "ok": False,
+                         "error": "missing or invalid bearer token"},
+            )
+
     raw = await request.body()
     if len(raw) > MAX_BODY_BYTES:
         return JSONResponse(
@@ -426,6 +455,68 @@ def latest(request: Request):
         )
     finally:
         conn.close()
+
+
+@app.get("/api/v1/window")
+def window(request: Request):
+    """返回某设备最近 N 秒的**连续**样本序列，供监控页画实时波形。
+
+    与 /api/v1/latest 的区别：latest 只给最近 1 批的首末各 5 条，
+    这里跨批次拼出连续时间轴（abs_ms = 批次起点 ts_ms + 批内偏移 t_ms）。
+
+    说明：过滤条件用**服务端**接收时间 received_at 而非板端 ts_ms ——
+    板端 SNTP 失败时 ts_ms 可能不可信，但数据本身仍应展示。
+    """
+    device_id = (request.query_params.get("device_id") or "").strip()
+    try:
+        seconds = int(request.query_params.get("seconds", 30))
+    except (TypeError, ValueError):
+        seconds = 30
+    seconds = max(1, min(MAX_WINDOW_SECONDS, seconds))
+
+    conn = _connect()
+    try:
+        since = time.time() - seconds
+        # 用索引把「最近 N 秒」换算成主键下界：uploads.id 与 received_at 都是入库时
+        # 递增的，加上 id >= ? 可让 SQLite 走主键范围扫描，避免库变大后扫描该设备的
+        # 全部历史批次。received_at 条件仍然保留，查询语义不变，这里纯属性能优化。
+        row = conn.execute(
+            "SELECT MIN(id) FROM uploads WHERE received_at >= ?", (since,)
+        ).fetchone()
+        min_id = row[0] if row is not None else None
+
+        rows = []
+        if min_id is not None:
+            sql = (
+                "SELECT u.ts_ms + s.t_ms AS abs_ms, s.ax, s.ay, s.az"
+                " FROM samples s JOIN uploads u ON u.id = s.upload_id"
+                " WHERE u.received_at >= ? AND u.id >= ?"
+            )
+            args = [since, min_id]
+            if device_id:
+                sql += " AND u.device_id = ?"
+                args.append(device_id)
+            # 先按时间倒序取上限条，再在内存里翻正，保证拿到的是"最近"的 N 条
+            sql += " ORDER BY u.received_at DESC, u.id DESC, s.seq DESC LIMIT ?"
+            args.append(MAX_WINDOW_POINTS)
+            rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+    points = [
+        {"t": r["abs_ms"], "ax": r["ax"], "ay": r["ay"], "az": r["az"]}
+        for r in reversed(rows)
+    ]
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "device_id": device_id or None,
+            "seconds": seconds,
+            "count": len(points),
+            "points": points,
+        },
+    )
 
 
 def _fmt_epoch_ms(ts_ms):

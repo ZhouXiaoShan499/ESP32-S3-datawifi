@@ -78,6 +78,17 @@
   th:first-child, td:first-child { text-align: left; }
   tr:last-child td { border-bottom: none; }
   .samples-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+  .chart-box { margin-top: 18px; }
+  .chart-head {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    color: var(--muted); font-size: 12px; padding: 6px 0;
+  }
+  .chart-title { font-weight: 600; color: var(--text); font-size: 13px; }
+  .chart-count { margin-left: auto; }
+  #chart {
+    display: block; width: 100%; height: 240px;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  }
   .err-msg { color: var(--err); }
   footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
@@ -85,7 +96,7 @@
 <body>
 <header>
   <h1>ESP32-S3 IMU 传感数据 · 实时监控</h1>
-  <span class="poll-hint">自动轮询 · 每 2 秒</span>
+  <span class="poll-hint">自动轮询 · 每 0.8 秒</span>
 </header>
 
 <section class="controls">
@@ -134,10 +145,19 @@
       </table>
     </div>
   </div>
+
+  <div class="chart-box">
+    <div class="chart-head">
+      <span class="chart-title">最近 <span id="chartWin">30</span> s 加速度波形</span>
+      <span class="chart-unit" id="chartUnit">m/s^2</span>
+      <span class="chart-count" id="chartCount">0 点</span>
+    </div>
+    <canvas id="chart" width="900" height="240"></canvas>
+  </div>
 </section>
 
 <footer>
-  查询接口：/api/v1/devices · /api/v1/latest?device_id=… 　|　
+  查询接口：/api/v1/devices · /api/v1/latest?device_id=… · /api/v1/window?device_id=…&amp;seconds=30 　|　
   <a href="/" target="_blank" rel="noopener">服务端首页</a>
 </footer>
 
