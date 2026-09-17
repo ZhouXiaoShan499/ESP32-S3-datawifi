@@ -2,7 +2,7 @@ menu "Project WiFi Configuration"
 
     config WIFI_SSID
         string "WiFi SSID"
-        default "YOUR_WIFI_SSID"
+        default "431"
         help
             SSID of the WiFi access point this device connects to.
             Set your real SSID via "idf.py menuconfig" or by editing the
@@ -11,7 +11,7 @@ menu "Project WiFi Configuration"
 
     config WIFI_PASSWORD
         string "WiFi Password"
-        default "YOUR_WIFI_PASSWORD"
+        default "88888888"
         help
             Password of the WiFi access point.
             Set your real password via "idf.py menuconfig" or by editing
@@ -31,12 +31,24 @@ menu "Real-Sensor Upload Configuration"
 
     config SENSOR_SERVER_URL
         string "Server upload URL"
-        default "http://192.168.1.100:8000/api/v1/upload"
+        default "http://10.1.41.14:8000/api/v1/upload"
         help
             Full URL of the FastAPI receiver running on the PC
             (server/main.py). Use the PC's LAN IP (not 127.0.0.1) so the
             board can reach it. Set via "idf.py menuconfig" or by editing
             the local "sdkconfig" file (git-ignored, NOT committed).
+            Keep placeholder values for any committed config.
+
+    config SENSOR_TOKEN
+        string "Optional upload auth token"
+        default ""
+        help
+            Optional shared secret for POST /api/v1/upload. When non-empty the
+            board sends "Authorization: Bearer <token>" and the server
+            (started with a matching SENSOR_TOKEN env var) validates it.
+            Leave empty for LAN-only debugging (no auth).
+            Set your real token via "idf.py menuconfig" or by editing the
+            local "sdkconfig" file (git-ignored, NOT committed).
             Keep placeholder values for any committed config.
 
 endmenu

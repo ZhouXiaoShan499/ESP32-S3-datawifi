@@ -12,3 +12,24 @@ CONFIG_FATFS_LFN_HEAP=y
 
 # CONFIG_FATFS_LFN_NONE is not set
 # 关闭 “仅 8.3 短文件名” 模式（否则像 capture_123456.csv 这类文件名会因超长而无法创建）
+
+# ---- PSRAM: ESP32-S3-EYE has 8 MB octal PSRAM (per BSP README) ----
+# sdkconfig is gitignored, so this MUST live here to be reproducible.
+# Without PSRAM the LVGL 64 KiB pool + 240x240 double draw buffers exhaust
+# internal SRAM (~36 KiB free, largest contiguous internal block ~20 KiB).
+# That made WiFi fail to alloc timers and i2c fail to alloc command links,
+# which aborted IMU sampling and blocked all uploads.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+# Safety net: keep booting on internal RAM if PSRAM is ever not detected.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MEMTEST=y
+# >=16 KiB allocations prefer PSRAM (moves LVGL pool + draw buffers out).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Reserve 32 KiB internal for DMA-only users: i2c links, SDMMC, esp_timer.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
