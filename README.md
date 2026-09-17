@@ -38,7 +38,8 @@ data_capture_sim/
 │   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
 │
 ├── docs/
-│   └── crash_analysis_and_fix.md  # 崩溃分析与修复记录
+│   ├── crash_analysis_and_fix.md  # 崩溃分析与修复记录（LVGL 栈溢出）
+│   └── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
 │
 └── server/                        # 服务端（PC 运行，Python/FastAPI）
     ├── main.py                    # FastAPI 接收服务（校验 + SQLite 存储 + 查询接口）
@@ -60,9 +61,58 @@ QMA6100P (100Hz)      ──WiFi──▶  FastAPI (server/main.py)  ──HTTP�
 
 ---
 
-## 三、使用说明
+## 三、快速运行（端到端跑通）
 
-### 3.1 服务端（PC，先启动）
+> 前置条件：板端与电脑处于**同一 WiFi**；电脑已装 Python 3.9+；ESP-IDF ≥ 5.4。
+
+**① 电脑端 —— 启动服务端**
+
+```bash
+cd server
+pip install -r requirements.txt     # 首次
+python main.py                      # 监听 http://0.0.0.0:8000
+```
+
+记下电脑的局域网 IP：Windows `ipconfig`，找 IPv4（如 `192.168.1.100`）。
+
+**② 板端 —— 配置并烧录**
+
+```bash
+idf.py set-target esp32s3           # 首次
+idf.py menuconfig                   # 或直接改本地 sdkconfig
+idf.py build
+idf.py -p COMx flash monitor        # COMx = 实际串口
+```
+
+`menuconfig` → `Real-Sensor Upload Configuration` 需确认：
+
+| 配置项 | 值 |
+|--------|-----|
+| `SENSOR_SERVER_URL` | `http://<电脑IP>:8000/api/v1/upload`（不能填 `127.0.0.1`） |
+| `SENSOR_DEVICE_ID` | 本组唯一标识，如 `esp32s3-eye-0001` |
+| `SENSOR_TOKEN` | 留空（除非服务端也设了同样的值） |
+
+**③ 浏览器 —— 查看实时数据**
+
+- 实时监控面板：`http://<电脑IP>:8000/ui/`（每 2 s 自动刷新）
+- 极简首页：`http://<电脑IP>:8000/`
+- 健康汇总：`http://<电脑IP>:8000/api/v1/health`
+
+板端连上 WiFi 后每 1 s 上传 1 批（100 个采样点 @ 100 Hz）。
+
+**常见问题**
+
+- 页面打不开 → 放行 Windows 防火墙 `8000/TCP`（专用网络）。
+- 板端日志 `[upload] attempt x/3 failed ...` → 重试机制在跑；检查 `SENSOR_SERVER_URL` 是否为电脑局域网 IP、是否同网段。
+- 板端日志 `[upload] skip: WiFi not connected` → 板端 WiFi 未连上。
+
+> 详细说明见「四、使用说明」；无 VPS 时的部署步骤与课程验证对照见「七、本机替代 VPS 部署（备用路径）」。
+
+---
+
+## 四、使用说明
+
+### 4.1 服务端（PC，先启动）
 
 **环境要求**：Python 3.9+。
 
@@ -80,6 +130,7 @@ python main.py
 | `SENSOR_HOST` | `0.0.0.0` | 监听地址 |
 | `SENSOR_PORT` | `8000` | 监听端口 |
 | `SENSOR_DB` | `server/data/upload.db` | SQLite 数据库路径 |
+| `SENSOR_TOKEN` | 空（不鉴权） | 可选上传鉴权；非空则要求板端发送 `Authorization: Bearer <token>` |
 
 **自测**（可选，验证服务端正常）：
 
@@ -92,7 +143,7 @@ python e2e_server_check.py    # 真实 HTTP 端到端自检
 - 监控面板：`http://<PC_IP>:8000/ui/`
 - 极简首页：`http://<PC_IP>:8000/`
 
-### 3.2 板端（ESP32-S3-EYE）
+### 4.2 板端（ESP32-S3-EYE）
 
 **环境要求**：ESP-IDF ≥ 5.4（本工程使用 ESP Component Registry 托管依赖）。
 
@@ -106,6 +157,7 @@ python e2e_server_check.py    # 真实 HTTP 端到端自检
 | `WIFI_SSID` / `WIFI_PASSWORD` | 连接的 WiFi 名称与密码 |
 | `SENSOR_DEVICE_ID` | 设备唯一标识（默认 `esp32s3-eye-0001`） |
 | `SENSOR_SERVER_URL` | 服务端上传地址，如 `http://192.168.1.100:8000/api/v1/upload` |
+| `SENSOR_TOKEN` | 可选上传 Token（默认空=不鉴权）；须与服务端 `SENSOR_TOKEN` 一致 |
 
 > ⚠️ 真实 WiFi 凭据请只写入 `sdkconfig`，勿提交到 `Kconfig.projbuild`（那里保留占位符）。
 
@@ -148,7 +200,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 
 ---
 
-## 四、服务端 HTTP 接口
+## 五、服务端 HTTP 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -183,9 +235,51 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 
 ---
 
-## 五、注意事项
+## 六、注意事项
 
 1. **网络**：板端与 PC 须处于同一局域网；`SENSOR_SERVER_URL` 使用 PC 的局域网 IP，不能填 `127.0.0.1`。
 2. **凭据安全**：真实 WiFi 密码只写入 `sdkconfig`（已 gitignore），`Kconfig.projbuild` 只保留占位符。
-3. **上传策略**：板端上传为「尽力而为」，断网或慢网时会丢弃批次（无重试），这是为保证 100 Hz 采样不被网络阻塞的刻意取舍。
-4. **鉴权**：服务端上传接口暂无鉴权/限流，面向局域网联调；如需公网部署请自行补充。
+3. **上传策略**：板端上传带**有界重试**（最多 3 次，500 ms / 1 s 退避；4xx 表示服务端拒绝载荷、不再重试），RAM 队列 8 批（约 8 s）作为慢网缓冲。重试耗尽或队列满时仍会丢弃批次——这是为保证 100 Hz 采样不被网络阻塞的刻意取舍；**批量落盘重放 / 掉电续传未实现**。
+4. **鉴权**：默认不鉴权，面向局域网联调。如需公网部署：给服务端设 `SENSOR_TOKEN`，并同步配置板端 `SENSOR_TOKEN`，板端会带 `Authorization: Bearer <token>`，不匹配返回 `401`。注意本机直连仅为「备用路径」，正式公网部署仍需在 VPS 上补 TLS/反向代理与进程守护。
+5. **CORS**：监控页 `/ui/` 与接口同源，浏览器不会触发跨域；板端上传是 HTTP 客户端而非浏览器，与 CORS 无关，故未配置 CORS 中间件。
+
+---
+
+## 七、本机替代 VPS 部署（备用路径）
+
+没有 VPS 时，用本机 `server/main.py` 充当接收端，板端经**同一局域网**上传，浏览器访问本机页面查看：
+
+```
+ESP32-S3-EYE ──WiFi(局域网)──▶ 本机 PC:8000 (FastAPI + SQLite) ──▶ 浏览器 /ui/
+```
+
+步骤：
+
+1. 查本机局域网 IP（Windows `ipconfig` / Linux,macOS `ifconfig`），例如 `192.168.149.97`。
+2. 启动服务端（`SENSOR_HOST` 默认 `0.0.0.0`，局域网可达）：
+   ```bash
+   cd server && python main.py
+   ```
+3. 板端配置 `SENSOR_SERVER_URL = http://<本机IP>:8000/api/v1/upload`，`SENSOR_DEVICE_ID` 用本组唯一标识（`idf.py menuconfig` 或改本地 `sdkconfig`）。
+4. 烧录运行，浏览器打开 `http://<本机IP>:8000/ui/` 观察实时数据。
+
+> - Windows 防火墙若拦截，需放行 `8000/TCP`（专用网络）。
+> - **公网部署待补**：VPS 上的 TLS/反向代理、`SENSOR_TOKEN` 鉴权、systemd 等进程守护、限流。
+
+### 课程验证对照
+
+| 验证点 | 怎么看 |
+|---|---|
+| 真实传感源 | 板端 IMU 100 Hz 采集，`source=qma6100p` |
+| 单位与时间 | `/ui/` 显示 `m/s^2` 与板端 NTP(epoch ms) 时间；`/api/v1/latest` 可逐值核对 |
+| 数据来自本组设备 | 页面/查询接口显示 `device_id`，`/api/v1/devices` 只列本组标识 |
+| 页面未写死数值 | 所有数值均来自 SQLite 实时读库 |
+| 停采后保留旧时间、提示未更新 | 停止采集 30 s 后状态由「更新中」变「未更新」 |
+| 显示无数据 | 空库时首页/面板显示「无数据」 |
+
+### 自测
+
+```bash
+python server/test_receive.py    # 单元自测（临时库）：校验/入库/查询/可选鉴权
+python server/e2e_server_check.py # 真实 HTTP 端到端自检
+```

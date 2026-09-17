@@ -36,6 +36,7 @@
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "iot_button.h"
@@ -64,7 +65,9 @@
 
 /* Real-sensor upload config */
 #define UPLOAD_WINDOW_SIZE       100      /* 1 s at 100 Hz per POST batch */
-#define UPLOAD_QUEUE_LEN         2        /* bound pending batches (drop if full) */
+#define UPLOAD_QUEUE_LEN         8        /* RAM buffer for slow nets (drop if full) */
+#define UPLOAD_MAX_ATTEMPTS      3        /* bounded POST retries per batch */
+#define UPLOAD_RETRY_BACKOFF_MS  500      /* 500 ms, 1 s (doubles per retry) */
 #define UPLOAD_SOURCE            "qma6100p"
 #define UPLOAD_UNIT              "m/s^2"
 
@@ -74,7 +77,10 @@
 #define CONFIG_SENSOR_DEVICE_ID "esp32s3-eye-0001"
 #endif
 #ifndef CONFIG_SENSOR_SERVER_URL
-#define CONFIG_SENSOR_SERVER_URL "http://192.168.1.100:8000/api/v1/upload"
+#define CONFIG_SENSOR_SERVER_URL "http://10.1.41.14/api/v1/upload"
+#endif
+#ifndef CONFIG_SENSOR_TOKEN
+#define CONFIG_SENSOR_TOKEN ""    /* empty = no auth (LAN debugging only) */
 #endif
 
 /* 6-face calibration config */
@@ -145,6 +151,28 @@
 #define QMA6100P_I2C_PORT        (i2c_port_t)CONFIG_BSP_I2C_NUM
 
 static const char *TAG = "imu_logger";
+
+/* ------------------------------------------------------------------
+ * Heap diagnostics.
+ * PSRAM is disabled in sdkconfig (# CONFIG_SPIRAM is not set), so every
+ * allocation - LVGL pool, WiFi, SD, cJSON upload payload - competes for
+ * the same internal SRAM. When it runs dry the failures surface far from
+ * the cause (wifi "fail to alloc timer", i2c "command link malloc error"),
+ * so log the real numbers instead of guessing.
+ *   free      = total free heap (all capabilities)
+ *   min_free  = low-water mark since boot
+ *   int_largest = biggest single contiguous INTERNAL block; this is what
+ *                 WiFi/i2c actually need, and it shrinks with
+ *                 fragmentation long before "free" looks alarming.
+ * ------------------------------------------------------------------ */
+static void log_heap(const char *where)
+{
+    ESP_LOGI(TAG, "[HEAP] %-22s free=%6u  min_free=%6u  int_largest=%6u",
+             where,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
 
 /* ================================================================
  *  Global State
@@ -607,6 +635,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        log_heap("after wifi got ip");
     }
 }
 
@@ -1104,31 +1133,48 @@ static void reset_accel_filter(void)
 
 static esp_err_t start_collection_locked(void)
 {
-    if (!s_sd_ready) {
-        set_status_locked("Cannot start: SD card not mounted");
-        return ESP_ERR_INVALID_STATE;
-    }
-
     if (s_collecting) {
         return ESP_OK;
     }
 
-    /* Use unique filename based on uptime (milliseconds) for CSV */
-    uint64_t now_ms = esp_timer_get_time() / 1000;
-    snprintf(s_file_path, sizeof(s_file_path),
-             BSP_SD_MOUNT_POINT "/DATA_%013" PRIu64 ".csv", now_ms);
+    /* WiFi-only streaming: a missing / unmountable SD card is no longer fatal.
+     * Button A still starts a 100 Hz session that is pushed to the web platform
+     * over HTTP; the SD card merely becomes an optional CSV backup.
+     * NOTE: the protocol sessions (calibration / stand / stairs / bend / jump /
+     * fall) keep their own strict "!s_sd_ready" guard — they are unchanged. */
+    s_data_file = NULL;
+    s_file_path[0] = '\0';
 
-    s_data_file = fopen(s_file_path, "w");
-    if (!s_data_file) {
-        int err = errno;
-        s_file_path[0] = '\0';
-        set_status_locked("Open file failed (errno=%d)", err);
-        return ESP_FAIL;
+    if (s_sd_ready) {
+        /* Use unique filename based on uptime (milliseconds) for CSV */
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        snprintf(s_file_path, sizeof(s_file_path),
+                 BSP_SD_MOUNT_POINT "/DATA_%013" PRIu64 ".csv", now_ms);
+
+        s_data_file = fopen(s_file_path, "w");
+        if (s_data_file) {
+            /* CSV header - label first format */
+            fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
+            fflush(s_data_file);
+        } else {
+            /* Card present but unwritable: degrade to WiFi-only instead of
+             * refusing to start, so a flaky card never blocks live streaming. */
+            int err = errno;
+            ESP_LOGW(TAG, "fopen(%s) failed (errno=%d) -> WiFi-only streaming",
+                     s_file_path, err);
+            s_file_path[0] = '\0';
+            s_data_file = NULL;
+        }
+    } else {
+        ESP_LOGW(TAG, "SD card not ready -> WiFi-only streaming (no CSV backup)");
     }
 
-    /* CSV header - label first format */
-    fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
-    fflush(s_data_file);
+    if (!s_data_file && !s_wifi_connected) {
+        /* Samples would go nowhere right now. We still start (WiFi may come up
+         * later and upload_accumulate() is re-evaluated every sample), but make
+         * the situation obvious on screen and in the log. */
+        ESP_LOGW(TAG, "Neither SD nor WiFi available: samples will be dropped");
+    }
 
     s_latest_accel_x = 0;
     s_latest_accel_y = 0;
@@ -1149,7 +1195,8 @@ static esp_err_t start_collection_locked(void)
 
     /* Reset low-pass filter state for a clean new session */
     reset_accel_filter();
-    set_status_locked("Logging IMU data @ 100 Hz");
+    set_status_locked(s_data_file ? "Logging IMU data @ 100 Hz"
+                                  : "WiFi-only streaming @ 100 Hz");
 
     return ESP_OK;
 }
@@ -1851,7 +1898,11 @@ static void button_a_single_click_cb(void *arg, void *data)
     } else {
         esp_err_t ret = start_collection_locked();
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Logging started: %s", s_file_path);
+            if (s_data_file) {
+                ESP_LOGI(TAG, "Logging started: %s", s_file_path);
+            } else {
+                ESP_LOGI(TAG, "Streaming started (WiFi-only, no CSV file)");
+            }
         } else {
             ESP_LOGW(TAG, "Failed to start: %s", esp_err_to_name(ret));
         }
@@ -1979,7 +2030,9 @@ static void upload_accumulate(uint64_t ts_ms, float ax, float ay, float az)
     }
 }
 
-/* Build JSON and POST one batch to the configured FastAPI receiver. */
+/* Build JSON and POST one batch to the configured FastAPI receiver.
+ * Uses bounded retries so a transient WiFi/AP hiccup does not throw away a
+ * whole second of samples on the first failure. */
 static void upload_post_batch(upload_batch_t *batch)
 {
     if (!batch || batch->count == 0) {
@@ -1991,8 +2044,10 @@ static void upload_post_batch(upload_batch_t *batch)
         return;
     }
 
+    log_heap("upload: pre-cJSON");
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        ESP_LOGE(TAG, "[upload] cJSON_CreateObject failed - heap exhausted");
         return;
     }
     cJSON_AddStringToObject(root, "device_id", CONFIG_SENSOR_DEVICE_ID);
@@ -2017,35 +2072,71 @@ static void upload_post_batch(upload_batch_t *batch)
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!payload) {
+        ESP_LOGE(TAG, "[upload] cJSON_PrintUnformatted failed - heap exhausted");
         return;
     }
+    ESP_LOGI(TAG, "[upload] payload=%u B for n=%" PRIu32 " samples",
+             (unsigned)strlen(payload), batch->count);
+    log_heap("upload: post-cJSON");
 
-    esp_http_client_config_t cfg = {
-        .url         = CONFIG_SENSOR_SERVER_URL,
-        .method      = HTTP_METHOD_POST,
-        .timeout_ms  = 10000,
-        .buffer_size = 4096,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    /* Retrying here (not in uploader_task) keeps batches in order and does not
+     * touch the drift-free 100 Hz sampler. A 4xx means the server rejected the
+     * payload itself, so that is not retried; 5xx / network errors are. */
+    const bool has_token = (CONFIG_SENSOR_TOKEN[0] != '\0');
     esp_err_t err = ESP_FAIL;
     int status = 0;
-    if (client) {
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, payload, (int)strlen(payload));
-        err = esp_http_client_perform(client);
-        status = esp_http_client_get_status_code(client);
-        esp_http_client_cleanup(client);
-    }
-    free(payload);
 
-    if (err == ESP_OK && status >= 200 && status < 300) {
-        ESP_LOGI(TAG, "[upload] OK ts=%" PRIu64 " n=%" PRIu32 " http=%d",
-                 batch->ts_ms, batch->count, status);
-    } else {
-        ESP_LOGW(TAG, "[upload] FAIL ts=%" PRIu64 " n=%" PRIu32
-                      " err=%s http=%d", batch->ts_ms, batch->count,
-                      esp_err_to_name(err), status);
+    for (int attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+        esp_http_client_config_t cfg = {
+            .url         = CONFIG_SENSOR_SERVER_URL,
+            .method      = HTTP_METHOD_POST,
+            .timeout_ms  = 10000,
+            .buffer_size = 4096,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+        err = ESP_FAIL;
+        status = 0;
+        if (client) {
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            if (has_token) {
+                /* Optional shared-secret auth; server only enforces it when
+                 * SENSOR_TOKEN is configured there too. */
+                char auth[160];
+                snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_SENSOR_TOKEN);
+                esp_http_client_set_header(client, "Authorization", auth);
+            }
+            esp_http_client_set_post_field(client, payload, (int)strlen(payload));
+            err = esp_http_client_perform(client);
+            status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+        }
+
+        if (err == ESP_OK && status >= 200 && status < 300) {
+            ESP_LOGI(TAG, "[upload] OK ts=%" PRIu64 " n=%" PRIu32
+                          " http=%d attempt=%d",
+                     batch->ts_ms, batch->count, status, attempt);
+            free(payload);
+            return;
+        }
+
+        ESP_LOGW(TAG, "[upload] attempt %d/%d failed ts=%" PRIu64
+                      " n=%" PRIu32 " err=%s http=%d",
+                 attempt, UPLOAD_MAX_ATTEMPTS, batch->ts_ms, batch->count,
+                 esp_err_to_name(err), status);
+
+        if (status >= 400 && status < 500) {
+            ESP_LOGW(TAG, "[upload] payload rejected (http=%d), stop retrying",
+                     status);
+            break;
+        }
+        if (attempt < UPLOAD_MAX_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_BACKOFF_MS << (attempt - 1)));
+        }
     }
+
+    ESP_LOGW(TAG, "[upload] FAIL (gave up) ts=%" PRIu64 " n=%" PRIu32,
+             batch->ts_ms, batch->count);
+    free(payload);
 }
 
 /* Uploader task: drain the queue and POST batches one at a time. */
@@ -2076,8 +2167,22 @@ static void sampler_task(void *arg)
         /* Do NOT refresh UI in every loop — only when state changes or periodically.
          * This reduces jitter in the critical sampling path. */
 
+        /* Periodic heap telemetry (every 2 s). Deliberately OUTSIDE the state
+         * mutex so it never lengthens the 10 ms sampling critical section. */
+        static int64_t s_last_heap_log_us;
+        int64_t heap_now_us = esp_timer_get_time();
+        if (heap_now_us - s_last_heap_log_us >= 2000000) {
+            s_last_heap_log_us = heap_now_us;
+            log_heap(s_collecting ? "sampler(collecting)" : "sampler(idle)");
+        }
+
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            if (s_collecting && s_data_file) {
+            /* Sampling gate: s_collecting alone is enough now.
+             * s_data_file may legitimately be NULL in WiFi-only mode; the
+             * CSV write below is NULL-guarded. Protocol sessions always have
+             * a valid s_data_file because their start_* functions still
+             * require a mounted SD card. */
+            if (s_collecting) {
                 /* 1. Read accelerometer */
                 float ax, ay, az;
                 esp_err_t ret = app_accel_read(&ax, &ay, &az);
@@ -2144,20 +2249,29 @@ static void sampler_task(void *arg)
                     snprintf(label_buf, sizeof(label_buf), "%s", DATA_LABEL);
                 }
                 
-                /* Use jump_data_file if jump protocol is active, otherwise use data_file */
+                /* Use jump_data_file if jump protocol is active, otherwise use data_file.
+                 * write_file may be NULL in WiFi-only mode (no SD card). */
                 FILE *write_file = s_data_file;
                 if (s_jump_protocol_active && s_jump_data_file) {
                     write_file = s_jump_data_file;
                 }
-                
-                if (fprintf(write_file, "%s,%" PRIu64 ",%.4f,%.4f,%.4f\n",
-                            label_buf,
-                            timestamp_ms,
-                            ax_ms2, ay_ms2, az_ms2) < 0) {
+
+                bool csv_write_failed = false;
+                if (write_file) {
+                    if (fprintf(write_file, "%s,%" PRIu64 ",%.4f,%.4f,%.4f\n",
+                                label_buf,
+                                timestamp_ms,
+                                ax_ms2, ay_ms2, az_ms2) < 0) {
+                        csv_write_failed = true;
+                    } else {
+                        fflush(write_file);
+                    }
+                }
+
+                if (csv_write_failed) {
                     stop_collection_locked("Write failed");
                     ESP_LOGE(TAG, "CSV write failed");
                 } else {
-                    fflush(write_file);
                     /* Store raw m/s² values for UI (refresh_ui converts to mm/s² for display) */
                     s_latest_accel_x = ax_ms2;
                     s_latest_accel_y = ay_ms2;
@@ -2753,13 +2867,17 @@ void app_main(void)
 
     /* 2. LVGL UI */
     create_ui();
+    log_heap("after create_ui");
 
     /* 3. Wi-Fi + SNTP (blocking — waits for connection + time) */
     wifi_init_sta();         // blocks until connected or failed
+    log_heap("after wifi_init_sta");
     initialize_sntp();       // blocks until time synced or timeout
+    log_heap("after sntp");
 
     /* 4. SD card */
     init_sdcard();
+    log_heap("after init_sdcard");
 
     /* 5. Accelerometer */
     if (app_accel_init() == ESP_OK) {
@@ -2789,6 +2907,13 @@ void app_main(void)
     s_upload_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_batch_t *));
     assert(s_upload_queue != NULL);
     xTaskCreate(uploader_task, "upload_task", 8192, NULL, 4, NULL);
+
+    /* sizeof(upload_batch_t) x UPLOAD_QUEUE_LEN is the worst-case heap held
+     * by in-flight batches; log it so the cost is visible, not assumed. */
+    ESP_LOGI(TAG, "[HEAP] upload_batch_t=%u B x queue %d = %u B worst case",
+             (unsigned)sizeof(upload_batch_t), UPLOAD_QUEUE_LEN,
+             (unsigned)(sizeof(upload_batch_t) * UPLOAD_QUEUE_LEN));
+    log_heap("system ready");
 
     ESP_LOGI(TAG, "System ready. Button A: start/stop normal IMU logging");
     ESP_LOGI(TAG, "Protocol toggle: Long-press Button B (2s) cycles through 5 protocols");

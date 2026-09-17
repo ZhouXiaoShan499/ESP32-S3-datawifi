@@ -102,6 +102,32 @@ def main_run():
     assert "尚无传感数据" not in r.text
     print("[PASS] 上传后首页已展示设备真实数据（非 no-data）")
 
+    # 8) 可选鉴权：默认关闭；临时打开 main.SENSOR_TOKEN 验证 401 / 201 两条分支
+    main.SENSOR_TOKEN = "test-secret"
+    try:
+        no_auth = client.post("/api/v1/upload", json=make_payload(device="auth-dev"))
+        assert no_auth.status_code == 401, no_auth.status_code
+        assert no_auth.json()["code"] == "UNAUTHORIZED"
+        print("[PASS] 开启鉴权后无 Token 上传被拒 401")
+
+        wrong = client.post(
+            "/api/v1/upload",
+            json=make_payload(device="auth-dev"),
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert wrong.status_code == 401, wrong.status_code
+        print("[PASS] 错误 Token 被拒 401")
+
+        good = client.post(
+            "/api/v1/upload",
+            json=make_payload(device="auth-dev"),
+            headers={"Authorization": "Bearer test-secret"},
+        )
+        assert good.status_code == 201, good.status_code
+        print("[PASS] 正确 Token 上传成功 201")
+    finally:
+        main.SENSOR_TOKEN = ""
+
     print("\nALL CHECKS PASSED")
 
 
