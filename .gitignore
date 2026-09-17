@@ -21,8 +21,6 @@ Thumbs.db
 *.elf
 *.map
 build_log.txt
-_gitcheck.txt
-_g*.txt
 
 # ---- Web/server runtime artifacts ----
 server/data/
