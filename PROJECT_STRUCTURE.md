@@ -39,12 +39,14 @@ data_capture_sim/                  # 仓库根目录
 │   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
 │
 ├── docs/                          # 项目文档
-│   └── crash_analysis_and_fix.md  # 崩溃分析与修复记录
+│   ├── crash_analysis_and_fix.md  # 崩溃分析与修复记录（LVGL 栈溢出）
+│   └── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
     ├── main.py                    # FastAPI 接收服务（约 530 行）
     ├── requirements.txt           # 依赖（fastapi、uvicorn、httpx）
     ├── test_receive.py            # 本地联调自测脚本
+    ├── e2e_server_check.py        # 真实 HTTP 端到端自检脚本
     └── static/                    # 实时监控页面（静态资源）
         ├── index.html             # 页面结构 + 样式
         └── app.js                 # 轮询 + 渲染逻辑
@@ -64,7 +66,7 @@ data_capture_sim/                  # 仓库根目录
 |------|------|
 | `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。 |
 | `CMakeLists.txt` | 通过 `idf_component_register` 注册组件，声明 `SRCS "main.c"`，并 `REQUIRES` 大量依赖（`json`、`esp_http_client`、`esp_netif`、`esp_wifi`、`sdmmc`、`fatfs`、`esp_timer`、`esp_lcd` 等）。 |
-| `Kconfig.projbuild` | 定义 `menuconfig` 菜单：WiFi SSID/密码、设备 ID（`SENSOR_DEVICE_ID`）、上传 URL（`SENSOR_SERVER_URL`）。真实值通过本地 `sdkconfig` 配置，**不入库**。 |
+| `Kconfig.projbuild` | 定义 `menuconfig` 菜单：WiFi SSID/密码、设备 ID（`SENSOR_DEVICE_ID`）、上传 URL（`SENSOR_SERVER_URL`）、可选上传鉴权 Token（`SENSOR_TOKEN`）。真实值通过本地 `sdkconfig` 配置，**不入库**。 |
 | `idf_component.yml` | ESP 组件注册表依赖：`espressif/esp32_s3_eye`（BSP）、`espressif/qma6100p`（传感器驱动）、`idf >= 5.4`。 |
 
 ### 2.3 `server/` —— 服务端（FastAPI）
@@ -73,7 +75,8 @@ data_capture_sim/                  # 仓库根目录
 |------|------|
 | `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、托管监控页面。 |
 | `requirements.txt` | Python 依赖：`fastapi`、`uvicorn[standard]`、`httpx`（自测用）。 |
-| `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程。 |
+| `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支。 |
+| `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检。 |
 | `static/index.html` | 监控页面结构（设备下拉、数据卡片、样本表）。 |
 | `static/app.js` | 轮询逻辑（每 2s 拉取设备列表与最新数据并渲染）。 |
 
