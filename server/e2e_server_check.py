@@ -14,6 +14,13 @@ import time
 import urllib.error
 import urllib.request
 
+# 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _E2E_DB = os.path.join(_HERE, "data", "e2e_upload.db")
 if os.path.exists(_E2E_DB):

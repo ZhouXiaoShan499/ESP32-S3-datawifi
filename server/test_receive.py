@@ -10,6 +10,13 @@ import os
 import sys
 import time
 
+# 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 先指到临时库，再导入 main（main 在 import 时读取 SENSOR_DB）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TEST_DB = os.path.join(_HERE, "data", "test_upload.db")
