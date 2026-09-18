@@ -291,6 +291,43 @@ def main_run():
         assert r.status_code == 400 and r.json()["code"] == "INVALID", (bad_body, r.text)
     print("[PASS] 任务参数越界/缺失均被 400 拒绝")
 
+    # 18) /latest?trigger= 过滤（监控页「手动 vs 周期」对照区用）
+    lj = client.get("/api/v1/latest",
+                    params={"device_id": task_dev, "trigger": "manual"}).json()
+    assert lj["found"] is True and lj["upload"]["trigger"] == "manual"
+    assert lj["upload"]["request_id"] == rid
+    pj = client.get("/api/v1/latest",
+                    params={"device_id": task_dev, "trigger": "periodic"}).json()
+    assert pj["found"] is False, pj      # 该设备只有手动批次
+    pj2 = client.get("/api/v1/latest",
+                     params={"device_id": "esp32s3-eye-periodic",
+                             "trigger": "periodic"}).json()
+    assert pj2["found"] is True and pj2["upload"]["trigger"] == "periodic"
+    r = client.get("/api/v1/latest",
+                   params={"device_id": task_dev, "trigger": "auto"})
+    assert r.status_code == 400 and r.json()["code"] == "INVALID", r.text
+    print("[PASS] /latest?trigger=manual|periodic 过滤生效；非法 trigger 400")
+
+    # 19) /tasks 历史列表：字段齐全、按创建时间倒序、limit 夹取、device_id 过滤
+    tj = client.get("/api/v1/tasks",
+                    params={"device_id": task_dev, "limit": 20}).json()
+    ts = tj["tasks"]
+    assert tj["count"] == len(ts) >= 5, tj["count"]
+    assert all(t["device_id"] == task_dev for t in ts)
+    assert [t["created_at"] for t in ts] == sorted(
+        (t["created_at"] for t in ts), reverse=True), "任务列表未按创建时间倒序"
+    assert all(t["created_at_str"] and "status_cn" in t and "terminal" in t
+               for t in ts), "列表缺少 Web 需要的展示字段"
+    done = [t for t in ts if t["status"] == "completed"]
+    assert done and done[0]["upload_id"] == gj["upload"]["id"], \
+        "历史里的 upload_id 与任务详情不一致"
+    assert len(client.get("/api/v1/tasks",
+                          params={"device_id": task_dev, "limit": 2}).json()["tasks"]) == 2
+    assert len(client.get("/api/v1/tasks",
+                          params={"device_id": task_dev, "limit": 0}).json()["tasks"]) == 1
+    print("[PASS] /tasks?limit= 历史 %d 条：倒序、字段齐全、upload_id=%s 与详情一致、"
+          "limit 夹取到 1..100" % (len(ts), done[0]["upload_id"]))
+
     print("\nALL CHECKS PASSED")
 
 

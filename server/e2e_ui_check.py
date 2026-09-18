@@ -3,10 +3,14 @@
 Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的无头模式）。
 
 流程：临时库 + 真实 uvicorn 服务 → 通过 HTTP 造出 periodic / manual 两类数据 →
-无头浏览器打开 /ui/?autocapture=1 → dump DOM → 断言页面 JS 真的执行到底：
+无头浏览器打开 /ui/?autocapture=1&samples=250&rate=50 → dump DOM → 断言页面 JS 真的执行到底：
   * 轮询填好了设备下拉与数据卡片（trigger / request_id / 波形点数）
   * 三维视图完成绘制（#sceneInfo 被 JS 写入了 |a|）
-  * 页面自身通过「采集一次最新数据」按钮的代码路径创建任务并渲染状态
+  * 参数表单带板端上限（样本数 ≤600、采样率 ≤100 Hz），且页面建出的任务真的带着表单里的参数
+  * 任务卡片渲染了 upload_id 与 dispatched_at/acked_at/completed_at，任务历史表按倒序列出任务
+  * 「手动 vs 周期」对照区两个来源各一行（走 /api/v1/latest?trigger=manual|periodic）
+  * 任务被下发但迟迟没有 acked_at 时，页面给出「未收到设备回执」提示（第二次 dump）；
+    板端回执后提示消失、acked_at 有值、状态文本含 acked（第三次 dump）
 
 运行：python server/e2e_ui_check.py
   未找到浏览器时打印 [SKIP] 并以 0 退出；可用 EDGE_PATH 指定浏览器可执行文件。
@@ -153,6 +157,24 @@ def field(dom, elem_id):
     return m.group(1).strip() if m else ""
 
 
+def any_text(dom, elem_id):
+    """取出任意标签（span / p / td …）且带指定 id 的元素文本。"""
+    m = re.search(r'<(\w+)[^>]*id="%s"[^>]*>(.*?)</\1>' % elem_id, dom, re.S)
+    return m.group(2).strip() if m else ""
+
+
+def tbody_rows(dom, elem_id):
+    """返回某个 <tbody id="x"> 内 <tr> 的行数（0 表示表体不存在）。"""
+    m = re.search(r'<tbody[^>]*id="%s"[^>]*>(.*?)</tbody>' % elem_id, dom, re.S)
+    return m.group(1).count("<tr") if m else 0
+
+
+def tbody_html(dom, elem_id):
+    """返回某个 <tbody id="x"> 的原始 HTML（用于检查单元格里是否出现某个 request_id）。"""
+    m = re.search(r'<tbody[^>]*id="%s"[^>]*>(.*?)</tbody>' % elem_id, dom, re.S)
+    return m.group(1) if m else ""
+
+
 def main_run():
     import main           # 先导入 main：它在 import 时读取 SENSOR_DB
     import uvicorn
@@ -171,7 +193,8 @@ def main_run():
     check("server up", wait_server(), BASE)
 
     rid_seed = seed()
-    dom = dump_dom(browser, BASE + "/ui/?autocapture=1")
+    # URL 里的 samples/rate 会先覆盖参数表单初值，页面随后就用这组参数建任务（D3 验证）
+    dom = dump_dom(browser, BASE + "/ui/?autocapture=1&samples=250&rate=50")
     check("browser returned DOM", len(dom) > 2000, "%d B" % len(dom))
 
     # 1) 轮询主流程跑完（poll() 的 finally 会写 lastPoll）
@@ -214,6 +237,86 @@ def main_run():
     dev = [d for d in devices["devices"] if d["device_id"] == DEV][0]
     check("devices exposes pending_tasks", dev["pending_tasks"] >= 1, str(dev))
     check("device uploads counted", dev["uploads"] >= 2, str(dev["uploads"]))
+
+    # 8) 参数表单：板端上限写进 DOM，且页面建出的任务真的用了表单里的参数
+    check("samples input clamped to board limit",
+          bool(re.search(r'id="countInput"[^>]*max="600"[^>]*value="250"', dom)),
+          "countInput max=600 value=250")
+    check("rate input clamped to board limit",
+          bool(re.search(r'id="rateInput"[^>]*max="100"[^>]*value="50"', dom)),
+          "rateInput max=100 value=50")
+    check("source fixed to board value",
+          bool(re.search(r'id="sourceSel".*?qma6100p', dom, re.S)))
+    st, body = get_json("/api/v1/tasks?device_id=%s&limit=20" % DEV)
+    page_task = [t for t in body["tasks"] if t["request_id"] == rid_page][0]
+    check("page task uses form params",
+          page_task["sample_count"] == 250 and page_task["sample_rate_hz"] == 50
+          and page_task["source"] == "qma6100p",
+          "count=%s rate=%s source=%s" % (page_task["sample_count"],
+                                          page_task["sample_rate_hz"],
+                                          page_task["source"]))
+
+    # 9) 任务卡片：三个状态时间戳与 upload_id 都有渲染（此刻任务还没被板端领取）
+    check("task timestamp fields rendered",
+          field(dom, "taskDispatched") and field(dom, "taskAcked")
+          and field(dom, "taskCompleted"),
+          field(dom, "taskDispatched"))
+    check("task upload_id placeholder when unfinished",
+          "任务未完成" in field(dom, "taskUploadId"), field(dom, "taskUploadId"))
+
+    # 10) 对照区：manual / periodic 各一行，manual 行能追到 seed 的 request_id
+    cmp_html = tbody_html(dom, "cmpBody")
+    check("compare table has one row per trigger",
+          tbody_rows(dom, "cmpBody") == 2 and "manual（按需采集）" in cmp_html
+          and "periodic（周期上报）" in cmp_html,
+          "rows=%d" % tbody_rows(dom, "cmpBody"))
+    check("compare manual row traced to task",
+          ("%s…%s" % (rid_seed[:6], rid_seed[-4:])) in cmp_html, rid_seed)
+
+    # 11) 任务历史表：seed 的已完成任务与页面自建任务都在表里（按创建时间倒序）
+    hist_html = tbody_html(dom, "taskHistoryBody")
+    check("history table has rows", tbody_rows(dom, "taskHistoryBody") >= 2,
+          "rows=%d" % tbody_rows(dom, "taskHistoryBody"))
+    check("history header counts completed",
+          "已完成 1 条" in field(dom, "taskHistoryInfo"),
+          field(dom, "taskHistoryInfo"))
+    check("history lists page task", rid_page in hist_html and
+          ("%s…%s" % (rid_page[:6], rid_page[-4:])) in hist_html, rid_page)
+    st, task_detail = get_json("/api/v1/tasks/%s" % rid_seed)
+    check("history lists completed upload_id",
+          ("><td>%s</td>" % task_detail["upload"]["id"]) in hist_html.replace(" ", ""),
+          "upload_id=%s" % task_detail["upload"]["id"])
+
+    # 12) 板端领取却迟迟不回执：第二次 dump 应出现「未收到设备回执」提示（D4）
+    st, body = get_json("/api/v1/tasks/next?device_id=" + DEV)
+    check("page task claimed for the hint test",
+          body.get("found") is True and body["task"]["request_id"] == rid_page,
+          str(body)[:120])
+    conn = main._connect()
+    try:
+        conn.execute("UPDATE tasks SET dispatched_at=? WHERE request_id=?",
+                     (time.time() - 12, rid_page))
+        conn.commit()
+    finally:
+        conn.close()
+    dom2 = dump_dom(browser, BASE + "/ui/")
+    check("dispatched_at rendered",
+          "—（尚未下发）" not in field(dom2, "taskDispatched"),
+          field(dom2, "taskDispatched"))
+    hint = any_text(dom2, "taskAckHint")
+    check("no-ack hint shown", "仍未收到设备回执" in hint, hint[:90])
+
+    # 13) 板端回执后：acked_at 有值、提示消失、状态文本含 acked（D1 + D5）
+    st, body = post_json("/api/v1/tasks/%s/ack" % rid_page, {})
+    check("page task acked", st == 200 and body["task"]["status"] == "acked",
+          str(body)[:120])
+    dom3 = dump_dom(browser, BASE + "/ui/")
+    check("acked_at rendered",
+          "—（尚未回执）" not in field(dom3, "taskAcked"), field(dom3, "taskAcked"))
+    check("no-ack hint cleared",
+          "仍未收到设备回执" not in any_text(dom3, "taskAckHint"))
+    check("status text mentions acked", "状态码 acked" in field(dom3, "taskStatus"),
+          field(dom3, "taskStatus"))
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 
