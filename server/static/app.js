@@ -2,9 +2,14 @@
  * ESP32-S3 IMU 实时监控面板
  *
  * 定时轮询查询接口：
- *   GET /api/v1/devices              -> 设备下拉
- *   GET /api/v1/latest?device_id=..  -> 选中设备的最新数据
- * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）。
+ *   GET /api/v1/devices                    -> 设备下拉
+ *   GET /api/v1/latest?device_id=..        -> 选中设备的最新数据
+ *   GET /api/v1/latest?device_id=..&trigger=manual|periodic  -> 对照区各取一类批次
+ *   GET /api/v1/window?device_id=..&seconds=30               -> 波形与三维轨迹
+ *   GET /api/v1/tasks?device_id=..&limit=20                  -> 任务历史
+ * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）、
+ *      按需采集任务（参数表单 → 创建 → 跟踪 → 时间戳/upload_id 回显 → 无回执提示）、
+ *      手动批次与周期批次对照、三维姿态视图。
  */
 
 'use strict';
@@ -21,6 +26,10 @@ const $ = {
   deviceSel: el('deviceSel'),
   refreshBtn: el('refreshBtn'),
   captureBtn: el('captureBtn'),
+  sourceSel: el('sourceSel'),
+  countInput: el('countInput'),
+  rateInput: el('rateInput'),
+  timeoutInput: el('timeoutInput'),
   lastPoll: el('lastPoll'),
   noDeviceMsg: el('noDeviceMsg'),
   statusBar: el('statusBar'),
@@ -47,6 +56,15 @@ const $ = {
   taskStatus: el('taskStatus'),
   taskSpec: el('taskSpec'),
   taskExpires: el('taskExpires'),
+  taskDispatched: el('taskDispatched'),
+  taskAcked: el('taskAcked'),
+  taskCompleted: el('taskCompleted'),
+  taskUploadId: el('taskUploadId'),
+  taskAckHint: el('taskAckHint'),
+  taskHistoryBody: el('taskHistoryBody'),
+  taskHistoryInfo: el('taskHistoryInfo'),
+  cmpBody: el('cmpBody'),
+  cmpInfo: el('cmpInfo'),
   scene3d: el('scene3d'),
   sceneInfo: el('sceneInfo'),
   sceneWin: el('sceneWin'),
@@ -419,6 +437,11 @@ async function poll() {
     }
     drawChart(state.lastPoints);
     drawScene3D(state.lastPoints);
+
+    // 侧栏（对照区 / 任务历史）按节流刷新：首轮必刷，之后每 SIDE_REFRESH_EVERY 轮一次。
+    // 不 await：侧栏慢或失败都不该拖住 800 ms 的主轮询。
+    pollTicks++;
+    if (pollTicks === 1 || pollTicks % SIDE_REFRESH_EVERY === 0) refreshSidePanels();
   } catch (e) {
     renderStatus('⚠ ' + e.message, 'error');
   } finally {
@@ -484,6 +507,25 @@ const TASK = {
   pollMs: 1000,      // 任务状态查询间隔
 };
 
+/* 参数表单的可调范围：取「服务端校验」与「板端能力」的交集，避免页面造出必然失败的任务。
+ *  服务端 validate_task_request：rate 10-200、count 1-2000、timeout 5-600
+ *  板端 main.c：sample_count ≤ TASK_MAX_SAMPLES(600)、rate ≤ TARGET_SAMPLE_FREQ_HZ(100)
+ * source 必须是板端上报的 qma6100p、unit 必须是 m/s^2，否则 _check_task_match 判失败，
+ * 因此这两项在页面上固定、不开放编辑。 */
+const TASK_LIMITS = {
+  source: 'qma6100p',
+  countMin: 1, countMax: 600,
+  rateMin: 10, rateMax: 100,
+  timeoutMin: 5, timeoutMax: 600,
+};
+
+/* 已下发超过该秒数仍无 acked_at → 页面给出「回执未收到」提示（纯前端推断，服务端状态不变） */
+const NO_ACK_WARN_S = 5;
+
+/* 侧栏（对照区 / 任务历史）刷新节流：主轮询每 800 ms 一次，侧栏每 5 次刷新一次 */
+const SIDE_REFRESH_EVERY = 5;
+let pollTicks = 0;
+
 const TASK_STATUS_META = {
   submitted: { cls: 'warn', text: '已提交', hint: '等待板端轮询领取（板端每 3 s 轮询一次）' },
   dispatched: { cls: 'warn', text: '已下发', hint: '板端已领取任务，正在采集' },
@@ -504,7 +546,7 @@ function renderTaskBadge(status) {
   return meta;
 }
 
-function renderTask(task, note) {
+function renderTask(task, note, upload) {
   if (!task) return;
   const meta = renderTaskBadge(task.status);
   taskState.last = task;
@@ -521,6 +563,28 @@ function renderTask(task, note) {
     if (note) text += ' · ' + note;
     $.taskStatus.textContent = text;
   }
+  // 状态机时间戳：服务端返回 *_at_str，未到达的阶段显示占位文案
+  if ($.taskDispatched) {
+    $.taskDispatched.textContent = task.dispatched_at_str || '—（尚未下发）';
+  }
+  if ($.taskAcked) {
+    $.taskAcked.textContent = task.acked_at_str || '—（尚未回执）';
+  }
+  if ($.taskCompleted) {
+    $.taskCompleted.textContent = task.completed_at_str || '—（未结束）';
+  }
+  // 关联数据：任务详情接口带回 uploads 摘要（upload），列表接口只有 upload_id
+  const up = upload || task.upload || null;
+  if ($.taskUploadId) {
+    if (up && up.id) {
+      $.taskUploadId.textContent = up.id + '（' + (up.trigger || 'manual') + ' · ' +
+        (up.sample_count ?? '—') + ' 点 · ' + (up.received_at_str || '—') + '）';
+    } else if (task.upload_id) {
+      $.taskUploadId.textContent = String(task.upload_id);
+    } else {
+      $.taskUploadId.textContent = '—（任务未完成，暂无关联批次）';
+    }
+  }
   if ($.taskExpires) {
     if (task.terminal) {
       $.taskExpires.textContent = task.completed_at_str
@@ -533,6 +597,27 @@ function renderTask(task, note) {
         : '—';
     }
   }
+  renderNoAckHint(task);
+}
+
+/** 「回执未收到」提示：板端 ack 失败只在设备日志里可见，服务端会一直停在 dispatched */
+function renderNoAckHint(task) {
+  if (!$.taskAckHint) return;
+  const dispatched = Number(task && task.dispatched_at);
+  const waiting = !!(task && task.status === 'dispatched' &&
+                     isFinite(dispatched) && dispatched > 0);
+  if (!waiting) {
+    $.taskAckHint.classList.add('hidden');
+    $.taskAckHint.textContent = '';
+    return;
+  }
+  const waited = Math.max(0, Date.now() / 1000 - dispatched);
+  $.taskAckHint.classList.remove('hidden');
+  $.taskAckHint.textContent = waited >= NO_ACK_WARN_S
+    ? '⚠ 已下发 ' + waited.toFixed(0) + ' s 仍未收到设备回执（acked_at）：板端回执失败只在设备'
+      + '串口日志里可见，服务端状态会保持 dispatched 直到有效期结束。请查板端 [task] 日志；'
+      + '任务仍可能在有效期内靠数据回传（带 request_id 的上报）直接完成。'
+    : '已下发 ' + waited.toFixed(1) + ' s，等待设备回执（超过 ' + NO_ACK_WARN_S + ' s 会提示）。';
 }
 
 function stopTaskWatch() {
@@ -548,7 +633,7 @@ function watchTask(requestId) {
   const tick = async () => {
     try {
       const data = await apiGet('/api/v1/tasks/' + encodeURIComponent(requestId));
-      renderTask(data.task);
+      renderTask(data.task, undefined, data.upload);
       if (data.task && data.task.terminal) {
         stopTaskWatch();
         poll();          // 任务完成后立刻刷新数据面板，不用等下一次轮询
@@ -562,13 +647,15 @@ function watchTask(requestId) {
   tick();
 }
 
-/** 打开页面/切换设备时回填该设备最近的任务，避免刷新后卡片空白 */
+/** 打开页面/切换设备时回填该设备最近的任务与任务历史（列表按 created_at 倒序） */
 async function refreshLatestTask() {
   if (!state.current) return;
   try {
     const data = await apiGet('/api/v1/tasks?device_id=' +
-                              encodeURIComponent(state.current) + '&limit=1');
-    const task = (data.tasks || [])[0];
+                              encodeURIComponent(state.current) + '&limit=20');
+    const tasks = data.tasks || [];
+    renderTaskHistory(tasks);
+    const task = tasks[0];
     if (!task) return;
     renderTask(task, task.terminal ? '历史任务（已结束）' : '继续跟踪');
     if (!task.terminal) watchTask(task.request_id);
@@ -577,23 +664,163 @@ async function refreshLatestTask() {
   }
 }
 
-/** 点击「采集一次最新数据」：建任务 → 跟踪到终态 */
+/** request_id 是 32 位十六进制，表格里只显示头尾（完整值放在 title 属性里） */
+function shortRid(rid) {
+  if (!rid) return '—';
+  return rid.length > 10 ? rid.slice(0, 6) + '…' + rid.slice(-4) : rid;
+}
+
+/** 任务耗时：created_at → completed_at（未结束则显示已过时间） */
+function taskDuration(t) {
+  const start = Number(t && t.created_at);
+  if (!isFinite(start) || start <= 0) return '—';
+  const end = Number(t.completed_at) || (Date.now() / 1000);
+  return (t.completed_at ? '' : '进行中 ') + Math.max(0, end - start).toFixed(1) + ' s';
+}
+
+/** 任务历史表：最近 20 条任务（状态/参数/关联批次 upload_id/耗时） */
+function renderTaskHistory(tasks) {
+  const list = tasks || [];
+  if ($.taskHistoryInfo) {
+    $.taskHistoryInfo.textContent = list.length
+      ? '· ' + (state.current || '') + ' · 已完成 ' +
+        list.filter((t) => t.status === 'completed').length + ' 条'
+      : '· 暂无任务记录';
+  }
+  const body = $.taskHistoryBody;
+  if (!body) return;
+  if (!list.length) {
+    body.innerHTML = '<tr><td colspan="6">—（本设备还没有任务）</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const t of list) {
+    const meta = TASK_STATUS_META[t.status] || { cls: 'off', text: t.status };
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + (t.created_at_str || '—') + '</td>' +
+      '<td title="' + (t.request_id || '') + '">' + shortRid(t.request_id) + '</td>' +
+      '<td>' + (t.sample_count ?? '—') + ' @ ' + (t.sample_rate_hz ?? '—') + '</td>' +
+      '<td>' + meta.text + '（' + (t.status || '—') + '）</td>' +
+      '<td>' + (t.upload_id ?? '—') + '</td>' +
+      '<td>' + taskDuration(t) + '</td>';
+    frag.appendChild(tr);
+  }
+  body.innerHTML = '';
+  body.appendChild(frag);
+}
+
+/** 对照区：同设备「最近一批 manual」vs「最近一批 periodic」（后端只多了一个 trigger 过滤） */
+async function renderCompare() {
+  const body = $.cmpBody;
+  if (!body || !state.current) return;
+  const base = '/api/v1/latest?device_id=' + encodeURIComponent(state.current);
+  let manual = null, periodic = null;
+  try {
+    const [m, p] = await Promise.all([
+      apiGet(base + '&trigger=manual'),
+      apiGet(base + '&trigger=periodic'),
+    ]);
+    manual = (m && m.found) ? m.upload : null;
+    periodic = (p && p.found) ? p.upload : null;
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="6">—（对照数据查询失败：' + e.message + '）</td></tr>';
+    return;
+  }
+  const row = (label, up) => {
+    if (!up) {
+      return '<tr><td>' + label + '</td><td colspan="5">—（该设备还没有这类批次）</td></tr>';
+    }
+    return '<tr><td>' + label + '</td>' +
+      '<td>' + (up.id ?? '—') + '</td>' +
+      '<td>' + (up.sample_count ?? '—') + '</td>' +
+      '<td>' + fmtTsMs(up.ts_ms) + '　(' + (up.ts_ms ?? '—') + ')</td>' +
+      '<td>' + (up.received_at_str || '—') + '</td>' +
+      '<td>' + shortRid(up.request_id) + '</td></tr>';
+  };
+  body.innerHTML = row('manual（按需采集）', manual) + row('periodic（周期上报）', periodic);
+  if ($.cmpInfo) {
+    $.cmpInfo.textContent = manual && periodic
+      ? '· 两类批次各有记录 · ' + (state.current || '')
+      : '· 缺一类批次（板端可能在暂停周期上报或尚未手动采集）';
+  }
+}
+
+/** 侧栏刷新：对照区 + 任务历史（切换设备 / 建任务 / 任务终态 / 主轮询节流都会调用） */
+function refreshSidePanels() {
+  renderCompare();
+  refreshLatestTask();
+}
+
+/** URL 参数（?source=&samples=&rate=&timeout=）覆盖表单初值，便于自动化构造任务参数 */
+function syncFormFromUrl() {
+  let params;
+  try {
+    params = new URLSearchParams(window.location.search);
+  } catch (e) {
+    return;      // 不支持 URLSearchParams 的环境忽略
+  }
+  // 属性与属性值一起写：属性值让无头浏览器 dump-dom 也能看到实际生效的参数
+  const set = (elem, key) => {
+    const v = params.get(key);
+    if (!elem || !v) return;
+    elem.value = v;
+    elem.setAttribute('value', v);
+  };
+  set($.sourceSel, 'source');
+  set($.countInput, 'samples');
+  set($.rateInput, 'rate');
+  set($.timeoutInput, 'timeout');
+}
+
+/** 读取参数表单；越界/非整数抛错（不发请求，错误信息直接显示在状态条） */
+function readTaskParams() {
+  const num = (label, raw, low, high) => {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < low || n > high) {
+      throw new Error(label + ' 必须是 ' + low + '-' + high +
+                      ' 的整数（当前 ' + raw + '）');
+    }
+    return n;
+  };
+  const source = String(($.sourceSel && $.sourceSel.value) || TASK_LIMITS.source).trim();
+  return {
+    source: source || TASK_LIMITS.source,
+    sample_count: num('样本数', ($.countInput && $.countInput.value) || TASK.samples,
+                      TASK_LIMITS.countMin, TASK_LIMITS.countMax),
+    sample_rate_hz: num('采样率 Hz', ($.rateInput && $.rateInput.value) || TASK.rateHz,
+                        TASK_LIMITS.rateMin, TASK_LIMITS.rateMax),
+    timeout_s: num('有效期 s', ($.timeoutInput && $.timeoutInput.value) || TASK.timeoutS,
+                   TASK_LIMITS.timeoutMin, TASK_LIMITS.timeoutMax),
+  };
+}
+
+/** 点击「采集一次最新数据」：按表单参数建任务 → 跟踪到终态 */
 async function captureOnce() {
   if (!state.current) {
     renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
+    return;
+  }
+  let params;
+  try {
+    params = readTaskParams();
+  } catch (e) {
+    renderStatus('⚠ 任务参数不合法：' + e.message, 'error');
     return;
   }
   $.captureBtn.disabled = true;
   try {
     const data = await apiPost('/api/v1/tasks', {
       device_id: state.current,
-      sample_count: TASK.samples,
-      sample_rate_hz: TASK.rateHz,
-      timeout_s: TASK.timeoutS,
+      source: params.source,
+      sample_count: params.sample_count,
+      sample_rate_hz: params.sample_rate_hz,
+      timeout_s: params.timeout_s,
     });
     renderTask(data.task, data.duplicate ? '已复用未完成任务，未产生并行任务' : '任务已创建');
     watchTask(data.task.request_id);
     renderStatus('', 'hidden');
+    refreshSidePanels();
   } catch (e) {
     renderStatus('⚠ 创建采集任务失败：' + e.message, 'error');
   } finally {
@@ -616,15 +843,16 @@ function renderTrace(latest) {
 
 $.captureBtn.addEventListener('click', () => captureOnce());
 
-// 切换设备后回填该设备最近的任务（等待 poll() 完成设备切换）
+// 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
   stopTaskWatch();
-  setTimeout(refreshLatestTask, 900);
+  setTimeout(refreshSidePanels, 900);
 });
 
 // 设备列表首次加载后按钮才可用；这里先放开，点击时会校验是否已选设备
 $.captureBtn.disabled = false;
-refreshLatestTask();
+syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source= 覆盖表单初值
+refreshSidePanels();
 
 // 便于自动化验证：用 /ui/?autocapture=1 打开页面即触发一次采集（等价于点按钮），
 // 无需人工点击也能核对「建任务 → 板端领取 → 带 request_id 回传」这条链路。

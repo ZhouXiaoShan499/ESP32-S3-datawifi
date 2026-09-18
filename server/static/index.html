@@ -31,11 +31,13 @@
     padding: 14px 16px; margin-bottom: 16px;
   }
   .controls label { font-size: 14px; color: var(--muted); }
-  select, button {
+  select, input, button {
     font: inherit; padding: 7px 12px; border: 1px solid var(--border);
     border-radius: 6px; background: #fff; color: var(--text);
   }
-  select:focus { outline: 2px solid var(--accent); }
+  select:focus, input:focus { outline: 2px solid var(--accent); }
+  .controls input[type="number"] { width: 88px; }
+  .controls .sep { width: 1px; height: 24px; background: var(--border); }
   button { cursor: pointer; border-color: var(--accent); color: var(--accent); background: #fff; }
   button:hover { background: #eaf1ff; }
   button:active { background: #dbe7ff; }
@@ -45,6 +47,10 @@
   button.primary:active { background: #1e40af; }
   .hint { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 12px 0 0; }
   .hint code { background: #f1f3f6; padding: 1px 5px; border-radius: 4px; }
+  .ack-warn {
+    color: var(--warn); font-size: 13px; font-weight: 600;
+    line-height: 1.7; margin: 12px 0 0;
+  }
   #lastPoll { margin-left: auto; color: var(--muted); font-size: 13px; }
 
   .notice {
@@ -118,6 +124,20 @@
   <label for="deviceSel">设备</label>
   <select id="deviceSel" disabled><option value="">加载中…</option></select>
   <button id="refreshBtn" type="button" disabled>仅刷新（不采集）</button>
+  <span class="sep"></span>
+  <label for="sourceSel">数据源</label>
+  <select id="sourceSel" title="必须与板端上报的 source 一致，否则任务校验失败">
+    <option value="qma6100p">qma6100p</option>
+  </select>
+  <label for="countInput">样本数</label>
+  <input type="number" id="countInput" min="1" max="600" step="10" value="100"
+         title="板端单次采集上限 600 点（TASK_MAX_SAMPLES）">
+  <label for="rateInput">采样率 Hz</label>
+  <input type="number" id="rateInput" min="10" max="100" step="10" value="100"
+         title="板端采集上限 100 Hz（TARGET_SAMPLE_FREQ_HZ）">
+  <label for="timeoutInput">有效期 s</label>
+  <input type="number" id="timeoutInput" min="5" max="600" step="5" value="60"
+         title="服务端允许 5-600 s">
   <button id="captureBtn" type="button" class="primary" disabled>采集一次最新数据</button>
   <span id="lastPoll">—</span>
 </section>
@@ -129,13 +149,51 @@
     <div class="kv"><span class="k">任务状态</span><span class="v" id="taskStatus">尚未创建任务</span></div>
     <div class="kv"><span class="k">样本数 / 采样率</span><span class="v" id="taskSpec">100 点 @ 100 Hz</span></div>
     <div class="kv"><span class="k">有效期剩余</span><span class="v" id="taskExpires">—</span></div>
+    <div class="kv"><span class="k">下发时间 dispatched_at</span><span class="v" id="taskDispatched">—</span></div>
+    <div class="kv"><span class="k">设备回执 acked_at</span><span class="v" id="taskAcked">—</span></div>
+    <div class="kv"><span class="k">完成时间 completed_at</span><span class="v" id="taskCompleted">—</span></div>
+    <div class="kv"><span class="k">关联数据 upload_id</span><span class="v" id="taskUploadId">—</span></div>
   </div>
+  <p class="ack-warn hidden" id="taskAckHint"></p>
   <p class="hint">
-    点击「采集一次最新数据」：服务端创建任务（<code>POST /api/v1/tasks</code>）→ 板端轮询领取（≤3 s，
-    <code>GET /api/v1/tasks/next</code>）→ 暂停周期上报并按 100 Hz 采集 1 s（100 点）→ 带
-    <code>request_id</code> 回传完成任务。<br>
+    点击「采集一次最新数据」：按上面的表单参数创建任务（<code>POST /api/v1/tasks</code>）→
+    板端轮询领取（≤3 s，<code>GET /api/v1/tasks/next</code>）→ 暂停周期上报并按任务的采样率采集
+    <code>sample_count</code> 点 → 带 <code>request_id</code> 回传完成任务，任务卡片会显示关联的
+    <code>upload_id</code> 与各阶段时间戳（<code>*_at_str</code>）。<br>
+    表单范围已取两侧限制的交集：<b>样本数 ≤ 600</b>（板端 <code>TASK_MAX_SAMPLES</code>）、
+    <b>采样率 ≤ 100 Hz</b>（板端 <code>TARGET_SAMPLE_FREQ_HZ</code>），服务端本身允许到
+    2000 点 / 200 Hz，超限由服务端 400 或板端 <code>POST /fail</code> 拒绝。
+    <code>source</code> 固定 <code>qma6100p</code>、<code>unit</code> 固定 <code>m/s^2</code>
+    （必须与板端上报一致，故不开放编辑）。<br>
     连点只会复用一个未完成任务；request_id 贯穿任务、回执与样本，重复上传不会重复写样本。
   </p>
+</section>
+
+<section id="cmpCard" class="card">
+  <h2>手动批次 vs 周期批次（同一设备对照）<span id="cmpInfo" class="poll-hint"></span></h2>
+  <table>
+    <caption>各取该设备最近一批；点数/批次起点/接收时间均来自 SQLite，用于确认手动采集没有污染周期链路</caption>
+    <thead>
+      <tr><th>来源</th><th>upload_id</th><th>点数</th><th>批次起点 ts_ms</th><th>服务端接收时间</th><th>request_id</th></tr>
+    </thead>
+    <tbody id="cmpBody"><tr><td colspan="6">—</td></tr></tbody>
+  </table>
+  <p class="hint">
+    <code>manual</code> = 按需采集（带 request_id，任务完成后与本表一致）；
+    <code>periodic</code> = 板端周期上报（不带 request_id）。两行数据分别来自
+    <code>/api/v1/latest?trigger=manual</code> 与 <code>?trigger=periodic</code>。
+  </p>
+</section>
+
+<section id="taskHistoryCard" class="card">
+  <h2>任务历史（最近 20 条）<span id="taskHistoryInfo" class="poll-hint"></span></h2>
+  <table>
+    <caption>该设备的任务流水（<code>/api/v1/tasks?device_id=…&amp;limit=20</code>，按创建时间倒序）</caption>
+    <thead>
+      <tr><th>创建时间</th><th>request_id</th><th>点数 @ Hz</th><th>状态</th><th>upload_id</th><th>耗时</th></tr>
+    </thead>
+    <tbody id="taskHistoryBody"><tr><td colspan="6">—</td></tr></tbody>
+  </table>
 </section>
 
 <section id="noDeviceMsg" class="notice no-device hidden">
@@ -206,8 +264,10 @@
 </section>
 
 <footer>
-  查询接口：/api/v1/devices · /api/v1/latest?device_id=… · /api/v1/window?device_id=…&amp;seconds=30<br>
-  任务接口：POST /api/v1/tasks · GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id}
+  查询接口：/api/v1/devices · /api/v1/latest?device_id=…（可加 &amp;trigger=manual|periodic） ·
+  /api/v1/window?device_id=…&amp;seconds=30<br>
+  任务接口：POST /api/v1/tasks · GET /api/v1/tasks?device_id=…&amp;limit=20 ·
+  GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id}
   　|　
   <a href="/" target="_blank" rel="noopener">服务端首页</a>
 </footer>
