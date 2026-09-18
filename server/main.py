@@ -1010,20 +1010,34 @@ def devices():
 
 @app.get("/api/v1/latest")
 def latest(request: Request):
-    """返回最近一次上报（含首末样本），用于核对采集值是否来自本组设备。"""
+    """返回最近一次上报（含首末样本），用于核对采集值是否来自本组设备。
+
+    可选 `trigger=manual|periodic`：只看按需采集批次或只看周期上报批次，
+    供监控页的「手动 vs 周期」对照区各取一行。缺省时不加该条件，
+    与旧调用方行为完全一致（向后兼容）。
+    """
     device_id = (request.query_params.get("device_id") or "").strip()
+    trigger = (request.query_params.get("trigger") or "").strip()
+    if trigger and trigger not in ("manual", "periodic"):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'trigger' (expected manual or periodic)"},
+        )
     conn = _connect()
     try:
+        sql = "SELECT * FROM uploads"
+        conds, args = [], []
         if device_id:
-            row = conn.execute(
-                "SELECT * FROM uploads WHERE device_id=? "
-                "ORDER BY received_at DESC LIMIT 1",
-                (device_id,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT * FROM uploads ORDER BY received_at DESC LIMIT 1"
-            ).fetchone()
+            conds.append("device_id=?")
+            args.append(device_id)
+        if trigger:
+            conds.append("trigger=?")
+            args.append(trigger)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY received_at DESC LIMIT 1"
+        row = conn.execute(sql, args).fetchone()
         if row is None:
             return JSONResponse(
                 status_code=200, content={"ok": True, "found": False}
