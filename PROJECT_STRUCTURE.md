@@ -42,6 +42,7 @@ data_capture_sim/                  # 仓库根目录
 │   ├── crash_analysis_and_fix.md       # 崩溃分析与修复记录（LVGL 栈溢出）
 │   ├── psram_upload_fix.md             # 上传链路失效分析与修复（PSRAM 未启用）
 │   ├── manual_capture_task.md          # 按需采集任务（Web 触发、request_id 贯穿、三维视图）
+│   ├── manual_capture_task_acceptance.md # 验收手册：自检脚本 + 真机验收 + 逐条观测点/边界
 │   └── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
@@ -80,9 +81,10 @@ data_capture_sim/                  # 仓库根目录
 | `requirements.txt` | Python 依赖：`fastapi`、`uvicorn[standard]`、`httpx`（自测用）。 |
 | `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与按需采集任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败）。 |
 | `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等）。 |
-| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开 `/ui/?autocapture=1` 并 dump DOM，断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、页面自身建任务）；未装浏览器时打印 SKIP。 |
-| `static/index.html` | 监控页面结构（设备下拉、数据卡片、样本表、波形画布、任务卡片、三维视图画布）。 |
-| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图）、按需采集任务创建与状态跟踪、Canvas 2D 手写正交投影渲染。 |
+| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开 `/ui/?autocapture=1&samples=250&rate=50` 并 dump DOM（3 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、参数表单带板端上限且任务真用该参数、任务卡片 `upload_id` 与时间戳、任务历史倒序、manual/periodic 对照区、无回执提示出现与消失）；未装浏览器时打印 SKIP。 |
+| `e2e_device_check.py` | 真机（上板）脚本化验收：起真实服务（默认 `0.0.0.0:8000`），等板端周期上报出现后跑「建任务 → 领取 → ack → 采集窗口内周期上报为 0 → completed + upload_id → 周期恢复 → 历史可见」11 项断言；板端不在场时打印 `[SKIP]` 并以 0 退出。 |
+| `static/index.html` | 监控页面结构（设备下拉、**采集参数表单**、数据卡片、样本表、波形画布、任务卡片（含无回执提示）、**手动/周期对照表**、**任务历史表**、三维视图画布）。 |
+| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图）、按需采集任务参数读取与创建、状态跟踪（时间戳 / upload_id / 无回执推断）、对照区与任务历史渲染、Canvas 2D 手写正交投影渲染。 |
 
 #### 服务端数据库（SQLite，三张表）
 

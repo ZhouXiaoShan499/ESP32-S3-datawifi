@@ -41,6 +41,7 @@ data_capture_sim/
 │   ├── crash_analysis_and_fix.md       # 崩溃分析与修复记录（LVGL 栈溢出）
 │   ├── psram_upload_fix.md             # 上传链路失效分析与修复（PSRAM 未启用）
 │   ├── manual_capture_task.md          # 按需采集任务（request_id 贯穿）+ Web/三维视图说明
+│   ├── manual_capture_task_acceptance.md # 验收手册：3 层自检 + 真机脚本 + 逐条观测点
 │   └── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │
 └── server/                        # 服务端（PC 运行，Python/FastAPI）
@@ -49,6 +50,7 @@ data_capture_sim/
     ├── test_receive.py            # 单元自测（临时库）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检
     ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
+    ├── e2e_device_check.py        # 真机验收（可选，需板端在线上报；无板则 SKIP）
     └── static/                    # 实时监控页（静态资源）
         ├── index.html             # 页面结构 + 样式
         └── app.js                 # 轮询 + 渲染 + 任务跟踪 + 三维姿态视图
@@ -102,7 +104,7 @@ idf.py -p COMx flash monitor        # COMx = 实际串口
 
 **③ 浏览器 —— 查看实时数据**
 
-- 实时监控面板：`http://<电脑IP>:8000/ui/`（每 2 s 自动刷新）
+- 实时监控面板：`http://<电脑IP>:8000/ui/`（每 0.8 s 自动刷新）
 - 极简首页：`http://<电脑IP>:8000/`
 - 健康汇总：`http://<电脑IP>:8000/api/v1/health`
 
@@ -145,6 +147,8 @@ python main.py
 ```bash
 python test_receive.py        # 单元自测（临时库，不污染正式数据）
 python e2e_server_check.py    # 真实 HTTP 端到端自检
+python e2e_ui_check.py        # 界面自检（无浏览器则 SKIP）
+python e2e_device_check.py    # 真机验收（板端不在线则 SKIP）
 ```
 
 启动后浏览器访问：
@@ -214,19 +218,28 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 |------|------|
 | 设备下拉 | 来自 `/api/v1/devices`（板端至少上传过一次才会出现） |
 | **仅刷新（不采集）** | 只重新拉取查询接口，不打扰板端 |
-| **采集一次最新数据** | 创建一次按需采集任务 → 板端轮询领取 → 暂停周期上报并按 100 Hz 采 1 s（100 点）→ 带 `request_id` 回传；任务卡片实时显示状态 |
+| **采集参数表单** | 样本数（默认 100，上限 **600**）、采样率（默认 100 Hz，上限 **100**）、有效期（默认 60 s，5–600）；越界在本地就拒绝，不发请求 |
+| **采集一次最新数据** | 按表单参数创建任务 → 板端轮询领取 → 暂停周期上报并按参数采集一批 → 带 `request_id` 回传；任务卡片实时显示状态与时间戳 |
 
 - 任务状态机：`submitted → dispatched → acked → completed`，失败为 `failed`，超期未完成变 `timeout`
   （默认有效期 60 s，页面显示剩余时间）。
 - **连点不会并行采集**：同一设备已有未完成任务时，服务端直接复用并返回 `duplicate=true`。
 - 数据卡片新增「触发方式」与「任务号」，可判断最近一批是 `periodic` 还是 `manual`、属于哪个任务。
+- 任务卡片补齐 `dispatched_at` / `acked_at` / `completed_at` 与关联批次 `upload_id`（可一路追到具体批次）；
+  任务停在 `dispatched` 超过 5 s 仍无回执时给出黄色提示（板端 ack 失败只写设备串口日志，服务端状态不会变）。
+- 页面下方两张表：「手动批次 vs 周期批次」对照（走 `/api/v1/latest?trigger=manual|periodic`，
+  用来确认手动采集没有污染周期链路）与「任务历史（最近 20 条）」（走 `/api/v1/tasks?device_id=…&limit=20`）。
 - 页面底部「三维姿态视图」：纯 Canvas 2D 手写正交投影（无外部库、无 CDN，局域网离线可用），
   画三轴箭头、当前加速度向量与其分量/地面投影、重力参考 `g=9.81`、最近 30 s 轨迹；
   支持**拖拽旋转、滚轮缩放、双击或按钮复位、自动旋转开关**。
-- 自动化核对：打开 `/ui/?autocapture=1` 会触发与按钮完全相同的代码路径（便于无人值守验证）。
+- 自动化核对：打开 `/ui/?autocapture=1` 会触发与按钮完全相同的代码路径，可再加
+  `&samples=250&rate=50&timeout=45` 指定参数（便于无人值守验证表单参数真的传到了任务里）。
+- 自检脚本：`test_receive.py`（27 项）、`e2e_server_check.py`（8 项）、
+  `e2e_ui_check.py`（41 项，无浏览器则 SKIP）、`e2e_device_check.py`（真机 11 项，无板则 SKIP）。
 
 > 完整说明（接口字段、状态机、板端实现、验证场景）见 `docs/manual_capture_task.md`；
-> 需求来源、交付物清单、实测结果与遗留事项见 `docs/manual_capture_task_work_log.md`。
+> 需求来源、交付物清单、实测结果与遗留事项见 `docs/manual_capture_task_work_log.md`；
+> 逐条验收清单（含真机脚本与明确不验收的边界）见 `docs/manual_capture_task_acceptance.md`。
 
 ---
 
@@ -237,7 +250,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | `POST` | `/api/v1/upload` | 接收板端上传的传感批次（校验后入库，成功返回 201） |
 | `GET` | `/api/v1/health` | 健康状态 + 汇总（总批次 / 总样本 / 设备列表 / 最近上报） |
 | `GET` | `/api/v1/devices` | 设备列表 |
-| `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本、`trigger`、`request_id`） |
+| `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本、`trigger`、`request_id`）；可选 `&trigger=manual\|periodic` 只看该来源的最近一批（页面「手动 vs 周期」对照区用） |
 | `POST` | `/api/v1/tasks` | 创建按需采集任务（Web 用；已有未完成任务时复用并返回 `duplicate=true`） |
 | `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`，默认最近 20 条） |
 | `GET` | `/api/v1/tasks/next?device_id=…` | 板端轮询领取任务（原子领取，只返回 `submitted` 且未过期的任务） |
@@ -334,6 +347,7 @@ ESP32-S3-EYE ──WiFi(局域网)──▶ 本机 PC:8000 (FastAPI + SQLite) �
 python server/test_receive.py     # 单元自测（临时库）：校验/入库/查询/可选鉴权/任务全流程
 python server/e2e_server_check.py # 真实 HTTP 端到端自检（含任务创建-领取-回传-幂等）
 python server/e2e_ui_check.py     # 界面自检（可选，需本机 Edge/Chrome；无浏览器则 SKIP 退出）
+python server/e2e_device_check.py # 真机验收（可选，需板端在线；板端不在线则 SKIP 退出）
 ```
 
 > 板端固件侧的编译验证：`idf.py build`（本仓库根目录的 `build_idf.bat` 会写 `build_log.txt`，

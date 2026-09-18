@@ -2,8 +2,11 @@
 
 > - **记录对象**：分支 `feature/manual-capture-task-web-3d`（基线 `main` @ `2ac51e0`）
 > - **记录日期**：2026-09-18
-> - **一句话结论**：按需采集（Web 手动触发）功能、三层自测、文档全部完成并落成 **6 个提交**（10 文件，`+2666 / −70`），本地验证全绿；`git push` / PR 因环境网络限制未完成（见第七节）。
-> - **配套文档**：实现细节见 `docs/manual_capture_task.md`；本文档偏向"需求 → 交付 → 验证 → 遗留"的过程记录。
+> - **一句话结论**：按需采集（Web 手动触发）功能、三层自测、文档全部完成并落成 **6 个提交**（10 文件，`+2666 / −70`），本地验证全绿；`git push` / PR 因环境网络限制未完成（见第七节）。随后按 GitHub Flow 又补齐了「前端可观测性 + 真机验收脚本 + 断言扩展 + 验收手册」（见第十节补记），push / PR 待确认后执行。
+> - **配套文档**：实现细节见 `docs/manual_capture_task.md`；逐条验收清单（含真机脚本与"明确不验收"的边界）见 `docs/manual_capture_task_acceptance.md`；本文档偏向"需求 → 交付 → 验证 → 遗留"的过程记录。
+> - **真机联调补充（同日）**：上板后按需采集恒失败，先后定位并修复两个板端缺陷 ——
+>   ①`expires_at` 单位不一致（服务端秒、板端当毫秒）；②手动采集未按会话重新锚定采样时间戳。
+>   均已重新编译烧录并端到端验证通过，详见 §7.3 / §7.4。
 
 ---
 
@@ -171,9 +174,10 @@
 
 | 验证项 | 命令 / 方式 | 实测结果 |
 |--------|-------------|----------|
-| 单元自测 | `python server/test_receive.py` | `ALL CHECKS PASSED`（25 项，含任务全流程 8 组） |
+| 单元自测 | `python server/test_receive.py` | `ALL CHECKS PASSED`（25 项，含任务全流程 8 组；后补 2 组 trigger 过滤/历史列表 → 27 项） |
 | 真实 HTTP 端到端 | `python server/e2e_server_check.py` | `E2E ALL CHECKS PASSED`（8 项） |
-| 无头浏览器 UI 端到端 | `python server/e2e_ui_check.py` | `ALL 22 UI E2E CHECKS PASSED`、`UI_EXIT=0`（关键断言：任务卡片渲染出 `manual（按需采集）` 与 `request_id`；页面自身建出的任务服务端可见；`health` 计数 `{completed:1, submitted:1}`；`devices` 暴露 `pending_tasks:1`） |
+| 无头浏览器 UI 端到端 | `python server/e2e_ui_check.py` | `ALL 22 UI E2E CHECKS PASSED`、`UI_EXIT=0`（关键断言：任务卡片渲染出 `manual（按需采集）` 与 `request_id`；页面自身建出的任务服务端可见；`health` 计数 `{completed:1, submitted:1}`；`devices` 暴露 `pending_tasks:1`；后补 19 项 → 41 项） |
+| 真机脚本化验收 | `python server/e2e_device_check.py` | 有板时 `DEVICE ACCEPTANCE PASSED`（11 项）；板端不在线则 `[SKIP]` 且退出码 0（本轮实测为 SKIP） |
 | 固件编译 | `idf.py build`（`build_idf.bat` → `build_log.txt`） | `BUILD_EXIT=0`；`data_capture_sim.bin` ≈ `0x15a200`；分区剩余 8%；无新增告警 |
 | 老库迁移 | 手工造无 `request_id`/`trigger` 列的旧库后调 `init_db()` | 列被补齐、历史行 `trigger='periodic'`、部分唯一索引存在、周期与手动上传均正常、`init_db()` 可重复调用 |
 | 代码结构复核 | 检索路由声明顺序 / `app.js` 收尾 | `/tasks/next`（721 行）声明在 `/tasks/{request_id}`（804 行）之前；`app.js` 末尾为 `sceneInit();` |
@@ -223,15 +227,74 @@ git checkout main && git pull && git branch -d feature/manual-capture-task-web-3
 3. 点按钮后断电 → 60 s 后任务变 `timeout`、无上传，重启服务端状态不变；
 4. 静止时三维视图向量贴近重力参考（约 `|a| = 9.81 m/s²`）。
 
+### 7.3 真机联调发现的缺陷：`expires_at` 单位不一致（已修复、已上板验证）
+
+**现象**：真机上点「采集一次最新数据」后，任务在 `dispatched → acked` 之后约 4 s 变成
+`failed: task expired before capture`，而同一时刻服务端显示 `expires_in_s ≈ 53.9`（有效期还剩 50 多秒）。
+库里 **5 条任务全部同因失败**（100% 复现）；周期性上报链路本身正常（上传、入库、页面显示都正常）。
+
+**根因**：单位不一致 —— 服务端 `expires_at` 是 **epoch 秒**（建任务时 `now + timeout_s`，
+文档示例 `1767123516.78`），而板端 `task_handle_next_response()` 直接把该 JSON 数值当 **毫秒** 用
+（`(int64_t)exp->valuedouble`），再与 `manual_now_epoch_ms()`（≈ `1.789e12`）比较，结果恒为"已过期"，
+于是板端领到任务的第一个采样节拍就放弃采集并回执失败。
+这同时解释了"板端未按键采集却短暂产生 periodic 批次"的现象：§4.2 的采样闸门在任务活跃期被打开，
+但采集立刻失败退出，期间喂出的周期窗口被正常上传。
+
+**修复**：`main/main.c` 新增 `expires_to_epoch_ms()`，把 `expires_at` 归一化为 epoch ms
+（`< 1e12` 视为秒、否则视为毫秒，服务端日后改用毫秒也兼容），`task_handle_next_response()` 改用它。
+
+**验证（本次实测）**：
+
+| 项 | 方式 | 结果 |
+|----|------|------|
+| 编译 | `build_idf.bat` | `BUILD_EXIT=0`；`main.c` 14:23:21 → `main.c.obj` 14:23:59 → `data_capture_sim.bin` 14:24:09 |
+| 烧录 | `flash_idf.bat`（COM5） | `FLASH_EXIT=0` |
+| 真机端到端 | `POST /api/v1/tasks`（100 点 @ 100 Hz，60 s）→ 轮询 `/tasks/{id}` | `submitted → acked → completed`（14:28:40 → 14:28:41）、`upload_id=1071`、`trigger=manual`、`sample_count=100`、`request_id` 与任务一致、`health` 计数 `106604 → 106704`（**只增 1 批**） |
+
+⇒ §7.2 第 1 项（采集窗口内只出现该任务的 manual 批次、周期批次为 0）已顺带覆盖；
+第 2/3/4 项（连点去重、断电超时、三维视图读数）仍需人工操作验收。
+
+### 7.4 第二个缺陷：手动采集未按会话重新锚定采样时间戳（已修复、已上板验证）
+
+**现象**：§7.3 修完后的 100 点任务通过；紧接着的 250 点任务被服务端拒收：
+`failed: ts_ms is older than the task creation time`（判据在 `_check_task_match`：
+`data["ts_ms"] < int(created_at * 1000) - 5000`），`uploads` 计数不变（脏批次不入库，无半截数据）。
+
+**根因**：板端样本时间戳 = `s_base_timestamp_ms + s_sample_count * 10 ms`，而锚点 `s_base_timestamp_ms`
+只在 `s_sample_count == 0` 时取。手动采集在 `MANUAL_PENDING → MANUAL_CAPTURING` 时只重置了 `s_manual.tick`
+与 `s_upload_count`，**没有重置采样会话的 `s_sample_count`**；板子空闲（未按键采集）时 `s_collecting` 为 false，
+`stop_collection_locked()` 也不会被调用，于是**板子空闲多久，下一次手动采集的时间戳就落后多久**
+（本次落后约 113 s）→ 必然早于任务创建时间。上电后第一次手动采集因 `s_sample_count` 仍为 0 而正常，第二次起必错。
+
+**修复**：`sampler_task` 记录上一拍的闸门状态，闸门"由关变开"即视为**新采样会话**并
+`s_sample_count = s_upload_count = 0`（当拍即走既有锚点逻辑取新锚）。按键 / SD 会话不受影响：
+它们的 start_* 路径本来就归零，且采集进行中被任务插队时 `s_collecting` 一直为 true，时间线保持连续。
+
+**验证（本次实测）**：同一上电周期内**连续三次**按需采集，全部 `submitted → acked → completed`，
+批次时间戳均晚于任务创建时间（脚本轮询 `/tasks/{id}` + 读库核对）：
+
+| # | 点数 | 结果 | `upload_id` | 批次 `ts_ms` − 任务 `created_at` |
+|---|------|------|-------------|----------------------------------|
+| 1 | 100 | `completed` | 1073 | **+2.38 s** |
+| 2 | 250 | `completed` | 1077 | **+3.64 s** |
+| 3 | 100 | `completed` | 1079 | **+2.99 s** |
+
+对照：修复前同场景 250 点任务被判 `ts_ms is older than the task creation time`（时间戳落后约 113 s）。
+
+轮次证据（`main.c` 14:34:52 → `main.c.obj` 14:35:25 → `data_capture_sim.bin` 14:35:36）：
+`BUILD_EXIT=0`、`FLASH_EXIT=0`；三次批次的 `trigger` 均为 `manual`、`uploads.request_id` 与任务一致、
+`samples` 分别按 100 / 250 / 100 点入库。
+
 ---
 
 ## 八、复现方式（怎么再跑一遍）
 
 ```bash
 # 1. 服务端三层自测（串行，避免端口/库互相干扰）
-python server/test_receive.py          # 期望：ALL CHECKS PASSED
+python server/test_receive.py          # 期望：ALL CHECKS PASSED（27 项）
 python server/e2e_server_check.py      # 期望：E2E ALL CHECKS PASSED
-python server/e2e_ui_check.py          # 期望：ALL 22 UI E2E CHECKS PASSED（无浏览器则 SKIP）
+python server/e2e_ui_check.py          # 期望：ALL 41 UI E2E CHECKS PASSED（无浏览器则 SKIP）
+python server/e2e_device_check.py      # 期望：DEVICE ACCEPTANCE PASSED（11 项；无板则 SKIP 且退出码 0）
 
 # 2. 固件编译
 build_idf.bat                          # 期望：build_log.txt 末尾 BUILD_EXIT=0
@@ -246,8 +309,47 @@ cd server && python main.py            # 浏览器打开 http://<PC 局域网 IP
 
 ## 九、后续可做（按优先级）
 
-1. **完成 push / PR / 合并**（唯一被环境卡住的交付步骤）。
-2. 上板跑完 §7.2 的 4 个手工场景，把实测日志补进 `docs/manual_capture_task.md`。
+1. **完成 push / PR / 合并**：本仓库无 `gh` CLI，改用 GitHub compare URL 提交 PR；推送前需用户确认（属于对外可见操作）。
+2. 上板复跑真机验收：`python server/e2e_device_check.py`（11 项断言，含"采集窗口内周期批次为 0"），把实测日志补进 `docs/manual_capture_task_acceptance.md` §六。
 3. 若需要"掉电续传"：引入 SD 卡落盘队列，配合 `request_id` 做补传（当前失败批次不重放）。
 4. 若要公网部署：Web 侧接口补鉴权 + TLS / 反向代理。
 5. 若要真实姿态角：在三维视图上做加速度 + 陀螺的传感器融合（当前仅加速度向量可视化）。
+
+---
+
+## 十、增量补记（同日第二轮：可观测性 / 验收脚本 / 断言扩展）
+
+### 10.1 这一轮补了什么（以及为什么这么补）
+
+| 缺口 | 补法 | 为什么 |
+|------|------|--------|
+| 前端只显示 `request_id`，看不出"这批数据到底进没进库" | 任务卡片新增 `dispatched_at` / `acked_at` / `completed_at`（服务端本就返回 `*_at_str`）与关联批次 `upload_id`（详情接口有 `upload`，列表接口有 `upload_id`） | 零后端改动即可闭合"任务 → 批次"链路 |
+| 板端不 ack 时页面毫无提示（服务端只会停在 `dispatched` 直到超时） | 前端推断：`status=dispatched` 且 `dispatched_at` 超过 5 s 仍无 `acked_at` → 黄色提示，并说明回执失败只写设备串口日志 | 不为一个 UI 提示去改服务端状态机（避免引入第四种中间状态） |
+| 采集参数写死 100 点 @ 100 Hz | 顶部新增参数表单（样本数 / 采样率 / 有效期），范围取服务端校验与板端能力的**交集**（≤600 / ≤100 Hz / 5–600 s），越界本地直接拒绝、不发请求 | 页面不该造出必然被板端 `/fail` 的任务；`source`/`unit` 必须与板端上报一致，故固定不可编辑 |
+| 任务历史不可见（刷新页面只剩最后一条任务） | 新增「任务历史（最近 20 条）」表，走 `/tasks?limit=20`（服务端早已支持 limit 与按创建时间倒序） | 只加前端消费，不动接口 |
+| 无法一眼确认手动采集没有污染周期链路 | 新增「手动批次 vs 周期批次」对照表；后端 `/api/v1/latest` 增加可选 `trigger=manual|periodic`（非法值 400，缺省行为不变） | 唯一一处后端改动，完全向后兼容 |
+| 缺"上板就能跑"的验收动作 | 新增 `server/e2e_device_check.py`（11 项断言，无板则 `[SKIP]` 且退出码 0）+ `docs/manual_capture_task_acceptance.md`（观测点 D1–D6、真机场景、明确不验收的边界） | 把 §7.2 的手工清单变成可复跑脚本 |
+
+### 10.2 测试断言扩展
+
+- `test_receive.py` 新增两组：第 18 组 `/latest?trigger=` 过滤生效 + 非法值 400；第 19 组 `/tasks` 历史倒序、字段齐全、`upload_id` 与任务详情一致、`limit` 夹取 1..100 → **27 项**。
+- `e2e_ui_check.py` URL 改为 `/ui/?autocapture=1&samples=250&rate=50`，并做 **3 次 dump**：
+  ① 表单带上板端上限且页面建出的任务真用该参数、任务卡片时间戳/`upload_id` 渲染位、对照区两行、任务历史两行；
+  ② 板端领取后把 `dispatched_at` 回拨 12 s → 断言「仍未收到设备回执」提示出现；
+  ③ `POST /ack` 后 → 断言提示消失、`acked_at` 有值、状态文本含 `acked` → **41 项**。
+
+### 10.3 本轮实测
+
+| 项 | 结果 |
+|----|------|
+| `python server/test_receive.py` | `ALL CHECKS PASSED`（27 项） |
+| `python server/e2e_server_check.py` | `E2E ALL CHECKS PASSED`（8 项） |
+| `python server/e2e_ui_check.py` | `ALL 41 UI E2E CHECKS PASSED`（含 `no-ack hint shown ⚠ 已下发 21 s …`、`acked_at rendered 2026-09-18 15:36:48`） |
+| `python server/e2e_device_check.py` | `[SKIP] 没有正在周期上报的板端`（退出码 0，符合预期） |
+| 固件编译 | 沿用 §7.4 那次 `BUILD_EXIT=0`（`main.c` 14:34 → `build_log.txt` 14:35，本轮未再改固件） |
+
+### 10.4 文档同步
+
+新增 `docs/manual_capture_task_acceptance.md`（验收手册）；同步更新 `README.md`（§4.3 控件与可观测点、目录树、自检命令）、
+`PROJECT_STRUCTURE.md`（文件清单补 `e2e_device_check.py` 与验收手册）、`docs/manual_capture_task.md`
+（§5.1 控件表、§5.3 自动化钩子 URL 参数、§6.1 自检结果表、§6.2 手工场景 4 行）。

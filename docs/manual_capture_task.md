@@ -187,10 +187,15 @@ if (!manual_tick && s_wifi_connected) {
 ```
 
 - 接手任务的第一拍会 `s_upload_count = 0`，丢弃未满的周期窗口，避免周期数据混进 manual 批次。
+- 时间戳按**会话**锚定：`s_base_timestamp_ms` 在会话首个样本处锚定，`timestamp_ms = 锚点 + 样本序号 × 10 ms`；
+  闸门"由关变开"即视为新会话（`s_sample_count = 0` → 重新锚定）。否则板子空闲时被任务唤起会沿用上一次会话的
+  样本序号，时间戳落到过去，被服务端以 `ts_ms is older than the task creation time` 拒收（实测复现并已修，见
+  `docs/manual_capture_task_work_log.md` §7.4）。
 - `rate_hz < 100` 时按 `period_ticks = 100 / rate_hz` 抽点（如 10 Hz 即每 10 拍取一个点）。
 - 批次填满后**非阻塞**入队（`xQueueSend(..., 0)`）：队列满就在下一拍重试，绝不阻塞 10 ms 采样循环；
   直到本地 deadline（理论采集时长 ×2 + 5 s）仍失败才判失败。
 - 进入采集前还会用 SNTP 时间比对服务端 `expires_at`，已过期则直接失败，不做无用的采集。
+  该字段服务端发的是 epoch **秒**，板端按 `< 1e12` 判断并归一到毫秒后再比较（见 `manual_capture_task_work_log.md` §7.3）。
 
 ### 4.3 批次结构与内存
 
@@ -245,10 +250,15 @@ I (16403) app: [task] done, periodic uploads resumed
 | 控件 | 行为 |
 |------|------|
 | 仅刷新（不采集） | 重新拉 `/api/v1/devices`、`/latest`、`/window`，不打扰板端 |
-| 采集一次最新数据 | `POST /api/v1/tasks`（100 点 @ 100 Hz、60 s 有效期）→ 每 1 s 轮询 `/api/v1/tasks/{id}` 直到终态 |
-| 任务卡片 | `request_id`、状态码 + 中文状态、样本数/采样率、剩余有效期、`error`；`duplicate=true` 时提示"已复用未完成任务" |
+| **参数表单** | 样本数（默认 100、上限 **600**）、采样率 Hz（默认 100、上限 **100**）、有效期 s（默认 60、5–600）；`source` 固定 `qma6100p`、`unit` 固定 `m/s^2` 故不开放编辑。范围取「服务端校验」与「板端能力」的交集，越界时本地直接拒绝（状态条提示，不发请求） |
+| 采集一次最新数据 | 按表单参数 `POST /api/v1/tasks` → 每 1 s 轮询 `/api/v1/tasks/{id}` 直到终态 |
+| 任务卡片 | `request_id`、状态码 + 中文状态、样本数/采样率、剩余有效期、`error`、`dispatched_at` / `acked_at` / `completed_at` 时间戳、关联批次 `upload_id`；`duplicate=true` 时提示"已复用未完成任务" |
+| 回执未收到提示 | 任务停在 `dispatched` 且 `dispatched_at` 已过 5 s 仍无 `acked_at` → 黄色提示"仍未收到设备回执"，并说明板端回执失败只写设备串口日志（纯前端推断，服务端状态机不变） |
+| 手动 vs 周期对照表 | 两行分别取 `/api/v1/latest?device_id=…&trigger=manual` 与 `?trigger=periodic`，列出 `upload_id` / 点数 / 批次起点 / 接收时间 / `request_id`，用来确认手动采集没有污染周期链路 |
+| 任务历史表 | `/api/v1/tasks?device_id=…&limit=20`：创建时间 / `request_id` / 点数@Hz / 状态 / `upload_id` / 耗时（按创建时间倒序） |
 
-任务完成后页面会立刻补拉一次数据，不用等下一次 0.8 s 常规轮询。
+任务完成后页面会立刻补拉一次数据，不用等下一次 0.8 s 常规轮询；
+对照表与任务历史挂在主轮询上按节流刷新（每 5 个轮询周期一次），切换设备或建任务时立即刷新。
 
 ### 5.2 三维姿态视图（纯 Canvas 2D）
 
@@ -266,6 +276,8 @@ I (16403) app: [task] done, periodic uploads resumed
 
 `/ui/?autocapture=1` 会在页面加载 1.2 s 后调用与按钮完全相同的 `captureOnce()`，
 便于用无头浏览器（见 6.1 第 3 个脚本）验证"建任务 → 渲染状态"链路而无需人工点击。
+同一 URL 还支持 `&samples=250&rate=50&timeout=45&source=qma6100p`：这些值会先覆盖参数表单，
+`captureOnce()` 就用它们建任务，因此可以无人值守地验证「表单参数真的传到了板端任务里」。
 
 ---
 
@@ -275,9 +287,10 @@ I (16403) app: [task] done, periodic uploads resumed
 
 | 脚本 | 覆盖 | 实测结果 |
 |------|------|----------|
-| `python server/test_receive.py` | 接收/校验/入库/查询/鉴权 + 任务全流程（创建 → 领取 → ack → 回传 → 幂等 → 连点去重 → 不匹配 400+failed → 惰性超时 → fail 上报 → 404 → 参数校验） | `ALL CHECKS PASSED`（25 项） |
+| `python server/test_receive.py` | 接收/校验/入库/查询/鉴权 + 任务全流程（创建 → 领取 → ack → 回传 → 幂等 → 连点去重 → 不匹配 400+failed → 惰性超时 → fail 上报 → 404 → 参数校验 → `/latest?trigger=` 过滤与非法值 400 → `/tasks` 历史倒序/字段齐全/limit 夹取） | `ALL CHECKS PASSED`（27 项） |
 | `python server/e2e_server_check.py` | 真实 uvicorn 子进程 + 真实 HTTP：上传、查询、任务创建/连点/领取/ack/回传/幂等/completed/health | `E2E ALL CHECKS PASSED`（8 项） |
-| `python server/e2e_ui_check.py` | 无头 Edge 打开 `/ui/?autocapture=1` 并 dump DOM：设备下拉、`trigger`/`request_id` 回填、波形点数、三维视图 `|a|`、页面自身建任务且服务端可见 | `ALL 22 UI E2E CHECKS PASSED`（无浏览器时打印 SKIP） |
+| `python server/e2e_ui_check.py` | 无头 Edge 打开 `/ui/?autocapture=1&samples=250&rate=50` 并 dump DOM（共 3 次 dump）：设备下拉、`trigger`/`request_id` 回填、波形点数、三维视图 `|a|`、参数表单带上板端上限且任务真用该参数、任务卡片 `upload_id` 与三个时间戳、任务历史倒序、`manual`/`periodic` 对照区、无回执提示出现与消失、状态文本含 `acked` | `ALL 41 UI E2E CHECKS PASSED`（无浏览器时打印 SKIP） |
+| `python server/e2e_device_check.py` | **真机验收**：起真实服务（默认 `0.0.0.0:8000`），等板端自己的周期上报出现，再跑满「建任务 → 领取 → ack → 采集窗口内周期上报为 0 → `completed` + `upload_id` → 周期恢复 → 历史可见」；板端不在场时打印 `[SKIP]` 并以 0 退出 | `DEVICE ACCEPTANCE PASSED`（11 项） |
 
 **老库迁移**单独验证过：手工造一个没有 `request_id` / `trigger` 列的旧库后调用 `init_db()`，
 列被补齐、历史行 `trigger='periodic'`、`request_id` 为 `NULL`、部分唯一索引存在，
@@ -293,6 +306,13 @@ I (16403) app: [task] done, periodic uploads resumed
 | 掉电/超时 | 点按钮后给板端断电 | 任务在有效期（默认 60 s）后变 `timeout` 且无上传；重启服务端状态不变，`/tasks/next` 返回 `found:false`；重新上电后可正常创建新任务 |
 | 重复回传 | 用同一 `request_id` 再 POST 一次上传 | 返回 `200 + idempotent=true`，`samples` 计数不变 |
 | 三维视图 | 拖拽/滚轮/双击 | 视角可旋转缩放复位；静止时向量贴近重力参考 `g`（约 `|a| = 9.81 m/s²`） |
+| 参数表单越界 | 样本数填 700（或采样率填 200）后点按钮 | 不发请求，状态条提示"任务参数不合法：样本数 必须是 1-600 的整数"，任务卡片不变 |
+| 参数表单生效 | 填 200 点 @ 50 Hz 后点按钮 | 任务卡片「样本数 / 采样率」显示 `200 点 @ 50 Hz`，板端日志 `accepted …: 200 samples @ 50 Hz` |
+| 无回执提示 | 让板端不 ack（或在 `/ui/` 页面里点按钮后把板端断电，任务已 `dispatched`） | 任务卡片下出现黄色"仍未收到设备回执"提示；板端重启并回执/回传后自动消失 |
+| 任务历史与对照 | 连做两次采集后看页面下方两张表 | 任务历史每次新增一行（创建时间/`request_id`/点数@Hz/状态/`upload_id`/耗时，按时间倒序）；对照表 manual 行带 `request_id`、periodic 行 `request_id` 为 `—` |
+
+> 上表逐条的**脚本化版本**（含"无板也能跑"的三层自检、真机 11 项断言、边界与不验收项）
+> 见 `docs/manual_capture_task_acceptance.md`。
 
 ### 6.3 编译验证
 
