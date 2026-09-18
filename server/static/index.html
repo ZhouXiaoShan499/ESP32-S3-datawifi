@@ -94,6 +94,16 @@
     display: block; width: 100%; height: 240px;
     border: 1px solid var(--border); border-radius: 6px; background: #fff;
   }
+  .scene-controls {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-bottom: 10px; font-size: 13px; color: var(--muted);
+  }
+  .scene-controls label { display: inline-flex; align-items: center; gap: 6px; }
+  #scene3d {
+    display: block; width: 100%; height: 380px; touch-action: none; cursor: grab;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  }
+  #scene3d:active { cursor: grabbing; }
   .err-msg { color: var(--err); }
   footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
@@ -178,6 +188,21 @@
     </div>
     <canvas id="chart" width="900" height="240"></canvas>
   </div>
+</section>
+
+<section id="sceneCard" class="card">
+  <h2>三维姿态视图（三轴向量 + 轨迹）<span id="sceneInfo" class="poll-hint"></span></h2>
+  <div class="scene-controls">
+    <label><input type="checkbox" id="autoRotate" checked> 自动旋转</label>
+    <button id="resetView" type="button">复位视角</button>
+    <span>拖拽旋转 · 滚轮缩放 · 双击复位</span>
+  </div>
+  <canvas id="scene3d" width="900" height="380"></canvas>
+  <p class="hint">
+    单位 m/s²，纯 Canvas 2D 正交投影（无外部库/CDN，局域网离线可用）。红/绿/蓝箭头 = ax/ay/az 坐标轴，
+    粗实线 = 当前加速度向量（含分解虚线），灰虚线 = 重力参考 g=9.81，地面网格上的虚线 = 向量在
+    XZ 平面的投影，浅蓝折线 = 最近 <span id="sceneWin">30</span> s 轨迹（按最近一批数据实时刷新）。
+  </p>
 </section>
 
 <footer>

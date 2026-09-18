@@ -47,6 +47,11 @@ const $ = {
   taskStatus: el('taskStatus'),
   taskSpec: el('taskSpec'),
   taskExpires: el('taskExpires'),
+  scene3d: el('scene3d'),
+  sceneInfo: el('sceneInfo'),
+  sceneWin: el('sceneWin'),
+  autoRotate: el('autoRotate'),
+  resetView: el('resetView'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '' };
@@ -413,6 +418,7 @@ async function poll() {
       state.lastPoints = [];
     }
     drawChart(state.lastPoints);
+    drawScene3D(state.lastPoints);
   } catch (e) {
     renderStatus('⚠ ' + e.message, 'error');
   } finally {
@@ -630,5 +636,343 @@ try {
 } catch (e) {
   /* 不支持 URLSearchParams 的环境忽略即可 */
 }
+
+/* ------------------------------------------------------------------ *
+ *  三维姿态视图：纯 Canvas 2D 手写正交投影（无第三方库 / 无 CDN）
+ *
+ *  屏幕约定：ax → 右，ay → 上，az → 朝向观察者；绕 Y 轴偏航、绕屏幕水平轴俯仰，
+ *  正交投影（不做透视除法，读数稳定，CPU 开销小）。地面网格画在 y = -L 平面，
+ *  当前向量在 XZ 平面上的投影用虚线落到网格上。
+ * ------------------------------------------------------------------ */
+
+const SCENE = {
+  yaw: -0.65,       // 偏航角（弧度）
+  pitch: 0.42,      // 俯仰角
+  zoom: 1,
+  auto: true,
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+const SCENE_AXIS_LEN = 12;        // 轴长（m/s²，覆盖 1 g ≈ 9.81）
+const SCENE_G = 9.80665;          // 重力参考值
+const SCENE_TRAJ_MAX = 600;       // 轨迹最多绘制点数（超出则抽样）
+const SCENE_COLORS = {
+  ax: '#cf222e', ay: '#1a7f37', az: '#2563eb',
+  vector: '#111827', gravity: '#8b95a1', traj: 'rgba(37, 99, 235, .45)',
+  grid: '#eef1f5', ground: '#c8ccd2',
+};
+
+/** 世界坐标 (x, y, z) → 屏幕坐标；depth 供将来做远近排序 */
+function project3D(x, y, z, w, h, scale) {
+  const cy = Math.cos(SCENE.yaw), sy = Math.sin(SCENE.yaw);
+  const cp = Math.cos(SCENE.pitch), sp = Math.sin(SCENE.pitch);
+  const x1 = x * cy - z * sy;      // 绕 Y 轴偏航
+  const z1 = x * sy + z * cy;
+  const y2 = y * cp - z1 * sp;     // 绕屏幕水平轴俯仰
+  const z2 = y * sp + z1 * cp;
+  const s = scale * SCENE.zoom;
+  return { x: w / 2 + x1 * s, y: h / 2 - y2 * s, depth: z2 };
+}
+
+/** 带箭头的线段（箭头在屏幕空间计算，保证各视角下大小一致） */
+function drawArrow(ctx, from, to, color, width, dashed) {
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 2) return;
+  const ux = dx / len, uy = dy / len;
+  const head = Math.min(10, Math.max(5, len * 0.16));
+  const bx = to.x - ux * head, by = to.y - uy * head;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = width;
+  if (dashed) ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(bx, by);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(to.x, to.y);
+  ctx.lineTo(bx - uy * head * 0.45, by + ux * head * 0.45);
+  ctx.lineTo(bx + uy * head * 0.45, by - ux * head * 0.45);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/** 地面网格（y = -L 平面）+ 网格原点十字 */
+function drawGround3D(ctx, w, h, scale, L) {
+  const steps = 4;
+  ctx.save();
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= steps; i++) {
+    const t = -L + (2 * L * i) / steps;
+    ctx.strokeStyle = (i * 2 === steps) ? SCENE_COLORS.ground : SCENE_COLORS.grid;
+    for (const seg of [[t, -L, t, L], [-L, t, L, t]]) {
+      const a = project3D(seg[0], -L, seg[1], w, h, scale);
+      const b = project3D(seg[2], -L, seg[3], w, h, scale);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/** 三轴箭头 + 轴标签，返回屏幕原点 */
+function drawAxes3D(ctx, w, h, scale, L) {
+  const o = project3D(0, 0, 0, w, h, scale);
+  const tips = {
+    ax: project3D(L, 0, 0, w, h, scale),
+    ay: project3D(0, L, 0, w, h, scale),
+    az: project3D(0, 0, L, w, h, scale),
+  };
+  ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const key of ['ax', 'ay', 'az']) {
+    drawArrow(ctx, o, tips[key], SCENE_COLORS[key], 1.6, false);
+    ctx.fillStyle = SCENE_COLORS[key];
+    ctx.fillText(key, tips[key].x, tips[key].y);
+  }
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('轴长 ' + L + ' m/s²', 10, h - 8);
+  return o;
+}
+
+/** 轨迹折线（抽样到 SCENE_TRAJ_MAX 点；起点灰、终点蓝） */
+function drawTrajectory3D(ctx, w, h, scale, points) {
+  if (!points || points.length < 2) return;
+  const step = Math.max(1, Math.floor(points.length / SCENE_TRAJ_MAX));
+  ctx.save();
+  ctx.strokeStyle = SCENE_COLORS.traj;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < points.length; i += step) {
+    const p = points[i];
+    if (!isFinite(p.ax) || !isFinite(p.ay) || !isFinite(p.az)) {
+      started = false;
+      continue;
+    }
+    const s = project3D(p.ax, p.ay, p.az, w, h, scale);
+    if (!started) {
+      ctx.moveTo(s.x, s.y);
+      started = true;
+    } else {
+      ctx.lineTo(s.x, s.y);
+    }
+  }
+  ctx.stroke();
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const a = project3D(first.ax, first.ay, first.az, w, h, scale);
+  const b = project3D(last.ax, last.ay, last.az, w, h, scale);
+  ctx.fillStyle = '#9aa4b2';
+  ctx.beginPath();
+  ctx.arc(a.x, a.y, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = SCENE_COLORS.az;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function sceneEmptyText(ctx, w, h, text) {
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '13px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, w / 2, h / 2);
+}
+
+/**
+ * 主绘制：地面网格 + 三轴 + 轨迹 + 当前向量（含分量/投影虚线）+ 重力参考。
+ * points: [{t, ax, ay, az}, …]，按 t 升序（即 /api/v1/window 的返回值）
+ */
+function drawScene3D(points) {
+  const cv = $.scene3d;
+  if (!cv || !cv.getContext) return;
+  const ctx = cv.getContext('2d');
+  const { w, h } = fitCanvas(cv, ctx);
+  ctx.clearRect(0, 0, w, h);
+
+  const L = SCENE_AXIS_LEN;
+  const scale = Math.min(w, h) / (L * 3.6);     // 让 ±L 落在画布中部
+
+  drawGround3D(ctx, w, h, scale, L);
+  const o = drawAxes3D(ctx, w, h, scale, L);
+  drawTrajectory3D(ctx, w, h, scale, points);
+
+  const last = (points && points.length) ? points[points.length - 1] : null;
+  if (!last || !isFinite(last.ax) || !isFinite(last.ay) || !isFinite(last.az)) {
+    sceneEmptyText(ctx, w, h, '等待数据……（板端上传后此处实时刷新）');
+    updateSceneInfo(null, points);
+    return;
+  }
+
+  const v = project3D(last.ax, last.ay, last.az, w, h, scale);
+  const comps = [
+    [project3D(last.ax, 0, 0, w, h, scale), SCENE_COLORS.ax],
+    [project3D(0, last.ay, 0, w, h, scale), SCENE_COLORS.ay],
+    [project3D(0, 0, last.az, w, h, scale), SCENE_COLORS.az],
+  ];
+  const shadow = project3D(last.ax, -L, last.az, w, h, scale);
+
+  ctx.save();                     // 分量 + 地面投影（虚线，画在下层）
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1.2;
+  for (const [tip, color] of comps) {
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = SCENE_COLORS.ground;
+  ctx.beginPath();
+  ctx.moveTo(v.x, v.y);
+  ctx.lineTo(shadow.x, shadow.y);
+  ctx.stroke();
+  ctx.restore();
+
+  const gz = (last.az >= 0 ? 1 : -1) * SCENE_G;   // 重力参考：与 az 同向取 +g
+  const g = project3D(0, 0, gz, w, h, scale);
+  drawArrow(ctx, o, g, SCENE_COLORS.gravity, 1.4, true);
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('g', g.x, g.y - 4);
+
+  drawArrow(ctx, o, v, SCENE_COLORS.vector, 2.6, false);   // 当前向量（最上层）
+  ctx.fillStyle = SCENE_COLORS.vector;
+  ctx.beginPath();
+  ctx.arc(v.x, v.y, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  drawSceneLegend(ctx, last);
+  updateSceneInfo(last, points);
+}
+
+function drawSceneLegend(ctx, p) {
+  const mag = Math.sqrt(p.ax * p.ax + p.ay * p.ay + p.az * p.az);
+  const deg = (r) => (r * 180 / Math.PI).toFixed(0);
+  const lines = [
+    'a = (' + p.ax.toFixed(2) + ', ' + p.ay.toFixed(2) + ', ' + p.az.toFixed(2) + ') m/s²',
+    '|a| = ' + mag.toFixed(2) + ' m/s²    g = ' + SCENE_G.toFixed(2),
+    '偏航 ' + deg(SCENE.yaw) + '° · 俯仰 ' + deg(SCENE.pitch) +
+      '° · 缩放 ' + SCENE.zoom.toFixed(2) + '×',
+  ];
+  ctx.save();
+  ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#1f2933';
+  lines.forEach((t, i) => ctx.fillText(t, 10, 10 + i * 16));
+  ctx.restore();
+}
+
+function updateSceneInfo(last, points) {
+  if (!$.sceneInfo) return;
+  if (!last) {
+    $.sceneInfo.textContent = '暂无数据';
+    return;
+  }
+  const mag = Math.sqrt(last.ax * last.ax + last.ay * last.ay + last.az * last.az);
+  $.sceneInfo.textContent = '|a| = ' + mag.toFixed(2) + ' m/s² · 轨迹 ' +
+                            ((points || []).length) + ' 点';
+}
+
+/* ---- 交互：拖拽旋转 / 滚轮缩放 / 双击或按钮复位 / 自动旋转 ---- */
+
+function resetScene() {
+  SCENE.yaw = -0.65;
+  SCENE.pitch = 0.42;
+  SCENE.zoom = 1;
+  drawScene3D(state.lastPoints || []);
+}
+
+let sceneLastFrame = 0;
+
+/** 自动旋转：rAF 驱动并限到约 30 fps，避免无谓重绘 */
+function sceneRotateLoop(ts) {
+  const now = (typeof ts === 'number') ? ts : performance.now();
+  if (SCENE.auto && !SCENE.dragging && (now - sceneLastFrame) > 33) {
+    sceneLastFrame = now;
+    SCENE.yaw += 0.006;
+    drawScene3D(state.lastPoints || []);
+  }
+  requestAnimationFrame(sceneRotateLoop);
+}
+
+function sceneInit() {
+  const cv = $.scene3d;
+  if (!cv) return;
+  if ($.sceneWin) $.sceneWin.textContent = String(CHART_WINDOW_S);
+  if ($.autoRotate) SCENE.auto = $.autoRotate.checked;
+
+  const onDown = (x, y) => {
+    SCENE.dragging = true;
+    SCENE.lastX = x;
+    SCENE.lastY = y;
+  };
+  const onMove = (x, y) => {
+    if (!SCENE.dragging) return;
+    const dx = x - SCENE.lastX;
+    const dy = y - SCENE.lastY;
+    SCENE.lastX = x;
+    SCENE.lastY = y;
+    SCENE.yaw += dx * 0.01;
+    SCENE.pitch = Math.max(-1.45, Math.min(1.45, SCENE.pitch + dy * 0.01));
+    drawScene3D(state.lastPoints || []);
+  };
+  const onUp = () => { SCENE.dragging = false; };
+
+  cv.addEventListener('mousedown', (ev) => onDown(ev.clientX, ev.clientY));
+  window.addEventListener('mousemove', (ev) => onMove(ev.clientX, ev.clientY));
+  window.addEventListener('mouseup', onUp);
+
+  cv.addEventListener('touchstart', (ev) => {
+    const t = ev.touches[0];
+    if (t) onDown(t.clientX, t.clientY);
+  }, { passive: true });
+  cv.addEventListener('touchmove', (ev) => {
+    const t = ev.touches[0];
+    if (!t) return;
+    ev.preventDefault();
+    onMove(t.clientX, t.clientY);
+  }, { passive: false });
+  cv.addEventListener('touchend', onUp);
+
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 0.92 : 1.08;
+    SCENE.zoom = Math.max(0.4, Math.min(3, SCENE.zoom * factor));
+    drawScene3D(state.lastPoints || []);
+  }, { passive: false });
+
+  cv.addEventListener('dblclick', () => resetScene());
+  if ($.resetView) $.resetView.addEventListener('click', () => resetScene());
+  if ($.autoRotate) {
+    $.autoRotate.addEventListener('change', () => { SCENE.auto = $.autoRotate.checked; });
+  }
+  // 窗口尺寸变化时按新尺寸重绘（正交投影，只需重算 scale）
+  window.addEventListener('resize', () => drawScene3D(state.lastPoints || []));
+
+  requestAnimationFrame(sceneRotateLoop);
+  drawScene3D(state.lastPoints || []);
+}
+
+sceneInit();
 
 
