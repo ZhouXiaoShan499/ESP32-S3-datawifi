@@ -33,23 +33,25 @@ data_capture_sim/                  # 仓库根目录
 ├── .gitignore                     # 忽略 build/、sdkconfig、managed_components/、server/data/ 等
 │
 ├── main/                          # 板端固件（ESP-IDF 组件）
-│   ├── main.c                     # 主固件（约 2800 行）
+│   ├── main.c                     # 主固件（约 3500 行）
 │   ├── CMakeLists.txt             # 组件注册 + 依赖声明
 │   ├── Kconfig.projbuild          # 菜单配置（WiFi / 设备 ID / 上传 URL）
 │   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
 │
 ├── docs/                          # 项目文档
 │   ├── crash_analysis_and_fix.md  # 崩溃分析与修复记录（LVGL 栈溢出）
-│   └── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
+│   ├── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
+│   └── manual_capture_task.md     # 按需采集任务（Web 触发、request_id 贯穿、三维视图）
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
-    ├── main.py                    # FastAPI 接收服务（约 530 行）
+    ├── main.py                    # FastAPI 服务（约 1200 行：接收 + 存储 + 查询 + 任务接口）
     ├── requirements.txt           # 依赖（fastapi、uvicorn、httpx）
-    ├── test_receive.py            # 本地联调自测脚本
+    ├── test_receive.py            # 本地联调自测脚本（含按需采集任务全流程）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检脚本
+    ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
     └── static/                    # 实时监控页面（静态资源）
-        ├── index.html             # 页面结构 + 样式
-        └── app.js                 # 轮询 + 渲染逻辑
+        ├── index.html             # 页面结构 + 样式（含任务卡片与三维视图画布）
+        └── app.js                 # 轮询 + 渲染 + 任务跟踪 + Canvas 2D 三维姿态视图
 ```
 
 ### 2.1 根目录
@@ -64,7 +66,7 @@ data_capture_sim/                  # 仓库根目录
 
 | 文件 | 说明 |
 |------|------|
-| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。 |
+| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。另含 **按需采集任务**：`task_poll_task` 每 3s 轮询 `/api/v1/tasks/next`，领到任务后由 `sampler_task` 按任务节拍采一批数据（期间暂停周期上报）并带 `request_id` 回传。 |
 | `CMakeLists.txt` | 通过 `idf_component_register` 注册组件，声明 `SRCS "main.c"`，并 `REQUIRES` 大量依赖（`json`、`esp_http_client`、`esp_netif`、`esp_wifi`、`sdmmc`、`fatfs`、`esp_timer`、`esp_lcd` 等）。 |
 | `Kconfig.projbuild` | 定义 `menuconfig` 菜单：WiFi SSID/密码、设备 ID（`SENSOR_DEVICE_ID`）、上传 URL（`SENSOR_SERVER_URL`）、可选上传鉴权 Token（`SENSOR_TOKEN`）。真实值通过本地 `sdkconfig` 配置，**不入库**。 |
 | `idf_component.yml` | ESP 组件注册表依赖：`espressif/esp32_s3_eye`（BSP）、`espressif/qma6100p`（传感器驱动）、`idf >= 5.4`。 |
@@ -73,19 +75,29 @@ data_capture_sim/                  # 仓库根目录
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、托管监控页面。 |
+| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、按需采集任务接口、托管监控页面。 |
 | `requirements.txt` | Python 依赖：`fastapi`、`uvicorn[standard]`、`httpx`（自测用）。 |
-| `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支。 |
-| `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检。 |
-| `static/index.html` | 监控页面结构（设备下拉、数据卡片、样本表）。 |
-| `static/app.js` | 轮询逻辑（每 2s 拉取设备列表与最新数据并渲染）。 |
+| `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与按需采集任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败）。 |
+| `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等）。 |
+| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开 `/ui/?autocapture=1` 并 dump DOM，断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、页面自身建任务）；未装浏览器时打印 SKIP。 |
+| `static/index.html` | 监控页面结构（设备下拉、数据卡片、样本表、波形画布、任务卡片、三维视图画布）。 |
+| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图）、按需采集任务创建与状态跟踪、Canvas 2D 手写正交投影渲染。 |
 
-#### 服务端数据库（SQLite，两张表）
+#### 服务端数据库（SQLite，三张表）
 
 | 表 | 说明 |
 |----|------|
-| `uploads` | 每个上传批次一行，记录设备、来源、单位、起始时间戳、接收时间、样本数、来源 IP、原始 JSON（`payload`）。 |
+| `uploads` | 每个上传批次一行，记录设备、来源、单位、起始时间戳、接收时间、样本数、来源 IP、原始 JSON（`payload`）、任务号（`request_id`）与触发方式（`trigger`）。 |
 | `samples` | 每批内的每个采样点一行，记录 `ax/ay/az` 三轴加速度与相对时间偏移。 |
+| `tasks` | 按需采集任务：`request_id`（主键，uuid4 hex）、设备、来源、单位、采样率/样本数、状态、各状态时间戳、`expires_at`、关联 `upload_id` 与失败原因。 |
+
+- **老库迁移**：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列。`init_db()` 在 `executescript`
+  之后用 `PRAGMA table_info(uploads)` 判断并 `ALTER TABLE` 补 `request_id` / `trigger`，最后创建
+  **部分唯一索引** `idx_uploads_request`（`WHERE request_id IS NOT NULL`）。
+- **幂等**：带 `request_id` 的上传先查 `uploads.request_id`，命中即返回 `200 + idempotent=true`
+  且不写任何新行；`tasks` 的收尾与 `uploads/samples` 写入在同一事务内提交。
+- **惰性超时**：`_expire_stale_tasks()` 在创建/查询/领取路径调用，把 `expires_at` 已过的非终态任务
+  置 `timeout`，无后台线程，服务重启后状态自洽。
 
 #### 服务端 HTTP 接口
 
@@ -94,9 +106,19 @@ data_capture_sim/                  # 仓库根目录
 | `POST` | `/api/v1/upload` | 接收板端上传的传感数据批次（校验后入库，成功返回 201）。 |
 | `GET` | `/api/v1/health` | 服务健康状态 + 汇总统计（总批次 / 总样本 / 设备列表 / 最近上报）。 |
 | `GET` | `/api/v1/devices` | 设备列表（各设备的批次数与最近上报时间）。 |
-| `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本，用于核对采集值）。 |
+| `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本，并带回 `trigger` / `request_id` 便于判断数据来源）。 |
+| `POST` | `/api/v1/tasks` | 创建按需采集任务（Web 触发；同设备已有未完成任务时复用，返回 `duplicate=true`）。 |
+| `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`）。 |
+| `GET` | `/api/v1/tasks/next?device_id=…` | 板端领取任务（原子 `UPDATE … WHERE status='submitted'`；声明在 `/tasks/{request_id}` 之前）。 |
+| `GET` | `/api/v1/tasks/{request_id}` | 任务详情 + 关联上传摘要。 |
+| `POST` | `/api/v1/tasks/{request_id}/ack` | 板端回执（`submitted/dispatched` → `acked`）。 |
+| `POST` | `/api/v1/tasks/{request_id}/fail` | 板端上报失败原因（写入 `tasks.error`）。 |
 | `GET` | `/` | 极简 HTML 首页（内联渲染，数值不写死）。 |
 | `GET` | `/ui/` | 实时监控面板（托管 `server/static/` 下的静态文件）。 |
+
+> 鉴权范围：设备侧接口（`/api/v1/upload`、`/api/v1/tasks/next`、`/tasks/{id}/ack`、`/tasks/{id}/fail`）
+> 在配置了 `SENSOR_TOKEN` 时要求 `Authorization: Bearer <token>`；Web 侧查询/建任务接口与既有查询接口
+> 一样不做 Token 校验。
 
 ---
 
@@ -121,7 +143,9 @@ main（始终可部署）
 ```
 
 1. **从 `main` 创建分支**：`main` 分支始终保持可部署状态，任何新功能都从 `main` 拉出新分支，不直接在 `main` 上开发。
-2. **分支命名**：用描述性前缀，如 `feature/<描述>`、`bugfix/<描述>`、`docs/<描述>`。本项目当前分支为 `feature/real-sensor-upload-web`。
+2. **分支命名**：用描述性前缀，如 `feature/<描述>`、`bugfix/<描述>`、`docs/<描述>`。历史上用过
+   `feature/real-sensor-upload-web`、`feature/psram-upload-fix-web-ui`；本次按需采集任务功能使用
+   `feature/manual-capture-task-web-3d`。
 3. **小步提交**：频繁、原子化提交，每次提交只做一件事，便于 review 与回滚。
 4. **推送**：将分支推送到远程仓库（`origin`）。
 5. **Pull Request**：发起 PR 请求合并到 `main`，附上改动说明。
@@ -151,6 +175,17 @@ main（始终可部署）
 | `feat(server): add FastAPI receiver and store service for IMU upload` | 服务端 | 先建好接收 + 存储服务，板端才有目标。 |
 | `feat(esp32): upload real IMU samples to FastAPI server over WiFi` | 板端 | 板端定时打包真实采样数据并 WiFi 上传。 |
 | `feat: add UI monitor page, expand build deps, expose /ui endpoint` | 前端 | 补充监控页面与静态资源托管，形成完整闭环。 |
+
+**「按需采集任务 + Web/三维视图」功能（分支 `feature/manual-capture-task-web-3d`）** 同样按分层递进：
+
+| 提交 | 类型 | 说明 |
+|------|------|------|
+| `feat(server): add on-demand capture task endpoints with request_id traceability` | 服务端 | `tasks` 表 + 6 个任务接口 + 老库补列迁移 + 上传幂等与任务收尾同事务。 |
+| `feat(esp32): poll capture tasks and pause periodic upload during manual capture` | 板端 | 任务轮询、采样闸门、周期上报暂停、批次带 `request_id` 回传、失败回执。 |
+| `feat(ui): add refresh-only and capture-once buttons with task tracking` | 前端 | 两个按钮 + 任务卡片（request_id / 状态 / 剩余有效期）。 |
+| `feat(ui): add rotatable 3D three-axis vector and trajectory view` | 前端 | 纯 Canvas 2D 正交投影三维视图（拖拽/滚轮/复位/自动旋转）。 |
+| `test(server): cover task lifecycle, idempotency, timeout and duplicate clicks` | 测试 | 单元 + 真实 HTTP + 无头浏览器三层自检。 |
+| `docs: document manual capture task, web buttons and 3D view` | 文档 | README / PROJECT_STRUCTURE / `docs/manual_capture_task.md`。 |
 
 ### 3.4 常用命令
 
