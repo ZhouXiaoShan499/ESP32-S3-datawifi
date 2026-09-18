@@ -39,9 +39,10 @@ data_capture_sim/                  # 仓库根目录
 │   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
 │
 ├── docs/                          # 项目文档
-│   ├── crash_analysis_and_fix.md  # 崩溃分析与修复记录（LVGL 栈溢出）
-│   ├── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
-│   └── manual_capture_task.md     # 按需采集任务（Web 触发、request_id 贯穿、三维视图）
+│   ├── crash_analysis_and_fix.md       # 崩溃分析与修复记录（LVGL 栈溢出）
+│   ├── psram_upload_fix.md             # 上传链路失效分析与修复（PSRAM 未启用）
+│   ├── manual_capture_task.md          # 按需采集任务（Web 触发、request_id 贯穿、三维视图）
+│   └── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
     ├── main.py                    # FastAPI 服务（约 1200 行：接收 + 存储 + 查询 + 任务接口）
@@ -186,6 +187,7 @@ main（始终可部署）
 | `feat(ui): add rotatable 3D three-axis vector and trajectory view` | 前端 | 纯 Canvas 2D 正交投影三维视图（拖拽/滚轮/复位/自动旋转）。 |
 | `test(server): cover task lifecycle, idempotency, timeout and duplicate clicks` | 测试 | 单元 + 真实 HTTP + 无头浏览器三层自检。 |
 | `docs: document manual capture task, web buttons and 3D view` | 文档 | README / PROJECT_STRUCTURE / `docs/manual_capture_task.md`。 |
+| `docs: add work log for manual capture task session` | 文档 | `docs/manual_capture_task_work_log.md`：需求 → 交付 → 验证 → 遗留的过程记录。 |
 
 ### 3.4 常用命令
 

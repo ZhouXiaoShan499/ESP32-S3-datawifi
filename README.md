@@ -38,9 +38,10 @@ data_capture_sim/
 │   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
 │
 ├── docs/
-│   ├── crash_analysis_and_fix.md  # 崩溃分析与修复记录（LVGL 栈溢出）
-│   ├── psram_upload_fix.md        # 上传链路失效分析与修复（PSRAM 未启用）
-│   └── manual_capture_task.md     # 按需采集任务（request_id 贯穿）+ Web/三维视图说明
+│   ├── crash_analysis_and_fix.md       # 崩溃分析与修复记录（LVGL 栈溢出）
+│   ├── psram_upload_fix.md             # 上传链路失效分析与修复（PSRAM 未启用）
+│   ├── manual_capture_task.md          # 按需采集任务（request_id 贯穿）+ Web/三维视图说明
+│   └── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │
 └── server/                        # 服务端（PC 运行，Python/FastAPI）
     ├── main.py                    # FastAPI 服务（校验 + SQLite + 查询接口 + 按需采集任务接口）
@@ -224,7 +225,8 @@ label,timestamp_ms,accel_x,accel_y,accel_z
   支持**拖拽旋转、滚轮缩放、双击或按钮复位、自动旋转开关**。
 - 自动化核对：打开 `/ui/?autocapture=1` 会触发与按钮完全相同的代码路径（便于无人值守验证）。
 
-> 完整说明（接口字段、状态机、板端实现、验证场景）见 `docs/manual_capture_task.md`。
+> 完整说明（接口字段、状态机、板端实现、验证场景）见 `docs/manual_capture_task.md`；
+> 需求来源、交付物清单、实测结果与遗留事项见 `docs/manual_capture_task_work_log.md`。
 
 ---
 
