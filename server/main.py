@@ -15,11 +15,23 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
     "source":    "qma6100p",            # 传感源型号
     "unit":      "m/s^2",               # ax/ay/az 的单位
     "ts_ms":     1767123456789,         # 板端 NTP 同步后的采样起点时间戳(epoch ms)
+    "request_id": "8f3c...",            # 可选：按需采集任务 id（manual 批次才有）
+    "trigger":   "manual",              # 可选：periodic(周期上报) / manual(按需采集)
     "samples": [
         {"i": 0, "t_ms": 0,    "ax": 0.02, "ay": -0.15, "az": 9.81},
         {"i": 1, "t_ms": 10,   "ax": 0.03, "ay": -0.14, "az": 9.80}
     ]
   }
+
+按需采集任务（manual capture task）—— 对应 Web 上「采集一次最新数据」按钮：
+  * Web 侧：POST /api/v1/tasks 创建任务 → GET /api/v1/tasks/{request_id} 追踪状态
+  * 板端侧：GET /api/v1/tasks/next?device_id=… 轮询取任务 → 采集一次 → 带 request_id 回传
+  状态机：submitted → dispatched → acked → completed；失败为 failed，过期未完成变 timeout。
+  request_id 是任务主键，并贯穿任务、回执、上传与样本（uploads.request_id 部分唯一索引保证幂等：
+  同一 request_id 重复上传不会重复写样本）。
+  鉴权范围：Web 侧接口不做 Token 校验（与既有查询接口一致）；设备侧接口
+  （/api/v1/upload、/api/v1/tasks/next、/tasks/{id}/ack、/tasks/{id}/fail）在设置了 SENSOR_TOKEN
+  时才要求 Bearer Token。
 
 运行（本地电脑）：
   python server/main.py          # 默认 http://127.0.0.1:8000
@@ -34,6 +46,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime
 
 from fastapi import FastAPI, Request
@@ -67,6 +80,28 @@ SUPPORTED_AXES = ("ax", "ay", "az")
 MAX_WINDOW_SECONDS = 300
 MAX_WINDOW_POINTS = 12000
 
+# ---------------------------------------------------------------------------
+# 按需采集任务（manual capture task）参数与状态
+# ---------------------------------------------------------------------------
+TASK_DEFAULT_SOURCE = "qma6100p"     # 沿用板端真实传感源
+TASK_DEFAULT_UNIT = "m/s^2"
+TASK_DEFAULT_RATE_HZ = 100           # QMA6100P 100 Hz → 100 点约为 1 s 数据
+TASK_DEFAULT_COUNT = 100
+TASK_DEFAULT_TIMEOUT_S = 60
+TASK_MIN_RATE_HZ, TASK_MAX_RATE_HZ = 10, 200
+TASK_MIN_TIMEOUT_S, TASK_MAX_TIMEOUT_S = 5, 600
+TASK_TERMINAL_STATES = ("completed", "failed", "timeout")
+TASK_STATUS_CN = {
+    "submitted": "已提交",
+    "dispatched": "已下发",
+    "acked": "设备接收",
+    "completed": "完成",
+    "failed": "失败",
+    "timeout": "超时",
+}
+# request_id 允许的字符集（uuid4().hex 天然满足，也兼容自定 id）
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
 app = FastAPI(
     title="ESP32-S3 IMU Sensor Receiver",
     description="接收并存储开发板 IMU 传感数据，提供查询接口。",
@@ -93,8 +128,34 @@ def _connect():
     return conn
 
 
+def _table_columns(conn, table):
+    """读取某表已有列名，用于老库补列判断。"""
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_uploads_columns(conn):
+    """老库补列 + 建立 request_id 唯一索引。
+
+    CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段，所以升级服务端后
+    旧库必须靠 ALTER TABLE 补 request_id / trigger，否则上传会直接报错。
+    """
+    cols = _table_columns(conn, "uploads")
+    if "request_id" not in cols:
+        conn.execute("ALTER TABLE uploads ADD COLUMN request_id TEXT")
+    if "trigger" not in cols:
+        conn.execute(
+            "ALTER TABLE uploads ADD COLUMN trigger TEXT NOT NULL DEFAULT 'periodic'"
+        )
+    # 一条 request_id 最多对应一条上传：同一任务重复上传不会重复写样本。
+    # 必须在补列之后创建，否则老库上会因缺列失败。
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_request"
+        " ON uploads (request_id) WHERE request_id IS NOT NULL"
+    )
+
+
 def init_db():
-    """建表：uploads(每个批次) + samples(每批内的每个采样点)。"""
+    """建表：uploads(每个批次) + samples(每批内的每个采样点) + tasks(按需采集任务)。"""
     global _initialized
     if _initialized:
         return
@@ -114,6 +175,8 @@ def init_db():
                     received_at   REAL NOT NULL,      -- 服务端入库时间(epoch s, 带小数)
                     sample_count  INTEGER NOT NULL,
                     ip            TEXT,
+                    request_id    TEXT,               -- 按需采集任务 id（manual 批次才有）
+                    trigger       TEXT NOT NULL DEFAULT 'periodic',  -- periodic / manual
                     payload       TEXT NOT NULL       -- 原始 JSON，便于追溯原始记录
                 );
                 CREATE INDEX IF NOT EXISTS idx_uploads_device_ts
@@ -135,8 +198,31 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_samples_upload
                     ON samples (upload_id);
+                -- 按需采集任务：request_id 即任务主键，贯穿任务/回执/上传
+                CREATE TABLE IF NOT EXISTS tasks (
+                    request_id     TEXT PRIMARY KEY,
+                    device_id      TEXT NOT NULL,
+                    source         TEXT NOT NULL,
+                    unit           TEXT NOT NULL,
+                    sample_rate_hz INTEGER NOT NULL,
+                    sample_count   INTEGER NOT NULL,
+                    trigger        TEXT NOT NULL DEFAULT 'manual',
+                    status         TEXT NOT NULL,   -- submitted/dispatched/acked/completed/failed/timeout
+                    created_at     REAL NOT NULL,
+                    dispatched_at  REAL,
+                    acked_at       REAL,
+                    completed_at   REAL,
+                    expires_at     REAL NOT NULL,   -- 超过即判 timeout（惰性判定）
+                    upload_id      INTEGER,
+                    error          TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_tasks_device_status
+                    ON tasks (device_id, status);
+                CREATE INDEX IF NOT EXISTS idx_tasks_pending
+                    ON tasks (device_id, status, created_at);
                 """
             )
+            _migrate_uploads_columns(conn)
             conn.commit()
         finally:
             conn.close()
@@ -210,12 +296,81 @@ def validate_payload(payload):
         seq = s.get("i", idx)
         cleaned.append({"i": seq, "t_ms": t_ms, **vals})
 
+    # 可选字段 request_id / trigger：按需采集任务才有；
+    # 缺省时行为与旧版完全一致（trigger 归一为 periodic）。
+    request_id = payload.get("request_id")
+    if request_id is not None:
+        if not isinstance(request_id, str) or not REQUEST_ID_RE.match(request_id.strip()):
+            return False, "invalid 'request_id' (expect 6-64 chars of [A-Za-z0-9_-])"
+        request_id = request_id.strip()
+
+    trigger = payload.get("trigger")
+    if isinstance(trigger, str) and trigger.strip() in ("periodic", "manual"):
+        trigger = trigger.strip()
+    else:
+        trigger = "manual" if request_id else "periodic"
+
     return True, {
         "device_id": device_id,
         "source": source,
         "unit": unit,
         "ts_ms": ts_ms,
         "samples": cleaned,
+        "request_id": request_id,
+        "trigger": trigger,
+    }
+
+
+def validate_task_request(payload):
+    """校验 POST /api/v1/tasks 的请求体，返回 (ok, data|error_message)。"""
+    if not isinstance(payload, dict):
+        return False, "payload must be a JSON object"
+
+    device_id = payload.get("device_id")
+    if not isinstance(device_id, str) or not device_id.strip():
+        return False, "missing or empty 'device_id'"
+    device_id = device_id.strip()
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+
+    source = payload.get("source") or TASK_DEFAULT_SOURCE
+    if not isinstance(source, str) or not source.strip():
+        return False, "'source' must be a non-empty string"
+    source = source.strip()[:MAX_SOURCE_LEN]
+
+    unit = _normalize_unit(payload.get("unit") or TASK_DEFAULT_UNIT)
+    if unit is None:
+        return False, "invalid 'unit' (expected m/s^2 or g)"
+
+    limits = (
+        ("sample_rate_hz", TASK_DEFAULT_RATE_HZ, TASK_MIN_RATE_HZ, TASK_MAX_RATE_HZ),
+        ("sample_count", TASK_DEFAULT_COUNT, 1, MAX_SAMPLES_PER_BATCH),
+        ("timeout_s", TASK_DEFAULT_TIMEOUT_S, TASK_MIN_TIMEOUT_S, TASK_MAX_TIMEOUT_S),
+    )
+    parsed = {}
+    for name, default, low, high in limits:
+        raw = payload.get(name, default)
+        if isinstance(raw, bool):
+            return False, f"invalid '{name}'"
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return False, f"invalid '{name}'"
+        if value < low or value > high:
+            return False, (
+                f"invalid '{name}' (sample_rate_hz {TASK_MIN_RATE_HZ}-{TASK_MAX_RATE_HZ},"
+                f" sample_count 1-{MAX_SAMPLES_PER_BATCH},"
+                f" timeout_s {TASK_MIN_TIMEOUT_S}-{TASK_MAX_TIMEOUT_S})"
+            )
+        parsed[name] = value
+
+    return True, {
+        "device_id": device_id,
+        "source": source,
+        "unit": unit,
+        "sample_rate_hz": parsed["sample_rate_hz"],
+        "sample_count": parsed["sample_count"],
+        "timeout_s": parsed["timeout_s"],
     }
 
 
@@ -223,8 +378,23 @@ def validate_payload(payload):
 # 业务
 # ---------------------------------------------------------------------------
 def store_upload(data, ip=None):
+    """一个事务内写 uploads + samples；带 request_id 时联动 tasks 收尾。
+
+    返回 (upload_id, idempotent)。idempotent=True 表示该 request_id 之前已入库，
+    本次没有写任何行（板端重试 / 重复点击不会重复写样本）。
+    """
+    request_id = data.get("request_id")
+    trigger = data.get("trigger") or ("manual" if request_id else "periodic")
     conn = _connect()
     try:
+        if request_id:
+            row = conn.execute(
+                "SELECT id FROM uploads WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if row is not None:
+                conn.rollback()      # 未写任何行，回滚只是保险
+                return row["id"], True
+
         samples = data["samples"]
         payload_json = json.dumps(
             {
@@ -232,13 +402,16 @@ def store_upload(data, ip=None):
                 "source": data["source"],
                 "unit": data["unit"],
                 "ts_ms": data["ts_ms"],
+                "request_id": request_id,
+                "trigger": trigger,
                 "samples": samples,
             },
             ensure_ascii=False,
         )
         cur = conn.execute(
             "INSERT INTO uploads (device_id, source, unit, ts_ms, received_at,"
-            " sample_count, ip, payload) VALUES (?,?,?,?,?,?,?,?)",
+            " sample_count, ip, payload, request_id, trigger)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 data["device_id"],
                 data["source"],
@@ -248,6 +421,8 @@ def store_upload(data, ip=None):
                 len(samples),
                 ip,
                 payload_json,
+                request_id,
+                trigger,
             ),
         )
         upload_id = cur.lastrowid
@@ -260,8 +435,19 @@ def store_upload(data, ip=None):
                 for s in samples
             ],
         )
+        if request_id:
+            # 任务收尾与数据入库放在同一事务：要么都成功，要么都不写，
+            # 不会出现「任务已完成但没有数据」或反之。
+            conn.execute(
+                "UPDATE tasks SET status='completed', completed_at=?,"
+                " upload_id=?, error=NULL WHERE request_id=?",
+                (time.time(), upload_id, request_id),
+            )
         conn.commit()
-        return upload_id
+        return upload_id, False
+    except sqlite3.Error:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -275,19 +461,118 @@ def _fmt_time(epoch_s):
     return datetime.fromtimestamp(epoch_s).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _device_auth_ok(request):
+    """设备侧接口的可选鉴权。
+
+    Web 侧接口（创建/查询任务、/devices、/latest …）不做 Token 校验，与既有
+    查询接口保持一致；只有板端调用的接口（upload / tasks/next / ack / fail）
+    在 SENSOR_TOKEN 非空时才要求 Bearer Token。
+    """
+    if not SENSOR_TOKEN:
+        return True
+    got = request.headers.get("authorization", "")
+    want = f"Bearer {SENSOR_TOKEN}"
+    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+
+
+def _unauthorized():
+    return JSONResponse(
+        status_code=401,
+        content={"code": "UNAUTHORIZED", "ok": False,
+                 "error": "missing or invalid bearer token"},
+    )
+
+
+def _expire_stale_tasks(conn, device_id=None):
+    """惰性超时判定：把过了 expires_at 且未终态的任务标记为 timeout。
+
+    不引入后台定时线程——所有创建/查询/领取路径都先调用它，因此服务重启后
+    任务状态同样自洽，且过期任务绝不会被 /api/v1/tasks/next 下发。
+    """
+    now = time.time()
+    sql = ("UPDATE tasks SET status='timeout', completed_at=?,"
+           " error=COALESCE(error, 'expired before device upload')"
+           " WHERE status NOT IN ('completed','failed','timeout') AND expires_at < ?")
+    args = [now, now]
+    if device_id:
+        sql += " AND device_id = ?"
+        args.append(device_id)
+    return conn.execute(sql, args).rowcount
+
+
+def _task_view(row):
+    """tasks 行 → 对外结构（附中文状态与剩余有效期，便于 Web 直接展示）。"""
+    task = dict(row)
+    task["status_cn"] = TASK_STATUS_CN.get(task["status"], task["status"])
+    task["terminal"] = task["status"] in TASK_TERMINAL_STATES
+    for key in ("created_at", "dispatched_at", "acked_at", "completed_at", "expires_at"):
+        task[f"{key}_str"] = _fmt_time(task.get(key))
+    task["expires_in_s"] = round(task["expires_at"] - time.time(), 1)
+    return task
+
+
+def _check_task_match(request_id, data):
+    """校验带 request_id 的上传是否属于该任务；不匹配则把任务置为 failed。
+
+    返回 None 表示校验通过；否则返回应当发给板端的错误响应（4xx → 板端不重试）。
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return JSONResponse(
+                status_code=404,
+                content={"code": "TASK_NOT_FOUND", "ok": False,
+                         "error": f"unknown request_id: {request_id}"},
+            )
+        task = dict(row)
+        problems = []
+        if task["device_id"] != data["device_id"]:
+            problems.append(
+                f"device_id mismatch (task={task['device_id']}, upload={data['device_id']})"
+            )
+        if task["source"] != data["source"]:
+            problems.append(
+                f"source mismatch (task={task['source']}, upload={data['source']})"
+            )
+        if task["unit"] != data["unit"]:
+            problems.append(
+                f"unit mismatch (task={task['unit']}, upload={data['unit']})"
+            )
+        if len(data["samples"]) < task["sample_count"]:
+            problems.append(
+                f"sample_count too small ({len(data['samples'])} < {task['sample_count']})"
+            )
+        if data["ts_ms"] < int(task["created_at"] * 1000) - 5000:
+            problems.append("ts_ms is older than the task creation time")
+        if problems:
+            message = "; ".join(problems)
+            conn.execute(
+                "UPDATE tasks SET status='failed', completed_at=?, error=?"
+                " WHERE request_id=? AND status NOT IN ('completed','failed','timeout')",
+                (time.time(), message, request_id),
+            )
+            conn.commit()
+            return JSONResponse(
+                status_code=400,
+                content={"code": "INVALID", "ok": False, "error": message,
+                         "request_id": request_id},
+            )
+        conn.commit()
+        return None
+    finally:
+        conn.close()
+
+
 @app.post("/api/v1/upload")
 async def upload(request: Request):
-    """接收开发板上传的传感数据批次。"""
+    """接收开发板上传的传感数据批次（periodic 周期上报 / manual 按需采集）。"""
     # 可选鉴权：仅当服务端设置了 SENSOR_TOKEN 时校验（恒定时比较，避免时序侧信道）
-    if SENSOR_TOKEN:
-        got = request.headers.get("authorization", "")
-        want = f"Bearer {SENSOR_TOKEN}"
-        if not hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8")):
-            return JSONResponse(
-                status_code=401,
-                content={"code": "UNAUTHORIZED", "ok": False,
-                         "error": "missing or invalid bearer token"},
-            )
+    if not _device_auth_ok(request):
+        return _unauthorized()
 
     raw = await request.body()
     if len(raw) > MAX_BODY_BYTES:
@@ -312,16 +597,25 @@ async def upload(request: Request):
             status_code=400,
             content={"code": "INVALID", "ok": False, "error": result},
         )
+
+    request_id = result.get("request_id")
+    if request_id:
+        # 带任务号的上传先校验归属；不匹配则把任务置 failed 并返回 4xx（板端不重试）
+        mismatch = _check_task_match(request_id, result)
+        if mismatch is not None:
+            return mismatch
+
     try:
-        upload_id = store_upload(result, ip=ip)
+        upload_id, idempotent = store_upload(result, ip=ip)
     except sqlite3.Error as e:
         return JSONResponse(
             status_code=500,
             content={"code": "DB_ERROR", "ok": False,
                      "error": f"store failed: {e}"},
         )
+    # 同一 request_id 重复上传 → 200 + idempotent=True（没有重复写样本）
     return JSONResponse(
-        status_code=201,
+        status_code=200 if idempotent else 201,
         content={
             "code": "OK",
             "ok": True,
@@ -330,8 +624,304 @@ async def upload(request: Request):
             "sample_count": len(result["samples"]),
             "unit": result["unit"],
             "ts_ms": result["ts_ms"],
+            "request_id": request_id,
+            "trigger": result["trigger"],
+            "idempotent": idempotent,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 按需采集任务路由（manual capture task）
+#
+# 注意：/api/v1/tasks/next 必须声明在 /api/v1/tasks/{request_id} 之前，
+# 否则 "next" 会被当成 request_id 匹配掉（FastAPI 按声明顺序匹配路径）。
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/tasks")
+async def create_task(request: Request):
+    """Web「采集一次最新数据」：创建一个按需采集任务并返回 request_id。
+
+    去重：同 device + source 若已有未终态任务，则不再新建，直接返回已有任务
+    （duplicate=True），避免连点产生多个并行采集任务。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "request body must be valid JSON"},
+        )
+
+    ok, result = validate_task_request(payload)
+    if not ok:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": result},
+        )
+
+    conn = _connect()
+    try:
+        # 先清超时，避免一个已过期任务把新任务挡在去重逻辑外
+        _expire_stale_tasks(conn, result["device_id"])
+        existing = conn.execute(
+            "SELECT * FROM tasks WHERE device_id=? AND source=?"
+            " AND status NOT IN ('completed','failed','timeout')"
+            " ORDER BY created_at ASC LIMIT 1",
+            (result["device_id"], result["source"]),
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            return JSONResponse(
+                status_code=200,
+                content={"code": "DUPLICATE", "ok": True, "duplicate": True,
+                         "task": _task_view(existing)},
+            )
+
+        request_id = uuid.uuid4().hex
+        now = time.time()
+        conn.execute(
+            "INSERT INTO tasks (request_id, device_id, source, unit, sample_rate_hz,"
+            " sample_count, trigger, status, created_at, expires_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id,
+                result["device_id"],
+                result["source"],
+                result["unit"],
+                result["sample_rate_hz"],
+                result["sample_count"],
+                "manual",
+                "submitted",
+                now,
+                now + result["timeout_s"],
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+    except sqlite3.Error as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content={"code": "DB_ERROR", "ok": False,
+                     "error": f"create task failed: {e}"},
+        )
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=201,
+        content={"code": "OK", "ok": True, "duplicate": False,
+                 "task": _task_view(row)},
+    )
+
+
+@app.get("/api/v1/tasks/next")
+def next_task(request: Request):
+    """板端轮询待执行任务：只返回本设备「submitted 且未过期」的最早一条。
+
+    领取是原子的（UPDATE … WHERE status='submitted'），多板并发时也只会有一条
+    成功进入 dispatched；过期任务在此既不触达也不会被下发。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    device_id = (request.query_params.get("device_id") or "").strip()
+    if not device_id:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": "missing 'device_id'"},
+        )
+
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn, device_id)
+        row = conn.execute(
+            "SELECT request_id FROM tasks WHERE device_id=? AND status='submitted'"
+            " AND expires_at >= ? ORDER BY created_at ASC LIMIT 1",
+            (device_id, time.time()),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "found": False})
+        cur = conn.execute(
+            "UPDATE tasks SET status='dispatched', dispatched_at=?"
+            " WHERE request_id=? AND status='submitted'",
+            (time.time(), row["request_id"]),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            # 已被其它请求领走
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "found": False})
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (row["request_id"],)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "found": True, "task": _task_view(task)},
+    )
+
+
+@app.get("/api/v1/tasks")
+def list_tasks(request: Request):
+    """任务列表（默认最近 20 条，可按 device_id 过滤），供 Web 追踪任务。"""
+    device_id = (request.query_params.get("device_id") or "").strip()
+    try:
+        limit = int(request.query_params.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(100, limit))
+
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn, device_id or None)
+        sql = "SELECT * FROM tasks"
+        args = []
+        if device_id:
+            sql += " WHERE device_id=?"
+            args.append(device_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        rows = conn.execute(sql, args).fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "device_id": device_id or None,
+                 "count": len(rows), "tasks": [_task_view(r) for r in rows]},
+    )
+
+
+@app.get("/api/v1/tasks/{request_id}")
+def get_task(request_id: str):
+    """按 request_id 查询任务状态（含关联上传摘要），Web 轮询任务进度用。"""
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn)
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+        upload = None
+        if row is not None and row["upload_id"]:
+            up = conn.execute(
+                "SELECT id, device_id, request_id, trigger, sample_count, ts_ms,"
+                " received_at FROM uploads WHERE id=?",
+                (row["upload_id"],),
+            ).fetchone()
+            if up is not None:
+                upload = dict(up)
+                upload["received_at_str"] = _fmt_time(up["received_at"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown request_id: {request_id}"},
+        )
+    return JSONResponse(status_code=200,
+                        content={"ok": True, "task": _task_view(row),
+                                 "upload": upload})
+
+
+@app.post("/api/v1/tasks/{request_id}/ack")
+def ack_task(request_id: str, request: Request):
+    """板端回执「已收到任务」（可选步骤；不回执也能靠上传完成）。"""
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn)
+        cur = conn.execute(
+            "UPDATE tasks SET status='acked', acked_at=?"
+            " WHERE request_id=? AND status IN ('submitted','dispatched')",
+            (time.time(), request_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown request_id: {request_id}"},
+        )
+    if cur.rowcount != 1:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "CONFLICT", "ok": False,
+                     "error": f"task is already {row['status']}",
+                     "task": _task_view(row)},
+        )
+    return JSONResponse(status_code=200,
+                        content={"ok": True, "updated": True,
+                                 "task": _task_view(row)})
+
+
+@app.post("/api/v1/tasks/{request_id}/fail")
+async def fail_task(request_id: str, request: Request):
+    """板端上报任务失败（达不到采集节拍 / 上传交接失败 / 任务已过期等）。"""
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    reason = ""
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            reason = str(body.get("error") or body.get("reason") or "").strip()
+    except Exception:
+        reason = ""
+    if not reason:
+        reason = "device reported failure"
+    reason = reason[:256]
+
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn)
+        cur = conn.execute(
+            "UPDATE tasks SET status='failed', completed_at=?, error=?"
+            " WHERE request_id=? AND status NOT IN ('completed','failed','timeout')",
+            (time.time(), reason, request_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown request_id: {request_id}"},
+        )
+    if cur.rowcount != 1 and row["status"] not in TASK_TERMINAL_STATES:
+        return JSONResponse(
+            status_code=409,
+            content={"code": "CONFLICT", "ok": False,
+                     "error": f"task is already {row['status']}",
+                     "task": _task_view(row)},
+        )
+    return JSONResponse(status_code=200,
+                        content={"ok": True, "updated": bool(cur.rowcount),
+                                 "task": _task_view(row)})
 
 
 @app.get("/api/v1/health")
@@ -348,6 +938,9 @@ def health():
             ).fetchone()[0]
             dev_rows = conn.execute(
                 "SELECT DISTINCT device_id FROM uploads"
+            ).fetchall()
+            task_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
             last = conn.execute(
                 "SELECT device_id, ts_ms, received_at, sample_count, source, unit"
@@ -379,6 +972,8 @@ def health():
             "total_uploads": n_uploads,
             "total_samples": n_samples,
             "devices": [r["device_id"] for r in dev_rows],
+            "total_tasks": sum(r["n"] for r in task_rows),
+            "tasks_by_status": {r["status"]: r["n"] for r in task_rows},
             "latest": latest,
         },
     )
@@ -390,8 +985,10 @@ def devices():
     try:
         rows = conn.execute(
             "SELECT device_id, COUNT(*) AS uploads,"
-            " MAX(received_at) AS last_seen"
-            " FROM uploads GROUP BY device_id ORDER BY device_id"
+            " MAX(received_at) AS last_seen,"
+            " (SELECT COUNT(*) FROM tasks t WHERE t.device_id = u.device_id"
+            "  AND t.status NOT IN ('completed','failed','timeout')) AS pending_tasks"
+            " FROM uploads u GROUP BY device_id ORDER BY device_id"
         ).fetchall()
     finally:
         conn.close()
@@ -403,6 +1000,7 @@ def devices():
                     "device_id": r["device_id"],
                     "uploads": r["uploads"],
                     "last_seen": _fmt_time(r["last_seen"]),
+                    "pending_tasks": r["pending_tasks"],
                 }
                 for r in rows
             ]
