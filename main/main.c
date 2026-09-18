@@ -2570,6 +2570,22 @@ static void task_report_pending_failure(void)
     xSemaphoreGive(s_task_mutex);
 }
 
+/* Normalise the server's `expires_at` into epoch ms.
+ *
+ * The server sends epoch SECONDS as a JSON float (created as `now + timeout_s`
+ * in server/main.py, e.g. 1767123516.78), while this module compares it against
+ * the epoch ms from gettimeofday(). Reading the raw value as ms made every
+ * task look already expired ("task expired before capture"). Anything below
+ * 1e12 is therefore treated as seconds, so a deployment that switches to
+ * milliseconds keeps working too. */
+static int64_t expires_to_epoch_ms(double value)
+{
+    if (!(value > 0)) {
+        return 0;
+    }
+    return (value < 1.0e12) ? (int64_t)(value * 1000.0 + 0.5) : (int64_t)value;
+}
+
 /* Interpret one /api/v1/tasks/next response (runs in task_poll_task). */
 static void task_handle_next_response(const char *resp)
 {
@@ -2596,7 +2612,8 @@ static void task_handle_next_response(const char *resp)
     snprintf(request_id, sizeof(request_id), "%s", rid->valuestring);
     uint32_t target = (uint32_t)cnt->valuedouble;
     uint32_t rate_hz = (uint32_t)rate->valuedouble;
-    int64_t expires_ms = cJSON_IsNumber(exp) ? (int64_t)exp->valuedouble : 0;
+    int64_t expires_ms = cJSON_IsNumber(exp)
+                             ? expires_to_epoch_ms(exp->valuedouble) : 0;
     cJSON_Delete(root);
 
     if (target == 0 || target > TASK_MAX_SAMPLES || rate_hz == 0
@@ -2705,6 +2722,10 @@ static void sampler_task(void *arg)
      * next_wake_us is the absolute target time for the NEXT tick. */
     int64_t next_wake_us = esp_timer_get_time() + (SAMPLE_PERIOD_MS * 1000);
 
+    /* Sampling-gate state of the previous iteration: a gate that opens after
+     * being closed is a brand-new sampling session (see the gate below). */
+    bool gate_was_open = false;
+
     while (true) {
         /* Do NOT refresh UI in every loop — only when state changes or periodically.
          * This reduces jitter in the critical sampling path. */
@@ -2724,7 +2745,25 @@ static void sampler_task(void *arg)
              * mode; the CSV write below is NULL-guarded. Protocol sessions
              * always have a valid s_data_file because their start_* functions
              * still require a mounted SD card. */
-            if (s_collecting || manual_capture_is_active()) {
+            bool gate_open = (s_collecting || manual_capture_is_active());
+
+            /* A gate that opens after being closed starts a brand-new sampling
+             * session, so its timestamp anchor (s_base_timestamp_ms, taken at
+             * the first sample of a session) must be taken again. The button /
+             * SD session start_* paths zero s_sample_count themselves, but an
+             * on-demand capture claims the sampler while the board is idle, so
+             * without this its timestamps would keep counting from the previous
+             * session (s_base_timestamp_ms + n * 10 ms) and land in the past -
+             * the server rejects such a batch with "ts_ms is older than the
+             * task creation time". A session that never stopped (s_collecting
+             * stays true across a manual capture) keeps its timeline. */
+            if (gate_open && !gate_was_open) {
+                s_sample_count = 0;
+                s_upload_count = 0;
+            }
+            gate_was_open = gate_open;
+
+            if (gate_open) {
                 /* 1. Read accelerometer */
                 float ax, ay, az;
                 esp_err_t ret = app_accel_read(&ax, &ay, &az);
