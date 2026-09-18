@@ -40,6 +40,11 @@
   button:hover { background: #eaf1ff; }
   button:active { background: #dbe7ff; }
   button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background: #1d4ed8; }
+  button.primary:active { background: #1e40af; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 12px 0 0; }
+  .hint code { background: #f1f3f6; padding: 1px 5px; border-radius: 4px; }
   #lastPoll { margin-left: auto; color: var(--muted); font-size: 13px; }
 
   .notice {
@@ -102,8 +107,25 @@
 <section class="controls">
   <label for="deviceSel">设备</label>
   <select id="deviceSel" disabled><option value="">加载中…</option></select>
-  <button id="refreshBtn" type="button" disabled>立即刷新</button>
+  <button id="refreshBtn" type="button" disabled>仅刷新（不采集）</button>
+  <button id="captureBtn" type="button" class="primary" disabled>采集一次最新数据</button>
   <span id="lastPoll">—</span>
+</section>
+
+<section id="taskCard" class="card">
+  <h2>按需采集任务（手动触发）<span id="taskBadge" class="badge off">空闲</span></h2>
+  <div class="grid">
+    <div class="kv"><span class="k">request_id</span><span class="v" id="taskRid">—</span></div>
+    <div class="kv"><span class="k">任务状态</span><span class="v" id="taskStatus">尚未创建任务</span></div>
+    <div class="kv"><span class="k">样本数 / 采样率</span><span class="v" id="taskSpec">100 点 @ 100 Hz</span></div>
+    <div class="kv"><span class="k">有效期剩余</span><span class="v" id="taskExpires">—</span></div>
+  </div>
+  <p class="hint">
+    点击「采集一次最新数据」：服务端创建任务（<code>POST /api/v1/tasks</code>）→ 板端轮询领取（≤3 s，
+    <code>GET /api/v1/tasks/next</code>）→ 暂停周期上报并按 100 Hz 采集 1 s（100 点）→ 带
+    <code>request_id</code> 回传完成任务。<br>
+    连点只会复用一个未完成任务；request_id 贯穿任务、回执与样本，重复上传不会重复写样本。
+  </p>
 </section>
 
 <section id="noDeviceMsg" class="notice no-device hidden">
@@ -127,6 +149,8 @@
     <div class="kv"><span class="k">批次起点时间 (ts_ms)</span><span class="v" id="vTsMs">—</span></div>
     <div class="kv"><span class="k">服务端接收时间</span><span class="v" id="vReceived">—</span></div>
     <div class="kv"><span class="k">来源 IP</span><span class="v" id="vIp">—</span></div>
+    <div class="kv"><span class="k">触发方式 trigger</span><span class="v" id="vTrigger">—</span></div>
+    <div class="kv"><span class="k">任务号 request_id</span><span class="v" id="vRequestId">—</span></div>
   </div>
 
   <div class="samples-grid">
@@ -157,7 +181,9 @@
 </section>
 
 <footer>
-  查询接口：/api/v1/devices · /api/v1/latest?device_id=… · /api/v1/window?device_id=…&amp;seconds=30 　|　
+  查询接口：/api/v1/devices · /api/v1/latest?device_id=… · /api/v1/window?device_id=…&amp;seconds=30<br>
+  任务接口：POST /api/v1/tasks · GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id}
+  　|　
   <a href="/" target="_blank" rel="noopener">服务端首页</a>
 </footer>
 

@@ -20,6 +20,7 @@ const el = (id) => document.getElementById(id);
 const $ = {
   deviceSel: el('deviceSel'),
   refreshBtn: el('refreshBtn'),
+  captureBtn: el('captureBtn'),
   lastPoll: el('lastPoll'),
   noDeviceMsg: el('noDeviceMsg'),
   statusBar: el('statusBar'),
@@ -33,12 +34,19 @@ const $ = {
   vTsMs: el('vTsMs'),
   vReceived: el('vReceived'),
   vIp: el('vIp'),
+  vTrigger: el('vTrigger'),
+  vRequestId: el('vRequestId'),
   tbHead: el('tbHead'),
   tbTail: el('tbTail'),
   chart: el('chart'),
   chartWin: el('chartWin'),
   chartUnit: el('chartUnit'),
   chartCount: el('chartCount'),
+  taskBadge: el('taskBadge'),
+  taskRid: el('taskRid'),
+  taskStatus: el('taskStatus'),
+  taskSpec: el('taskSpec'),
+  taskExpires: el('taskExpires'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '' };
@@ -64,6 +72,33 @@ async function apiGet(path) {
   } catch (e) {
     throw new Error('响应不是合法 JSON：' + path);
   }
+  return data;
+}
+
+/** 容错 POST JSON：网络/非 2xx 都抛出带可读信息的 Error（优先用服务端 error 字段） */
+async function apiPost(path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      cache: 'no-store',
+    });
+  } catch (e) {
+    throw new Error('无法连接服务器，请确认服务端已启动：' + path);
+  }
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+  if (!res.ok) {
+    const msg = (data && data.error) ? data.error : ('接口返回 ' + res.status);
+    throw new Error(msg + '：' + path);
+  }
+  if (!data) throw new Error('响应不是合法 JSON：' + path);
   return data;
 }
 
@@ -365,6 +400,7 @@ async function poll() {
     const path = '/api/v1/latest?device_id=' + encodeURIComponent(state.current);
     const latest = await apiGet(path);
     renderLatest(latest);
+    renderTrace(latest);
 
     // 3) 实时波形：跨批次取连续样本（失败不影响上方数据卡片）
     const winPath = '/api/v1/window?device_id=' +
@@ -426,5 +462,173 @@ setInterval(poll, POLL_MS);
 
 // 页面加载时先画一次空波形，避免 canvas 区域空白
 drawChart([]);
+
+/* ------------------------------------------------------------------ *
+ *  按需采集任务（manual capture task）
+ *
+ *  「仅刷新」只重新拉查询接口；「采集一次最新数据」先 POST 建任务，板端轮询领取后
+ *  暂停周期上报、按任务节拍采一批数据并带 request_id 回传，服务端在写库的同一
+ *  事务里把任务置 completed。
+ * ------------------------------------------------------------------ */
+
+const TASK = {
+  samples: 100,      // 单次采集样本数（100 Hz × 1 s）
+  rateHz: 100,       // 采样率，与板端 QMA6100P 一致
+  timeoutS: 60,      // 任务有效期（服务端过期 → timeout）
+  pollMs: 1000,      // 任务状态查询间隔
+};
+
+const TASK_STATUS_META = {
+  submitted: { cls: 'warn', text: '已提交', hint: '等待板端轮询领取（板端每 3 s 轮询一次）' },
+  dispatched: { cls: 'warn', text: '已下发', hint: '板端已领取任务，正在采集' },
+  acked: { cls: 'warn', text: '设备接收', hint: '板端已回执，采集/上传进行中' },
+  completed: { cls: 'ok', text: '完成', hint: '数据已入库，样本来自本组设备' },
+  failed: { cls: 'err', text: '失败', hint: '被板端或服务端校验拒绝' },
+  timeout: { cls: 'err', text: '超时', hint: '有效期内未完成，不会被再次下发' },
+};
+
+const taskState = { rid: '', timer: null, last: null };
+
+function renderTaskBadge(status) {
+  const meta = TASK_STATUS_META[status] || { cls: 'off', text: status || '空闲', hint: '' };
+  if ($.taskBadge) {
+    $.taskBadge.className = 'badge ' + meta.cls;
+    $.taskBadge.textContent = meta.text;
+  }
+  return meta;
+}
+
+function renderTask(task, note) {
+  if (!task) return;
+  const meta = renderTaskBadge(task.status);
+  taskState.last = task;
+  taskState.rid = task.request_id || taskState.rid;
+
+  if ($.taskRid) $.taskRid.textContent = task.request_id || '—';
+  if ($.taskSpec) {
+    $.taskSpec.textContent = (task.sample_count ?? '—') + ' 点 @ ' +
+                             (task.sample_rate_hz ?? '—') + ' Hz';
+  }
+  if ($.taskStatus) {
+    let text = meta.text + '（状态码 ' + task.status + '）· ' + meta.hint;
+    if (task.error) text += ' · error: ' + task.error;
+    if (note) text += ' · ' + note;
+    $.taskStatus.textContent = text;
+  }
+  if ($.taskExpires) {
+    if (task.terminal) {
+      $.taskExpires.textContent = task.completed_at_str
+        ? '已结束 ' + task.completed_at_str
+        : '已结束';
+    } else {
+      const left = Number(task.expires_in_s);
+      $.taskExpires.textContent = isFinite(left)
+        ? (left > 0 ? left.toFixed(0) + ' s 后超时' : '已过期')
+        : '—';
+    }
+  }
+}
+
+function stopTaskWatch() {
+  if (taskState.timer) {
+    clearInterval(taskState.timer);
+    taskState.timer = null;
+  }
+}
+
+/** 以 1 s 间隔查询 /api/v1/tasks/{request_id}，终态后停止并补拉一次数据 */
+function watchTask(requestId) {
+  stopTaskWatch();
+  const tick = async () => {
+    try {
+      const data = await apiGet('/api/v1/tasks/' + encodeURIComponent(requestId));
+      renderTask(data.task);
+      if (data.task && data.task.terminal) {
+        stopTaskWatch();
+        poll();          // 任务完成后立刻刷新数据面板，不用等下一次轮询
+      }
+    } catch (e) {
+      stopTaskWatch();
+      renderStatus('⚠ 任务状态查询失败：' + e.message, 'error');
+    }
+  };
+  taskState.timer = setInterval(tick, TASK.pollMs);
+  tick();
+}
+
+/** 打开页面/切换设备时回填该设备最近的任务，避免刷新后卡片空白 */
+async function refreshLatestTask() {
+  if (!state.current) return;
+  try {
+    const data = await apiGet('/api/v1/tasks?device_id=' +
+                              encodeURIComponent(state.current) + '&limit=1');
+    const task = (data.tasks || [])[0];
+    if (!task) return;
+    renderTask(task, task.terminal ? '历史任务（已结束）' : '继续跟踪');
+    if (!task.terminal) watchTask(task.request_id);
+  } catch (e) {
+    /* 任务接口不可用不应影响主面板 */
+  }
+}
+
+/** 点击「采集一次最新数据」：建任务 → 跟踪到终态 */
+async function captureOnce() {
+  if (!state.current) {
+    renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
+    return;
+  }
+  $.captureBtn.disabled = true;
+  try {
+    const data = await apiPost('/api/v1/tasks', {
+      device_id: state.current,
+      sample_count: TASK.samples,
+      sample_rate_hz: TASK.rateHz,
+      timeout_s: TASK.timeoutS,
+    });
+    renderTask(data.task, data.duplicate ? '已复用未完成任务，未产生并行任务' : '任务已创建');
+    watchTask(data.task.request_id);
+    renderStatus('', 'hidden');
+  } catch (e) {
+    renderStatus('⚠ 创建采集任务失败：' + e.message, 'error');
+  } finally {
+    $.captureBtn.disabled = false;
+  }
+}
+
+/** /api/v1/latest 现在带回 trigger / request_id，回填到数据卡片 */
+function renderTrace(latest) {
+  const up = (latest && latest.upload) || {};
+  if ($.vTrigger) {
+    $.vTrigger.textContent = up.trigger
+      ? (up.trigger === 'manual' ? 'manual（按需采集）' : 'periodic（周期上报）')
+      : '—';
+  }
+  if ($.vRequestId) {
+    $.vRequestId.textContent = up.request_id || '—（周期批次不带任务号）';
+  }
+}
+
+$.captureBtn.addEventListener('click', () => captureOnce());
+
+// 切换设备后回填该设备最近的任务（等待 poll() 完成设备切换）
+$.deviceSel.addEventListener('change', () => {
+  stopTaskWatch();
+  setTimeout(refreshLatestTask, 900);
+});
+
+// 设备列表首次加载后按钮才可用；这里先放开，点击时会校验是否已选设备
+$.captureBtn.disabled = false;
+refreshLatestTask();
+
+// 便于自动化验证：用 /ui/?autocapture=1 打开页面即触发一次采集（等价于点按钮），
+// 无需人工点击也能核对「建任务 → 板端领取 → 带 request_id 回传」这条链路。
+try {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('autocapture') === '1') {
+    setTimeout(captureOnce, 1200);
+  }
+} catch (e) {
+  /* 不支持 URLSearchParams 的环境忽略即可 */
+}
 
 
