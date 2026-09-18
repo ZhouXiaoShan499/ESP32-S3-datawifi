@@ -71,6 +71,19 @@
 #define UPLOAD_SOURCE            "qma6100p"
 #define UPLOAD_UNIT              "m/s^2"
 
+/* 按需采集任务（manual capture task）config。
+ * 板端每 TASK_POLL_INTERVAL_MS 轮询 /api/v1/tasks/next：
+ * 领到任务 → ack → 暂停周期上报 → 按任务节拍采集 N 点 → 带 request_id 回传。 */
+#define TASK_POLL_INTERVAL_MS    3000     /* 轮询间隔 */
+#define TASK_API_PATH_NEXT       "/api/v1/tasks/next"
+#define TASK_API_PATH_ACK        "/api/v1/tasks/%s/ack"
+#define TASK_API_PATH_FAIL       "/api/v1/tasks/%s/fail"
+#define TASK_REQUEST_ID_LEN      40       /* 与服务端 uuid4().hex(32) 对齐 */
+#define TASK_TRIGGER_LEN         16
+#define TASK_MAX_SAMPLES         600      /* 板端单次采集上限（600×24B ≈ 14 KB 堆） */
+#define TASK_HTTP_TIMEOUT_MS     5000
+#define TASK_RESP_BUF_LEN        2048     /* /tasks/next 响应缓冲 */
+
 /* Device identity / server URL come from Kconfig (see Kconfig.projbuild).
  * Fallbacks keep the code compiling if the config header is stale. */
 #ifndef CONFIG_SENSOR_DEVICE_ID
@@ -1992,15 +2005,44 @@ typedef struct {
     float    az;       /* m/s² */
 } upload_sample_t;
 
+/* Flexible-array batch: periodic windows hold UPLOAD_WINDOW_SIZE samples while
+ * on-demand captures hold whatever the task asked for (<= TASK_MAX_SAMPLES),
+ * so samples[] is sized per allocation and cap records the capacity. */
 typedef struct {
-    uint64_t ts_ms;                     /* epoch ms of first sample in window */
+    uint64_t ts_ms;                     /* epoch ms of first sample in batch */
     uint32_t count;                     /* samples in this batch */
-    upload_sample_t samples[UPLOAD_WINDOW_SIZE];
+    uint32_t cap;                       /* capacity of samples[] */
+    char     request_id[TASK_REQUEST_ID_LEN];  /* empty = periodic batch */
+    char     trigger[TASK_TRIGGER_LEN];        /* "periodic" / "manual" */
+    upload_sample_t samples[];          /* flexible array, size = cap */
 } upload_batch_t;
 
 static QueueHandle_t s_upload_queue = NULL;    /* carries upload_batch_t* */
 static upload_sample_t s_upload_buf[UPLOAD_WINDOW_SIZE];
 static uint32_t s_upload_count = 0;
+
+/* Allocate a batch with room for cap samples. Metadata only - no HTTP here. */
+static upload_batch_t *upload_batch_alloc(uint32_t cap, const char *trigger,
+                                          const char *request_id)
+{
+    upload_batch_t *batch =
+        malloc(sizeof(upload_batch_t) + sizeof(upload_sample_t) * cap);
+    if (!batch) {
+        return NULL;
+    }
+    batch->ts_ms = 0;
+    batch->count = 0;
+    batch->cap = cap;
+    batch->request_id[0] = '\0';
+    batch->trigger[0] = '\0';
+    if (trigger) {
+        snprintf(batch->trigger, sizeof(batch->trigger), "%s", trigger);
+    }
+    if (request_id) {
+        snprintf(batch->request_id, sizeof(batch->request_id), "%s", request_id);
+    }
+    return batch;
+}
 
 /* Accumulate one sample; when a full second is collected, enqueue a copy. */
 static void upload_accumulate(uint64_t ts_ms, float ax, float ay, float az)
@@ -2017,7 +2059,8 @@ static void upload_accumulate(uint64_t ts_ms, float ax, float ay, float az)
 
     if (s_upload_count == UPLOAD_WINDOW_SIZE) {
         /* One full second collected → hand a private copy to the uploader. */
-        upload_batch_t *batch = malloc(sizeof(upload_batch_t));
+        upload_batch_t *batch =
+            upload_batch_alloc(UPLOAD_WINDOW_SIZE, "periodic", NULL);
         if (batch) {
             batch->ts_ms = s_upload_buf[0].ts_ms;
             batch->count = UPLOAD_WINDOW_SIZE;
@@ -2032,28 +2075,37 @@ static void upload_accumulate(uint64_t ts_ms, float ax, float ay, float az)
 
 /* Build JSON and POST one batch to the configured FastAPI receiver.
  * Uses bounded retries so a transient WiFi/AP hiccup does not throw away a
- * whole second of samples on the first failure. */
-static void upload_post_batch(upload_batch_t *batch)
+ * whole second of samples on the first failure.
+ * Returns true when the server accepted the batch (HTTP 2xx). */
+static bool upload_post_batch(upload_batch_t *batch)
 {
     if (!batch || batch->count == 0) {
-        return;
+        return false;
     }
 
     if (!s_wifi_connected) {
         ESP_LOGW(TAG, "[upload] skip: WiFi not connected");
-        return;
+        return false;
     }
 
     log_heap("upload: pre-cJSON");
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         ESP_LOGE(TAG, "[upload] cJSON_CreateObject failed - heap exhausted");
-        return;
+        return false;
     }
     cJSON_AddStringToObject(root, "device_id", CONFIG_SENSOR_DEVICE_ID);
     cJSON_AddStringToObject(root, "source",    UPLOAD_SOURCE);
     cJSON_AddStringToObject(root, "unit",      UPLOAD_UNIT);
     cJSON_AddNumberToObject(root, "ts_ms",     (double)batch->ts_ms);
+    /* On-demand batches carry the task id so the server can close the task and
+     * dedup replays; periodic batches keep the legacy body (no extra fields). */
+    if (batch->trigger[0] != '\0') {
+        cJSON_AddStringToObject(root, "trigger", batch->trigger);
+    }
+    if (batch->request_id[0] != '\0') {
+        cJSON_AddStringToObject(root, "request_id", batch->request_id);
+    }
 
     cJSON *arr = cJSON_CreateArray();
     cJSON_AddItemToObject(root, "samples", arr);
@@ -2073,7 +2125,7 @@ static void upload_post_batch(upload_batch_t *batch)
     cJSON_Delete(root);
     if (!payload) {
         ESP_LOGE(TAG, "[upload] cJSON_PrintUnformatted failed - heap exhausted");
-        return;
+        return false;
     }
     ESP_LOGI(TAG, "[upload] payload=%u B for n=%" PRIu32 " samples",
              (unsigned)strlen(payload), batch->count);
@@ -2116,7 +2168,7 @@ static void upload_post_batch(upload_batch_t *batch)
                           " http=%d attempt=%d",
                      batch->ts_ms, batch->count, status, attempt);
             free(payload);
-            return;
+            return true;
         }
 
         ESP_LOGW(TAG, "[upload] attempt %d/%d failed ts=%" PRIu64
@@ -2134,9 +2186,493 @@ static void upload_post_batch(upload_batch_t *batch)
         }
     }
 
-    ESP_LOGW(TAG, "[upload] FAIL (gave up) ts=%" PRIu64 " n=%" PRIu32,
-             batch->ts_ms, batch->count);
+    ESP_LOGW(TAG, "[upload] FAIL (gave up) ts=%" PRIu64 " n=%" PRIu32
+                  " request_id=%s",
+             batch->ts_ms, batch->count,
+             batch->request_id[0] ? batch->request_id : "-");
     free(payload);
+    return false;
+}
+
+/* ================================================================
+ *  Manual capture task (on-demand, triggered from the Web page)
+ *
+ *  The Web page POSTs /api/v1/tasks; this module polls
+ *  GET /api/v1/tasks/next?device_id=… every TASK_POLL_INTERVAL_MS.
+ *  On a hit it acks, then sampler_task (the only QMA6100P reader)
+ *  collects N samples at the requested rate while periodic uploads
+ *  are paused. The finished batch goes to uploader_task, which POSTs
+ *  it together with request_id so the server closes the task in the
+ *  same transaction that stores the samples.
+ *
+ *  Invariants:
+ *   * no I2C access here - the sampler keeps owning the sensor;
+ *   * every HTTP call lives in task_poll_task / uploader_task;
+ *   * sampler-side handoff is non-blocking (retried on the next tick).
+ * ================================================================ */
+typedef enum {
+    MANUAL_IDLE = 0,
+    MANUAL_PENDING,       /* task claimed, waiting for sampler to pick it up */
+    MANUAL_CAPTURING,     /* sampler is filling the batch */
+    MANUAL_UPLOADING,     /* batch queued, waiting for the upload result */
+    MANUAL_ERROR,         /* capture/upload failed, fail receipt pending */
+} manual_state_t;
+
+typedef struct {
+    manual_state_t state;
+    char     request_id[TASK_REQUEST_ID_LEN];
+    uint32_t rate_hz;             /* requested rate (1..TARGET_SAMPLE_FREQ_HZ) */
+    uint32_t target;              /* samples requested by the task */
+    uint32_t period_ticks;        /* one sample every N sampling ticks */
+    uint32_t tick;                /* sampling ticks since capture started */
+    int64_t  deadline_ms;         /* local safety deadline (esp_timer ms) */
+    int64_t  server_expires_ms;   /* server expires_at in epoch ms (0 = unknown) */
+    upload_batch_t *batch;        /* batch being filled (NULL after handoff) */
+    char     error[96];
+} manual_capture_t;
+
+static SemaphoreHandle_t s_task_mutex = NULL;
+static manual_capture_t s_manual;
+
+static int64_t manual_now_epoch_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static manual_state_t manual_capture_state(void)
+{
+    manual_state_t state;
+    if (!s_task_mutex) {
+        return MANUAL_IDLE;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    state = s_manual.state;
+    xSemaphoreGive(s_task_mutex);
+    return state;
+}
+
+/* True while a task owns the sampler (periodic uploads stay paused). */
+static bool manual_capture_is_active(void)
+{
+    return manual_capture_state() != MANUAL_IDLE;
+}
+
+/* Failure bookkeeping; caller must hold s_task_mutex. */
+static void manual_fail_locked(const char *reason)
+{
+    snprintf(s_manual.error, sizeof(s_manual.error), "%s",
+             reason ? reason : "unknown error");
+    if (s_manual.batch) {
+        free(s_manual.batch);
+        s_manual.batch = NULL;
+    }
+    s_manual.state = MANUAL_ERROR;
+    ESP_LOGW(TAG, "[task] capture failed: %s", s_manual.error);
+}
+
+/* Claim a task for the sampler. Returns false when a capture is already
+ * running (e.g. a second poll landed while one is in flight). */
+static bool manual_capture_begin(const char *request_id, uint32_t rate_hz,
+                                 uint32_t target, upload_batch_t *batch,
+                                 int64_t server_expires_ms)
+{
+    if (!s_task_mutex) {
+        return false;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (s_manual.state != MANUAL_IDLE) {
+        xSemaphoreGive(s_task_mutex);
+        return false;
+    }
+    memset(&s_manual, 0, sizeof(s_manual));
+    snprintf(s_manual.request_id, sizeof(s_manual.request_id), "%s", request_id);
+    s_manual.rate_hz = rate_hz;
+    s_manual.target = target;
+    /* The sampler always ticks at TARGET_SAMPLE_FREQ_HZ; lower rates are
+     * produced by keeping every period_ticks-th tick. */
+    s_manual.period_ticks = (rate_hz >= TARGET_SAMPLE_FREQ_HZ)
+                                ? 1
+                                : (TARGET_SAMPLE_FREQ_HZ / rate_hz);
+    if (s_manual.period_ticks == 0) {
+        s_manual.period_ticks = 1;
+    }
+    /* Local safety deadline: 2x the expected capture time + 5 s. */
+    s_manual.deadline_ms = esp_timer_get_time() / 1000
+        + ((int64_t)target * 1000 / (int64_t)rate_hz) * 2 + 5000;
+    s_manual.server_expires_ms = server_expires_ms;
+    s_manual.batch = batch;
+    s_manual.state = MANUAL_PENDING;
+    xSemaphoreGive(s_task_mutex);
+
+    ESP_LOGI(TAG, "[task] accepted %s: %" PRIu32 " samples @ %" PRIu32 " Hz",
+             request_id, target, rate_hz);
+    return true;
+}
+
+/* uploader_task reports the upload result so the state machine can move on. */
+static void manual_capture_on_upload_done(bool ok, const char *reason)
+{
+    if (!s_task_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (s_manual.state == MANUAL_UPLOADING) {
+        if (ok) {
+            s_manual.state = MANUAL_IDLE;
+            s_manual.request_id[0] = '\0';
+            ESP_LOGI(TAG, "[task] done, periodic uploads resumed");
+        } else {
+            manual_fail_locked(reason ? reason : "manual upload failed");
+        }
+    }
+    xSemaphoreGive(s_task_mutex);
+}
+
+/* Called by sampler_task once per sampling tick (holding s_state_mutex).
+ * Returns true when this tick belongs to the on-demand capture, in which case
+ * the periodic upload window must not be fed - that is the documented
+ * "periodic upload is paused while a manual capture runs" behaviour.
+ * Non-blocking by design: a full queue is retried on the next tick. */
+static bool manual_capture_consumes_sample(uint64_t ts_ms, float ax, float ay,
+                                           float az)
+{
+    if (!s_task_mutex) {
+        return false;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+
+    if (s_manual.state == MANUAL_PENDING) {
+        /* First tick after claiming: drop the partially filled periodic window
+         * and refuse to start when the task already expired server-side. */
+        if (s_time_synced && s_manual.server_expires_ms > 0
+            && manual_now_epoch_ms() > s_manual.server_expires_ms) {
+            manual_fail_locked("task expired before capture");
+            xSemaphoreGive(s_task_mutex);
+            return false;
+        }
+        s_manual.state = MANUAL_CAPTURING;
+        s_manual.tick = 0;
+        s_upload_count = 0;
+        ESP_LOGI(TAG, "[task] capturing %s", s_manual.request_id);
+    }
+
+    if (s_manual.state != MANUAL_CAPTURING) {
+        xSemaphoreGive(s_task_mutex);
+        return false;      /* idle / uploading / error → normal periodic path */
+    }
+
+    if (s_manual.batch == NULL) {
+        manual_fail_locked("batch buffer missing");
+        xSemaphoreGive(s_task_mutex);
+        return true;
+    }
+
+    if ((s_manual.tick % s_manual.period_ticks) == 0
+        && s_manual.batch->count < s_manual.batch->cap) {
+        upload_sample_t *dst = &s_manual.batch->samples[s_manual.batch->count];
+        dst->ts_ms = ts_ms;
+        dst->ax = ax;
+        dst->ay = ay;
+        dst->az = az;
+        if (s_manual.batch->count == 0) {
+            s_manual.batch->ts_ms = ts_ms;   /* batch start time for the server */
+        }
+        s_manual.batch->count++;
+    }
+    s_manual.tick++;
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool full = (s_manual.batch->count >= s_manual.target);
+
+    if (!full) {
+        if (now_ms > s_manual.deadline_ms) {
+            manual_fail_locked("capture timeout");
+        }
+        xSemaphoreGive(s_task_mutex);
+        return true;
+    }
+
+    /* Hand the finished batch to uploader_task. Never blocks the 10 ms loop:
+     * if the queue is full we simply retry on the following tick. */
+    upload_batch_t *batch = s_manual.batch;
+    if (xQueueSend(s_upload_queue, &batch, 0) == pdTRUE) {
+        s_manual.batch = NULL;
+        s_manual.state = MANUAL_UPLOADING;
+        ESP_LOGI(TAG, "[task] captured %" PRIu32 " samples for %s",
+                 batch->count, s_manual.request_id);
+    } else if (now_ms > s_manual.deadline_ms) {
+        manual_fail_locked("upload queue full");
+    }
+
+    xSemaphoreGive(s_task_mutex);
+    return true;
+}
+
+/* ---------------- task HTTP helpers ---------------- */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} http_buf_t;
+
+static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        http_buf_t *hb = (http_buf_t *)evt->user_data;
+        if (hb && hb->buf && (hb->len + 1) < hb->cap) {
+            size_t room = hb->cap - hb->len - 1;
+            size_t n = ((size_t)evt->data_len < room) ? (size_t)evt->data_len : room;
+            memcpy(hb->buf + hb->len, evt->data, n);
+            hb->len += n;
+            hb->buf[hb->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+/* Derive sibling API URLs from the configured upload URL by swapping the
+ * "/api/v1/upload" suffix for path. Returns false when the suffix is absent,
+ * so callers can disable polling instead of hitting a wrong address. */
+static bool server_api_url(char *out, size_t out_len, const char *path)
+{
+    const char *base = CONFIG_SENSOR_SERVER_URL;
+    const char *suffix = "/api/v1/upload";
+    const char *pos = strstr(base, suffix);
+    if (!pos) {
+        return false;
+    }
+    int n = snprintf(out, out_len, "%.*s%s", (int)(pos - base), base, path);
+    return (n > 0 && (size_t)n < out_len);
+}
+
+static void task_http_common(esp_http_client_handle_t client)
+{
+    if (CONFIG_SENSOR_TOKEN[0] != '\0') {
+        char auth[160];
+        snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_SENSOR_TOKEN);
+        esp_http_client_set_header(client, "Authorization", auth);
+    }
+}
+
+/* GET url and copy the (truncated) body into out. true = HTTP 2xx. */
+static bool http_get_text(const char *url, char *out, size_t out_len)
+{
+    http_buf_t hb = { .buf = out, .len = 0, .cap = out_len };
+    if (out_len > 0) {
+        out[0] = '\0';
+    }
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = TASK_HTTP_TIMEOUT_MS,
+        .event_handler = http_collect_event_handler,
+        .user_data = &hb,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+    task_http_common(client);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "[task] GET failed err=%s http=%d",
+                 esp_err_to_name(err), status);
+        return false;
+    }
+    return true;
+}
+
+/* POST a JSON body ("{}" when json is NULL). true = HTTP 2xx. */
+static bool http_post_text(const char *url, const char *json)
+{
+    const char *body = json ? json : "{}";
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = TASK_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, (int)strlen(body));
+    task_http_common(client);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "[task] POST %s failed err=%s http=%d",
+                 url, esp_err_to_name(err), status);
+        return false;
+    }
+    return true;
+}
+
+/* POST /api/v1/tasks/{id}/ack - best effort, the capture proceeds regardless. */
+static bool task_post_ack(const char *request_id)
+{
+    char path[96];
+    char url[192];
+    snprintf(path, sizeof(path), TASK_API_PATH_ACK, request_id);
+    if (!server_api_url(url, sizeof(url), path)) {
+        return false;
+    }
+    return http_post_text(url, NULL);
+}
+
+/* POST /api/v1/tasks/{id}/fail with a human readable reason. */
+static bool task_post_fail(const char *request_id, const char *reason)
+{
+    char path[96];
+    char url[192];
+    char body[192];
+    snprintf(path, sizeof(path), TASK_API_PATH_FAIL, request_id);
+    if (!server_api_url(url, sizeof(url), path)) {
+        return false;
+    }
+    snprintf(body, sizeof(body), "{\"error\": \"%s\"}", reason ? reason : "");
+    return http_post_text(url, body);
+}
+
+/* Send the pending fail receipt, then go back to IDLE. A report that fails is
+ * retried on the next poll because the state stays MANUAL_ERROR. */
+static void task_report_pending_failure(void)
+{
+    char request_id[TASK_REQUEST_ID_LEN];
+    char reason[96];
+    if (!s_task_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (s_manual.state != MANUAL_ERROR) {
+        xSemaphoreGive(s_task_mutex);
+        return;
+    }
+    snprintf(request_id, sizeof(request_id), "%s", s_manual.request_id);
+    snprintf(reason, sizeof(reason), "%s", s_manual.error);
+    xSemaphoreGive(s_task_mutex);
+
+    if (!task_post_fail(request_id, reason)) {
+        return;
+    }
+
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (s_manual.state == MANUAL_ERROR) {
+        s_manual.state = MANUAL_IDLE;
+        s_manual.request_id[0] = '\0';
+        ESP_LOGW(TAG, "[task] failure reported to server: %s", reason);
+    }
+    xSemaphoreGive(s_task_mutex);
+}
+
+/* Interpret one /api/v1/tasks/next response (runs in task_poll_task). */
+static void task_handle_next_response(const char *resp)
+{
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) {
+        ESP_LOGW(TAG, "[task] unparsable response from server");
+        return;
+    }
+    const cJSON *task = cJSON_GetObjectItem(root, "task");
+    const cJSON *rid = cJSON_IsObject(task)
+                           ? cJSON_GetObjectItem(task, "request_id") : NULL;
+    const cJSON *cnt = cJSON_IsObject(task)
+                           ? cJSON_GetObjectItem(task, "sample_count") : NULL;
+    const cJSON *rate = cJSON_IsObject(task)
+                            ? cJSON_GetObjectItem(task, "sample_rate_hz") : NULL;
+    const cJSON *exp = cJSON_IsObject(task)
+                           ? cJSON_GetObjectItem(task, "expires_at") : NULL;
+    if (!cJSON_IsString(rid) || !cJSON_IsNumber(cnt) || !cJSON_IsNumber(rate)) {
+        cJSON_Delete(root);
+        return;         /* found=false or unexpected body: nothing to do */
+    }
+
+    char request_id[TASK_REQUEST_ID_LEN];
+    snprintf(request_id, sizeof(request_id), "%s", rid->valuestring);
+    uint32_t target = (uint32_t)cnt->valuedouble;
+    uint32_t rate_hz = (uint32_t)rate->valuedouble;
+    int64_t expires_ms = cJSON_IsNumber(exp) ? (int64_t)exp->valuedouble : 0;
+    cJSON_Delete(root);
+
+    if (target == 0 || target > TASK_MAX_SAMPLES || rate_hz == 0
+        || rate_hz > TARGET_SAMPLE_FREQ_HZ) {
+        ESP_LOGW(TAG, "[task] %s asks %" PRIu32 " samples @ %" PRIu32
+                      " Hz - beyond device capability",
+                 request_id, target, rate_hz);
+        task_post_fail(request_id,
+                       "sample_count or sample_rate_hz beyond device capability");
+        return;
+    }
+
+    upload_batch_t *batch = upload_batch_alloc(target, "manual", request_id);
+    if (!batch) {
+        ESP_LOGE(TAG, "[task] out of memory for %" PRIu32 " samples", target);
+        log_heap("task: batch alloc failed");
+        task_post_fail(request_id, "out of memory on device");
+        return;
+    }
+
+    if (!manual_capture_begin(request_id, rate_hz, target, batch, expires_ms)) {
+        free(batch);                /* a capture is already in flight */
+        return;
+    }
+
+    if (!task_post_ack(request_id)) {
+        ESP_LOGW(TAG, "[task] ack failed for %s (capture continues)", request_id);
+    }
+}
+
+/* Poll /api/v1/tasks/next and hand tasks to the sampler. Priority 3, i.e.
+ * below sampler_task (5) and uploader_task (4). */
+static void task_poll_task(void *arg)
+{
+    (void)arg;
+    char base_url[192];
+    char url[256];
+
+    if (!server_api_url(base_url, sizeof(base_url), TASK_API_PATH_NEXT)) {
+        ESP_LOGW(TAG, "[task] cannot derive API base from '%s' - polling disabled",
+                 CONFIG_SENSOR_SERVER_URL);
+        vTaskDelete(NULL);
+        return;
+    }
+    snprintf(url, sizeof(url), "%s?device_id=%s", base_url,
+             CONFIG_SENSOR_DEVICE_ID);
+
+    char *resp = malloc(TASK_RESP_BUF_LEN);
+    if (!resp) {
+        ESP_LOGE(TAG, "[task] no heap for response buffer - polling disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[task] polling %s every %d ms", url, TASK_POLL_INTERVAL_MS);
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(TASK_POLL_INTERVAL_MS));
+
+        if (!s_wifi_connected) {
+            continue;
+        }
+
+        manual_state_t state = manual_capture_state();
+        if (state == MANUAL_ERROR) {
+            task_report_pending_failure();
+            continue;
+        }
+        if (state != MANUAL_IDLE) {
+            continue;       /* capture/upload in flight: do not claim another */
+        }
+
+        if (http_get_text(url, resp, TASK_RESP_BUF_LEN)) {
+            task_handle_next_response(resp);
+        }
+    }
 }
 
 /* Uploader task: drain the queue and POST batches one at a time. */
@@ -2146,7 +2682,13 @@ static void uploader_task(void *arg)
     upload_batch_t *batch;
     while (true) {
         if (xQueueReceive(s_upload_queue, &batch, portMAX_DELAY) == pdTRUE) {
-            upload_post_batch(batch);
+            bool ok = upload_post_batch(batch);
+            if (batch->request_id[0] != '\0') {
+                /* On-demand batch: releasing the manual state here is what lets
+                 * the sampler resume periodic uploads (or report a failure). */
+                manual_capture_on_upload_done(ok,
+                                              ok ? NULL : "manual upload failed");
+            }
             free(batch);
         }
     }
@@ -2177,12 +2719,12 @@ static void sampler_task(void *arg)
         }
 
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            /* Sampling gate: s_collecting alone is enough now.
-             * s_data_file may legitimately be NULL in WiFi-only mode; the
-             * CSV write below is NULL-guarded. Protocol sessions always have
-             * a valid s_data_file because their start_* functions still
-             * require a mounted SD card. */
-            if (s_collecting) {
+            /* Sampling gate: s_collecting (button/SD session) OR an on-demand
+             * capture task. s_data_file may legitimately be NULL in WiFi-only
+             * mode; the CSV write below is NULL-guarded. Protocol sessions
+             * always have a valid s_data_file because their start_* functions
+             * still require a mounted SD card. */
+            if (s_collecting || manual_capture_is_active()) {
                 /* 1. Read accelerometer */
                 float ax, ay, az;
                 esp_err_t ret = app_accel_read(&ax, &ay, &az);
@@ -2278,8 +2820,13 @@ static void sampler_task(void *arg)
                     s_latest_accel_z = az_ms2;
                     s_sample_count++;
 
+                    /* An on-demand capture owns this tick while it runs, which
+                     * is exactly what pauses the periodic 1 s upload window. */
+                    bool manual_tick = manual_capture_consumes_sample(
+                        timestamp_ms, ax_ms2, ay_ms2, az_ms2);
+
                     /* Feed this sample into the 1 s upload window (WiFi only). */
-                    if (s_wifi_connected) {
+                    if (!manual_tick && s_wifi_connected) {
                         upload_accumulate(timestamp_ms, ax_ms2, ay_ms2, az_ms2);
                     }
                     
@@ -2908,11 +3455,23 @@ void app_main(void)
     assert(s_upload_queue != NULL);
     xTaskCreate(uploader_task, "upload_task", 8192, NULL, 4, NULL);
 
-    /* sizeof(upload_batch_t) x UPLOAD_QUEUE_LEN is the worst-case heap held
-     * by in-flight batches; log it so the cost is visible, not assumed. */
-    ESP_LOGI(TAG, "[HEAP] upload_batch_t=%u B x queue %d = %u B worst case",
+    /* 10. On-demand capture task polling (Web "capture once" button).
+     *     The mutex is created first: task_poll_task uses it as its
+     *     "module is up" guard. */
+    s_task_mutex = xSemaphoreCreateMutex();
+    assert(s_task_mutex != NULL);
+    xTaskCreate(task_poll_task, "task_poll", 8192, NULL, 3, NULL);
+
+    /* (sizeof(upload_batch_t) + 100 samples) x UPLOAD_QUEUE_LEN is the worst-case
+     * heap held by in-flight periodic batches; one on-demand capture adds
+     * TASK_MAX_SAMPLES samples on top of that while it runs. Logged so the cost
+     * stays visible instead of assumed. */
+    ESP_LOGI(TAG, "[HEAP] upload_batch_t=%u B x queue %d = %u B worst case"
+                  " (+%u B for one on-demand capture)",
              (unsigned)sizeof(upload_batch_t), UPLOAD_QUEUE_LEN,
-             (unsigned)(sizeof(upload_batch_t) * UPLOAD_QUEUE_LEN));
+             (unsigned)(sizeof(upload_batch_t) * UPLOAD_QUEUE_LEN),
+             (unsigned)(sizeof(upload_batch_t)
+                        + sizeof(upload_sample_t) * TASK_MAX_SAMPLES));
     log_heap("system ready");
 
     ESP_LOGI(TAG, "System ready. Button A: start/stop normal IMU logging");
