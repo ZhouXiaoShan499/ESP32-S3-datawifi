@@ -2,9 +2,14 @@
  * ESP32-S3 IMU 实时监控面板
  *
  * 定时轮询查询接口：
- *   GET /api/v1/devices              -> 设备下拉
- *   GET /api/v1/latest?device_id=..  -> 选中设备的最新数据
- * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）。
+ *   GET /api/v1/devices                    -> 设备下拉
+ *   GET /api/v1/latest?device_id=..        -> 选中设备的最新数据
+ *   GET /api/v1/latest?device_id=..&trigger=manual|periodic  -> 对照区各取一类批次
+ *   GET /api/v1/window?device_id=..&seconds=30               -> 波形与三维轨迹
+ *   GET /api/v1/tasks?device_id=..&limit=20                  -> 任务历史
+ * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）、
+ *      按需采集任务（参数表单 → 创建 → 跟踪 → 时间戳/upload_id 回显 → 无回执提示）、
+ *      手动批次与周期批次对照、三维姿态视图。
  */
 
 'use strict';
@@ -20,6 +25,11 @@ const el = (id) => document.getElementById(id);
 const $ = {
   deviceSel: el('deviceSel'),
   refreshBtn: el('refreshBtn'),
+  captureBtn: el('captureBtn'),
+  sourceSel: el('sourceSel'),
+  countInput: el('countInput'),
+  rateInput: el('rateInput'),
+  timeoutInput: el('timeoutInput'),
   lastPoll: el('lastPoll'),
   noDeviceMsg: el('noDeviceMsg'),
   statusBar: el('statusBar'),
@@ -33,12 +43,33 @@ const $ = {
   vTsMs: el('vTsMs'),
   vReceived: el('vReceived'),
   vIp: el('vIp'),
+  vTrigger: el('vTrigger'),
+  vRequestId: el('vRequestId'),
   tbHead: el('tbHead'),
   tbTail: el('tbTail'),
   chart: el('chart'),
   chartWin: el('chartWin'),
   chartUnit: el('chartUnit'),
   chartCount: el('chartCount'),
+  taskBadge: el('taskBadge'),
+  taskRid: el('taskRid'),
+  taskStatus: el('taskStatus'),
+  taskSpec: el('taskSpec'),
+  taskExpires: el('taskExpires'),
+  taskDispatched: el('taskDispatched'),
+  taskAcked: el('taskAcked'),
+  taskCompleted: el('taskCompleted'),
+  taskUploadId: el('taskUploadId'),
+  taskAckHint: el('taskAckHint'),
+  taskHistoryBody: el('taskHistoryBody'),
+  taskHistoryInfo: el('taskHistoryInfo'),
+  cmpBody: el('cmpBody'),
+  cmpInfo: el('cmpInfo'),
+  scene3d: el('scene3d'),
+  sceneInfo: el('sceneInfo'),
+  sceneWin: el('sceneWin'),
+  autoRotate: el('autoRotate'),
+  resetView: el('resetView'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '' };
@@ -64,6 +95,33 @@ async function apiGet(path) {
   } catch (e) {
     throw new Error('响应不是合法 JSON：' + path);
   }
+  return data;
+}
+
+/** 容错 POST JSON：网络/非 2xx 都抛出带可读信息的 Error（优先用服务端 error 字段） */
+async function apiPost(path, body) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      cache: 'no-store',
+    });
+  } catch (e) {
+    throw new Error('无法连接服务器，请确认服务端已启动：' + path);
+  }
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+  if (!res.ok) {
+    const msg = (data && data.error) ? data.error : ('接口返回 ' + res.status);
+    throw new Error(msg + '：' + path);
+  }
+  if (!data) throw new Error('响应不是合法 JSON：' + path);
   return data;
 }
 
@@ -365,6 +423,7 @@ async function poll() {
     const path = '/api/v1/latest?device_id=' + encodeURIComponent(state.current);
     const latest = await apiGet(path);
     renderLatest(latest);
+    renderTrace(latest);
 
     // 3) 实时波形：跨批次取连续样本（失败不影响上方数据卡片）
     const winPath = '/api/v1/window?device_id=' +
@@ -377,6 +436,12 @@ async function poll() {
       state.lastPoints = [];
     }
     drawChart(state.lastPoints);
+    drawScene3D(state.lastPoints);
+
+    // 侧栏（对照区 / 任务历史）按节流刷新：首轮必刷，之后每 SIDE_REFRESH_EVERY 轮一次。
+    // 不 await：侧栏慢或失败都不该拖住 800 ms 的主轮询。
+    pollTicks++;
+    if (pollTicks === 1 || pollTicks % SIDE_REFRESH_EVERY === 0) refreshSidePanels();
   } catch (e) {
     renderStatus('⚠ ' + e.message, 'error');
   } finally {
@@ -426,5 +491,716 @@ setInterval(poll, POLL_MS);
 
 // 页面加载时先画一次空波形，避免 canvas 区域空白
 drawChart([]);
+
+/* ------------------------------------------------------------------ *
+ *  按需采集任务（manual capture task）
+ *
+ *  「仅刷新」只重新拉查询接口；「采集一次最新数据」先 POST 建任务，板端轮询领取后
+ *  暂停周期上报、按任务节拍采一批数据并带 request_id 回传，服务端在写库的同一
+ *  事务里把任务置 completed。
+ * ------------------------------------------------------------------ */
+
+const TASK = {
+  samples: 100,      // 单次采集样本数（100 Hz × 1 s）
+  rateHz: 100,       // 采样率，与板端 QMA6100P 一致
+  timeoutS: 60,      // 任务有效期（服务端过期 → timeout）
+  pollMs: 1000,      // 任务状态查询间隔
+};
+
+/* 参数表单的可调范围：取「服务端校验」与「板端能力」的交集，避免页面造出必然失败的任务。
+ *  服务端 validate_task_request：rate 10-200、count 1-2000、timeout 5-600
+ *  板端 main.c：sample_count ≤ TASK_MAX_SAMPLES(600)、rate ≤ TARGET_SAMPLE_FREQ_HZ(100)
+ * source 必须是板端上报的 qma6100p、unit 必须是 m/s^2，否则 _check_task_match 判失败，
+ * 因此这两项在页面上固定、不开放编辑。 */
+const TASK_LIMITS = {
+  source: 'qma6100p',
+  countMin: 1, countMax: 600,
+  rateMin: 10, rateMax: 100,
+  timeoutMin: 5, timeoutMax: 600,
+};
+
+/* 已下发超过该秒数仍无 acked_at → 页面给出「回执未收到」提示（纯前端推断，服务端状态不变） */
+const NO_ACK_WARN_S = 5;
+
+/* 侧栏（对照区 / 任务历史）刷新节流：主轮询每 800 ms 一次，侧栏每 5 次刷新一次 */
+const SIDE_REFRESH_EVERY = 5;
+let pollTicks = 0;
+
+const TASK_STATUS_META = {
+  submitted: { cls: 'warn', text: '已提交', hint: '等待板端轮询领取（板端每 3 s 轮询一次）' },
+  dispatched: { cls: 'warn', text: '已下发', hint: '板端已领取任务，正在采集' },
+  acked: { cls: 'warn', text: '设备接收', hint: '板端已回执，采集/上传进行中' },
+  completed: { cls: 'ok', text: '完成', hint: '数据已入库，样本来自本组设备' },
+  failed: { cls: 'err', text: '失败', hint: '被板端或服务端校验拒绝' },
+  timeout: { cls: 'err', text: '超时', hint: '有效期内未完成，不会被再次下发' },
+};
+
+const taskState = { rid: '', timer: null, last: null };
+
+function renderTaskBadge(status) {
+  const meta = TASK_STATUS_META[status] || { cls: 'off', text: status || '空闲', hint: '' };
+  if ($.taskBadge) {
+    $.taskBadge.className = 'badge ' + meta.cls;
+    $.taskBadge.textContent = meta.text;
+  }
+  return meta;
+}
+
+function renderTask(task, note, upload) {
+  if (!task) return;
+  const meta = renderTaskBadge(task.status);
+  taskState.last = task;
+  taskState.rid = task.request_id || taskState.rid;
+
+  if ($.taskRid) $.taskRid.textContent = task.request_id || '—';
+  if ($.taskSpec) {
+    $.taskSpec.textContent = (task.sample_count ?? '—') + ' 点 @ ' +
+                             (task.sample_rate_hz ?? '—') + ' Hz';
+  }
+  if ($.taskStatus) {
+    let text = meta.text + '（状态码 ' + task.status + '）· ' + meta.hint;
+    if (task.error) text += ' · error: ' + task.error;
+    if (note) text += ' · ' + note;
+    $.taskStatus.textContent = text;
+  }
+  // 状态机时间戳：服务端返回 *_at_str，未到达的阶段显示占位文案
+  if ($.taskDispatched) {
+    $.taskDispatched.textContent = task.dispatched_at_str || '—（尚未下发）';
+  }
+  if ($.taskAcked) {
+    $.taskAcked.textContent = task.acked_at_str || '—（尚未回执）';
+  }
+  if ($.taskCompleted) {
+    $.taskCompleted.textContent = task.completed_at_str || '—（未结束）';
+  }
+  // 关联数据：任务详情接口带回 uploads 摘要（upload），列表接口只有 upload_id
+  const up = upload || task.upload || null;
+  if ($.taskUploadId) {
+    if (up && up.id) {
+      $.taskUploadId.textContent = up.id + '（' + (up.trigger || 'manual') + ' · ' +
+        (up.sample_count ?? '—') + ' 点 · ' + (up.received_at_str || '—') + '）';
+    } else if (task.upload_id) {
+      $.taskUploadId.textContent = String(task.upload_id);
+    } else {
+      $.taskUploadId.textContent = '—（任务未完成，暂无关联批次）';
+    }
+  }
+  if ($.taskExpires) {
+    if (task.terminal) {
+      $.taskExpires.textContent = task.completed_at_str
+        ? '已结束 ' + task.completed_at_str
+        : '已结束';
+    } else {
+      const left = Number(task.expires_in_s);
+      $.taskExpires.textContent = isFinite(left)
+        ? (left > 0 ? left.toFixed(0) + ' s 后超时' : '已过期')
+        : '—';
+    }
+  }
+  renderNoAckHint(task);
+}
+
+/** 「回执未收到」提示：板端 ack 失败只在设备日志里可见，服务端会一直停在 dispatched */
+function renderNoAckHint(task) {
+  if (!$.taskAckHint) return;
+  const dispatched = Number(task && task.dispatched_at);
+  const waiting = !!(task && task.status === 'dispatched' &&
+                     isFinite(dispatched) && dispatched > 0);
+  if (!waiting) {
+    $.taskAckHint.classList.add('hidden');
+    $.taskAckHint.textContent = '';
+    return;
+  }
+  const waited = Math.max(0, Date.now() / 1000 - dispatched);
+  $.taskAckHint.classList.remove('hidden');
+  $.taskAckHint.textContent = waited >= NO_ACK_WARN_S
+    ? '⚠ 已下发 ' + waited.toFixed(0) + ' s 仍未收到设备回执（acked_at）：板端回执失败只在设备'
+      + '串口日志里可见，服务端状态会保持 dispatched 直到有效期结束。请查板端 [task] 日志；'
+      + '任务仍可能在有效期内靠数据回传（带 request_id 的上报）直接完成。'
+    : '已下发 ' + waited.toFixed(1) + ' s，等待设备回执（超过 ' + NO_ACK_WARN_S + ' s 会提示）。';
+}
+
+function stopTaskWatch() {
+  if (taskState.timer) {
+    clearInterval(taskState.timer);
+    taskState.timer = null;
+  }
+}
+
+/** 以 1 s 间隔查询 /api/v1/tasks/{request_id}，终态后停止并补拉一次数据 */
+function watchTask(requestId) {
+  stopTaskWatch();
+  const tick = async () => {
+    try {
+      const data = await apiGet('/api/v1/tasks/' + encodeURIComponent(requestId));
+      renderTask(data.task, undefined, data.upload);
+      if (data.task && data.task.terminal) {
+        stopTaskWatch();
+        poll();          // 任务完成后立刻刷新数据面板，不用等下一次轮询
+      }
+    } catch (e) {
+      stopTaskWatch();
+      renderStatus('⚠ 任务状态查询失败：' + e.message, 'error');
+    }
+  };
+  taskState.timer = setInterval(tick, TASK.pollMs);
+  tick();
+}
+
+/** 打开页面/切换设备时回填该设备最近的任务与任务历史（列表按 created_at 倒序） */
+async function refreshLatestTask() {
+  if (!state.current) return;
+  try {
+    const data = await apiGet('/api/v1/tasks?device_id=' +
+                              encodeURIComponent(state.current) + '&limit=20');
+    const tasks = data.tasks || [];
+    renderTaskHistory(tasks);
+    const task = tasks[0];
+    if (!task) return;
+    renderTask(task, task.terminal ? '历史任务（已结束）' : '继续跟踪');
+    if (!task.terminal) watchTask(task.request_id);
+  } catch (e) {
+    /* 任务接口不可用不应影响主面板 */
+  }
+}
+
+/** request_id 是 32 位十六进制，表格里只显示头尾（完整值放在 title 属性里） */
+function shortRid(rid) {
+  if (!rid) return '—';
+  return rid.length > 10 ? rid.slice(0, 6) + '…' + rid.slice(-4) : rid;
+}
+
+/** 任务耗时：created_at → completed_at（未结束则显示已过时间） */
+function taskDuration(t) {
+  const start = Number(t && t.created_at);
+  if (!isFinite(start) || start <= 0) return '—';
+  const end = Number(t.completed_at) || (Date.now() / 1000);
+  return (t.completed_at ? '' : '进行中 ') + Math.max(0, end - start).toFixed(1) + ' s';
+}
+
+/** 任务历史表：最近 20 条任务（状态/参数/关联批次 upload_id/耗时） */
+function renderTaskHistory(tasks) {
+  const list = tasks || [];
+  if ($.taskHistoryInfo) {
+    $.taskHistoryInfo.textContent = list.length
+      ? '· ' + (state.current || '') + ' · 已完成 ' +
+        list.filter((t) => t.status === 'completed').length + ' 条'
+      : '· 暂无任务记录';
+  }
+  const body = $.taskHistoryBody;
+  if (!body) return;
+  if (!list.length) {
+    body.innerHTML = '<tr><td colspan="6">—（本设备还没有任务）</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const t of list) {
+    const meta = TASK_STATUS_META[t.status] || { cls: 'off', text: t.status };
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + (t.created_at_str || '—') + '</td>' +
+      '<td title="' + (t.request_id || '') + '">' + shortRid(t.request_id) + '</td>' +
+      '<td>' + (t.sample_count ?? '—') + ' @ ' + (t.sample_rate_hz ?? '—') + '</td>' +
+      '<td>' + meta.text + '（' + (t.status || '—') + '）</td>' +
+      '<td>' + (t.upload_id ?? '—') + '</td>' +
+      '<td>' + taskDuration(t) + '</td>';
+    frag.appendChild(tr);
+  }
+  body.innerHTML = '';
+  body.appendChild(frag);
+}
+
+/** 对照区：同设备「最近一批 manual」vs「最近一批 periodic」（后端只多了一个 trigger 过滤） */
+async function renderCompare() {
+  const body = $.cmpBody;
+  if (!body || !state.current) return;
+  const base = '/api/v1/latest?device_id=' + encodeURIComponent(state.current);
+  let manual = null, periodic = null;
+  try {
+    const [m, p] = await Promise.all([
+      apiGet(base + '&trigger=manual'),
+      apiGet(base + '&trigger=periodic'),
+    ]);
+    manual = (m && m.found) ? m.upload : null;
+    periodic = (p && p.found) ? p.upload : null;
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="6">—（对照数据查询失败：' + e.message + '）</td></tr>';
+    return;
+  }
+  const row = (label, up) => {
+    if (!up) {
+      return '<tr><td>' + label + '</td><td colspan="5">—（该设备还没有这类批次）</td></tr>';
+    }
+    return '<tr><td>' + label + '</td>' +
+      '<td>' + (up.id ?? '—') + '</td>' +
+      '<td>' + (up.sample_count ?? '—') + '</td>' +
+      '<td>' + fmtTsMs(up.ts_ms) + '　(' + (up.ts_ms ?? '—') + ')</td>' +
+      '<td>' + (up.received_at_str || '—') + '</td>' +
+      '<td>' + shortRid(up.request_id) + '</td></tr>';
+  };
+  body.innerHTML = row('manual（按需采集）', manual) + row('periodic（周期上报）', periodic);
+  if ($.cmpInfo) {
+    $.cmpInfo.textContent = manual && periodic
+      ? '· 两类批次各有记录 · ' + (state.current || '')
+      : '· 缺一类批次（板端可能在暂停周期上报或尚未手动采集）';
+  }
+}
+
+/** 侧栏刷新：对照区 + 任务历史（切换设备 / 建任务 / 任务终态 / 主轮询节流都会调用） */
+function refreshSidePanels() {
+  renderCompare();
+  refreshLatestTask();
+}
+
+/** URL 参数（?source=&samples=&rate=&timeout=）覆盖表单初值，便于自动化构造任务参数 */
+function syncFormFromUrl() {
+  let params;
+  try {
+    params = new URLSearchParams(window.location.search);
+  } catch (e) {
+    return;      // 不支持 URLSearchParams 的环境忽略
+  }
+  // 属性与属性值一起写：属性值让无头浏览器 dump-dom 也能看到实际生效的参数
+  const set = (elem, key) => {
+    const v = params.get(key);
+    if (!elem || !v) return;
+    elem.value = v;
+    elem.setAttribute('value', v);
+  };
+  set($.sourceSel, 'source');
+  set($.countInput, 'samples');
+  set($.rateInput, 'rate');
+  set($.timeoutInput, 'timeout');
+}
+
+/** 读取参数表单；越界/非整数抛错（不发请求，错误信息直接显示在状态条） */
+function readTaskParams() {
+  const num = (label, raw, low, high) => {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < low || n > high) {
+      throw new Error(label + ' 必须是 ' + low + '-' + high +
+                      ' 的整数（当前 ' + raw + '）');
+    }
+    return n;
+  };
+  const source = String(($.sourceSel && $.sourceSel.value) || TASK_LIMITS.source).trim();
+  return {
+    source: source || TASK_LIMITS.source,
+    sample_count: num('样本数', ($.countInput && $.countInput.value) || TASK.samples,
+                      TASK_LIMITS.countMin, TASK_LIMITS.countMax),
+    sample_rate_hz: num('采样率 Hz', ($.rateInput && $.rateInput.value) || TASK.rateHz,
+                        TASK_LIMITS.rateMin, TASK_LIMITS.rateMax),
+    timeout_s: num('有效期 s', ($.timeoutInput && $.timeoutInput.value) || TASK.timeoutS,
+                   TASK_LIMITS.timeoutMin, TASK_LIMITS.timeoutMax),
+  };
+}
+
+/** 点击「采集一次最新数据」：按表单参数建任务 → 跟踪到终态 */
+async function captureOnce() {
+  if (!state.current) {
+    renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
+    return;
+  }
+  let params;
+  try {
+    params = readTaskParams();
+  } catch (e) {
+    renderStatus('⚠ 任务参数不合法：' + e.message, 'error');
+    return;
+  }
+  $.captureBtn.disabled = true;
+  try {
+    const data = await apiPost('/api/v1/tasks', {
+      device_id: state.current,
+      source: params.source,
+      sample_count: params.sample_count,
+      sample_rate_hz: params.sample_rate_hz,
+      timeout_s: params.timeout_s,
+    });
+    renderTask(data.task, data.duplicate ? '已复用未完成任务，未产生并行任务' : '任务已创建');
+    watchTask(data.task.request_id);
+    renderStatus('', 'hidden');
+    refreshSidePanels();
+  } catch (e) {
+    renderStatus('⚠ 创建采集任务失败：' + e.message, 'error');
+  } finally {
+    $.captureBtn.disabled = false;
+  }
+}
+
+/** /api/v1/latest 现在带回 trigger / request_id，回填到数据卡片 */
+function renderTrace(latest) {
+  const up = (latest && latest.upload) || {};
+  if ($.vTrigger) {
+    $.vTrigger.textContent = up.trigger
+      ? (up.trigger === 'manual' ? 'manual（按需采集）' : 'periodic（周期上报）')
+      : '—';
+  }
+  if ($.vRequestId) {
+    $.vRequestId.textContent = up.request_id || '—（周期批次不带任务号）';
+  }
+}
+
+$.captureBtn.addEventListener('click', () => captureOnce());
+
+// 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
+$.deviceSel.addEventListener('change', () => {
+  stopTaskWatch();
+  setTimeout(refreshSidePanels, 900);
+});
+
+// 设备列表首次加载后按钮才可用；这里先放开，点击时会校验是否已选设备
+$.captureBtn.disabled = false;
+syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source= 覆盖表单初值
+refreshSidePanels();
+
+// 便于自动化验证：用 /ui/?autocapture=1 打开页面即触发一次采集（等价于点按钮），
+// 无需人工点击也能核对「建任务 → 板端领取 → 带 request_id 回传」这条链路。
+try {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('autocapture') === '1') {
+    setTimeout(captureOnce, 1200);
+  }
+} catch (e) {
+  /* 不支持 URLSearchParams 的环境忽略即可 */
+}
+
+/* ------------------------------------------------------------------ *
+ *  三维姿态视图：纯 Canvas 2D 手写正交投影（无第三方库 / 无 CDN）
+ *
+ *  屏幕约定：ax → 右，ay → 上，az → 朝向观察者；绕 Y 轴偏航、绕屏幕水平轴俯仰，
+ *  正交投影（不做透视除法，读数稳定，CPU 开销小）。地面网格画在 y = -L 平面，
+ *  当前向量在 XZ 平面上的投影用虚线落到网格上。
+ * ------------------------------------------------------------------ */
+
+const SCENE = {
+  yaw: -0.65,       // 偏航角（弧度）
+  pitch: 0.42,      // 俯仰角
+  zoom: 1,
+  auto: true,
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+const SCENE_AXIS_LEN = 12;        // 轴长（m/s²，覆盖 1 g ≈ 9.81）
+const SCENE_G = 9.80665;          // 重力参考值
+const SCENE_TRAJ_MAX = 600;       // 轨迹最多绘制点数（超出则抽样）
+const SCENE_COLORS = {
+  ax: '#cf222e', ay: '#1a7f37', az: '#2563eb',
+  vector: '#111827', gravity: '#8b95a1', traj: 'rgba(37, 99, 235, .45)',
+  grid: '#eef1f5', ground: '#c8ccd2',
+};
+
+/** 世界坐标 (x, y, z) → 屏幕坐标；depth 供将来做远近排序 */
+function project3D(x, y, z, w, h, scale) {
+  const cy = Math.cos(SCENE.yaw), sy = Math.sin(SCENE.yaw);
+  const cp = Math.cos(SCENE.pitch), sp = Math.sin(SCENE.pitch);
+  const x1 = x * cy - z * sy;      // 绕 Y 轴偏航
+  const z1 = x * sy + z * cy;
+  const y2 = y * cp - z1 * sp;     // 绕屏幕水平轴俯仰
+  const z2 = y * sp + z1 * cp;
+  const s = scale * SCENE.zoom;
+  return { x: w / 2 + x1 * s, y: h / 2 - y2 * s, depth: z2 };
+}
+
+/** 带箭头的线段（箭头在屏幕空间计算，保证各视角下大小一致） */
+function drawArrow(ctx, from, to, color, width, dashed) {
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 2) return;
+  const ux = dx / len, uy = dy / len;
+  const head = Math.min(10, Math.max(5, len * 0.16));
+  const bx = to.x - ux * head, by = to.y - uy * head;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = width;
+  if (dashed) ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(bx, by);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(to.x, to.y);
+  ctx.lineTo(bx - uy * head * 0.45, by + ux * head * 0.45);
+  ctx.lineTo(bx + uy * head * 0.45, by - ux * head * 0.45);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/** 地面网格（y = -L 平面）+ 网格原点十字 */
+function drawGround3D(ctx, w, h, scale, L) {
+  const steps = 4;
+  ctx.save();
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= steps; i++) {
+    const t = -L + (2 * L * i) / steps;
+    ctx.strokeStyle = (i * 2 === steps) ? SCENE_COLORS.ground : SCENE_COLORS.grid;
+    for (const seg of [[t, -L, t, L], [-L, t, L, t]]) {
+      const a = project3D(seg[0], -L, seg[1], w, h, scale);
+      const b = project3D(seg[2], -L, seg[3], w, h, scale);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/** 三轴箭头 + 轴标签，返回屏幕原点 */
+function drawAxes3D(ctx, w, h, scale, L) {
+  const o = project3D(0, 0, 0, w, h, scale);
+  const tips = {
+    ax: project3D(L, 0, 0, w, h, scale),
+    ay: project3D(0, L, 0, w, h, scale),
+    az: project3D(0, 0, L, w, h, scale),
+  };
+  ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const key of ['ax', 'ay', 'az']) {
+    drawArrow(ctx, o, tips[key], SCENE_COLORS[key], 1.6, false);
+    ctx.fillStyle = SCENE_COLORS[key];
+    ctx.fillText(key, tips[key].x, tips[key].y);
+  }
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('轴长 ' + L + ' m/s²', 10, h - 8);
+  return o;
+}
+
+/** 轨迹折线（抽样到 SCENE_TRAJ_MAX 点；起点灰、终点蓝） */
+function drawTrajectory3D(ctx, w, h, scale, points) {
+  if (!points || points.length < 2) return;
+  const step = Math.max(1, Math.floor(points.length / SCENE_TRAJ_MAX));
+  ctx.save();
+  ctx.strokeStyle = SCENE_COLORS.traj;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < points.length; i += step) {
+    const p = points[i];
+    if (!isFinite(p.ax) || !isFinite(p.ay) || !isFinite(p.az)) {
+      started = false;
+      continue;
+    }
+    const s = project3D(p.ax, p.ay, p.az, w, h, scale);
+    if (!started) {
+      ctx.moveTo(s.x, s.y);
+      started = true;
+    } else {
+      ctx.lineTo(s.x, s.y);
+    }
+  }
+  ctx.stroke();
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const a = project3D(first.ax, first.ay, first.az, w, h, scale);
+  const b = project3D(last.ax, last.ay, last.az, w, h, scale);
+  ctx.fillStyle = '#9aa4b2';
+  ctx.beginPath();
+  ctx.arc(a.x, a.y, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = SCENE_COLORS.az;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function sceneEmptyText(ctx, w, h, text) {
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '13px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, w / 2, h / 2);
+}
+
+/**
+ * 主绘制：地面网格 + 三轴 + 轨迹 + 当前向量（含分量/投影虚线）+ 重力参考。
+ * points: [{t, ax, ay, az}, …]，按 t 升序（即 /api/v1/window 的返回值）
+ */
+function drawScene3D(points) {
+  const cv = $.scene3d;
+  if (!cv || !cv.getContext) return;
+  const ctx = cv.getContext('2d');
+  const { w, h } = fitCanvas(cv, ctx);
+  ctx.clearRect(0, 0, w, h);
+
+  const L = SCENE_AXIS_LEN;
+  const scale = Math.min(w, h) / (L * 3.6);     // 让 ±L 落在画布中部
+
+  drawGround3D(ctx, w, h, scale, L);
+  const o = drawAxes3D(ctx, w, h, scale, L);
+  drawTrajectory3D(ctx, w, h, scale, points);
+
+  const last = (points && points.length) ? points[points.length - 1] : null;
+  if (!last || !isFinite(last.ax) || !isFinite(last.ay) || !isFinite(last.az)) {
+    sceneEmptyText(ctx, w, h, '等待数据……（板端上传后此处实时刷新）');
+    updateSceneInfo(null, points);
+    return;
+  }
+
+  const v = project3D(last.ax, last.ay, last.az, w, h, scale);
+  const comps = [
+    [project3D(last.ax, 0, 0, w, h, scale), SCENE_COLORS.ax],
+    [project3D(0, last.ay, 0, w, h, scale), SCENE_COLORS.ay],
+    [project3D(0, 0, last.az, w, h, scale), SCENE_COLORS.az],
+  ];
+  const shadow = project3D(last.ax, -L, last.az, w, h, scale);
+
+  ctx.save();                     // 分量 + 地面投影（虚线，画在下层）
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1.2;
+  for (const [tip, color] of comps) {
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = SCENE_COLORS.ground;
+  ctx.beginPath();
+  ctx.moveTo(v.x, v.y);
+  ctx.lineTo(shadow.x, shadow.y);
+  ctx.stroke();
+  ctx.restore();
+
+  const gz = (last.az >= 0 ? 1 : -1) * SCENE_G;   // 重力参考：与 az 同向取 +g
+  const g = project3D(0, 0, gz, w, h, scale);
+  drawArrow(ctx, o, g, SCENE_COLORS.gravity, 1.4, true);
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('g', g.x, g.y - 4);
+
+  drawArrow(ctx, o, v, SCENE_COLORS.vector, 2.6, false);   // 当前向量（最上层）
+  ctx.fillStyle = SCENE_COLORS.vector;
+  ctx.beginPath();
+  ctx.arc(v.x, v.y, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  drawSceneLegend(ctx, last);
+  updateSceneInfo(last, points);
+}
+
+function drawSceneLegend(ctx, p) {
+  const mag = Math.sqrt(p.ax * p.ax + p.ay * p.ay + p.az * p.az);
+  const deg = (r) => (r * 180 / Math.PI).toFixed(0);
+  const lines = [
+    'a = (' + p.ax.toFixed(2) + ', ' + p.ay.toFixed(2) + ', ' + p.az.toFixed(2) + ') m/s²',
+    '|a| = ' + mag.toFixed(2) + ' m/s²    g = ' + SCENE_G.toFixed(2),
+    '偏航 ' + deg(SCENE.yaw) + '° · 俯仰 ' + deg(SCENE.pitch) +
+      '° · 缩放 ' + SCENE.zoom.toFixed(2) + '×',
+  ];
+  ctx.save();
+  ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#1f2933';
+  lines.forEach((t, i) => ctx.fillText(t, 10, 10 + i * 16));
+  ctx.restore();
+}
+
+function updateSceneInfo(last, points) {
+  if (!$.sceneInfo) return;
+  if (!last) {
+    $.sceneInfo.textContent = '暂无数据';
+    return;
+  }
+  const mag = Math.sqrt(last.ax * last.ax + last.ay * last.ay + last.az * last.az);
+  $.sceneInfo.textContent = '|a| = ' + mag.toFixed(2) + ' m/s² · 轨迹 ' +
+                            ((points || []).length) + ' 点';
+}
+
+/* ---- 交互：拖拽旋转 / 滚轮缩放 / 双击或按钮复位 / 自动旋转 ---- */
+
+function resetScene() {
+  SCENE.yaw = -0.65;
+  SCENE.pitch = 0.42;
+  SCENE.zoom = 1;
+  drawScene3D(state.lastPoints || []);
+}
+
+let sceneLastFrame = 0;
+
+/** 自动旋转：rAF 驱动并限到约 30 fps，避免无谓重绘 */
+function sceneRotateLoop(ts) {
+  const now = (typeof ts === 'number') ? ts : performance.now();
+  if (SCENE.auto && !SCENE.dragging && (now - sceneLastFrame) > 33) {
+    sceneLastFrame = now;
+    SCENE.yaw += 0.006;
+    drawScene3D(state.lastPoints || []);
+  }
+  requestAnimationFrame(sceneRotateLoop);
+}
+
+function sceneInit() {
+  const cv = $.scene3d;
+  if (!cv) return;
+  if ($.sceneWin) $.sceneWin.textContent = String(CHART_WINDOW_S);
+  if ($.autoRotate) SCENE.auto = $.autoRotate.checked;
+
+  const onDown = (x, y) => {
+    SCENE.dragging = true;
+    SCENE.lastX = x;
+    SCENE.lastY = y;
+  };
+  const onMove = (x, y) => {
+    if (!SCENE.dragging) return;
+    const dx = x - SCENE.lastX;
+    const dy = y - SCENE.lastY;
+    SCENE.lastX = x;
+    SCENE.lastY = y;
+    SCENE.yaw += dx * 0.01;
+    SCENE.pitch = Math.max(-1.45, Math.min(1.45, SCENE.pitch + dy * 0.01));
+    drawScene3D(state.lastPoints || []);
+  };
+  const onUp = () => { SCENE.dragging = false; };
+
+  cv.addEventListener('mousedown', (ev) => onDown(ev.clientX, ev.clientY));
+  window.addEventListener('mousemove', (ev) => onMove(ev.clientX, ev.clientY));
+  window.addEventListener('mouseup', onUp);
+
+  cv.addEventListener('touchstart', (ev) => {
+    const t = ev.touches[0];
+    if (t) onDown(t.clientX, t.clientY);
+  }, { passive: true });
+  cv.addEventListener('touchmove', (ev) => {
+    const t = ev.touches[0];
+    if (!t) return;
+    ev.preventDefault();
+    onMove(t.clientX, t.clientY);
+  }, { passive: false });
+  cv.addEventListener('touchend', onUp);
+
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 0.92 : 1.08;
+    SCENE.zoom = Math.max(0.4, Math.min(3, SCENE.zoom * factor));
+    drawScene3D(state.lastPoints || []);
+  }, { passive: false });
+
+  cv.addEventListener('dblclick', () => resetScene());
+  if ($.resetView) $.resetView.addEventListener('click', () => resetScene());
+  if ($.autoRotate) {
+    $.autoRotate.addEventListener('change', () => { SCENE.auto = $.autoRotate.checked; });
+  }
+  // 窗口尺寸变化时按新尺寸重绘（正交投影，只需重算 scale）
+  window.addEventListener('resize', () => drawScene3D(state.lastPoints || []));
+
+  requestAnimationFrame(sceneRotateLoop);
+  drawScene3D(state.lastPoints || []);
+}
+
+sceneInit();
 
 

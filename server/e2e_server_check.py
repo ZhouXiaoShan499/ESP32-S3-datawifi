@@ -14,6 +14,13 @@ import time
 import urllib.error
 import urllib.request
 
+# 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _E2E_DB = os.path.join(_HERE, "data", "e2e_upload.db")
 if os.path.exists(_E2E_DB):
@@ -88,6 +95,51 @@ def main():
         assert lj["found"] and abs(lj["sample_tail"][-1]["az"] - 9.83) < 1e-6
         print("[PASS] latest 末样本 az=%s（与上传值一致）"
               % lj["sample_tail"][-1]["az"])
+
+        # ---- 按需采集任务：真实 HTTP 全链路（建 → 连点去重 → 领 → ack → 回传 → 幂等）----
+        task_body = {"device_id": payload["device_id"], "sample_count": 2}
+        st, tj = request("POST", BASE + "/api/v1/tasks", task_body)
+        assert st == 201 and tj["duplicate"] is False, (st, tj)
+        rid = tj["task"]["request_id"]
+        assert tj["task"]["status"] == "submitted"
+
+        st, dup = request("POST", BASE + "/api/v1/tasks", task_body)
+        assert st == 200 and dup["duplicate"] is True, (st, dup)
+        assert dup["task"]["request_id"] == rid
+        print("[PASS] 连点去重（真实 HTTP）：duplicate=true 且 request_id 不变")
+
+        next_url = BASE + "/api/v1/tasks/next?device_id=" + payload["device_id"]
+        st, nx = request("GET", next_url)
+        assert nx["found"] is True and nx["task"]["request_id"] == rid, nx
+        st, nx2 = request("GET", next_url)
+        assert nx2["found"] is False, nx2
+        st, _ = request("POST", BASE + "/api/v1/tasks/%s/ack" % rid, {})
+        assert st == 200, st
+        print("[PASS] /tasks/next 领取一次即 dispatched，ack 回执 200（真实 HTTP）")
+
+        manual = dict(payload)
+        manual["ts_ms"] = int(time.time() * 1000)
+        manual["request_id"] = rid
+        manual["trigger"] = "manual"
+        manual["samples"] = [{"i": i, "t_ms": i * 10, "ax": 0.01 * i,
+                              "ay": -0.02 * i, "az": 9.8} for i in range(2)]
+        st, mj = request("POST", BASE + "/api/v1/upload", manual)
+        assert st == 201 and mj["request_id"] == rid and mj["trigger"] == "manual", \
+            (st, mj)
+
+        st, again = request("POST", BASE + "/api/v1/upload", manual)
+        assert st == 200 and again["idempotent"] is True, (st, again)
+        assert again["upload_id"] == mj["upload_id"], (again, mj)
+
+        st, tj = request("GET", BASE + "/api/v1/tasks/%s" % rid)
+        assert tj["task"]["status"] == "completed", tj
+        assert tj["task"]["upload_id"] == mj["upload_id"], tj
+        print("[PASS] 手动批次回传 → 任务 completed（真实 HTTP，upload_id=%s）"
+              % mj["upload_id"])
+
+        st, h = request("GET", BASE + "/api/v1/health")
+        assert h["tasks_by_status"].get("completed") == 1, h
+        print("[PASS] health 任务统计（真实 HTTP）:", h["tasks_by_status"])
 
         print("\nE2E ALL CHECKS PASSED")
     finally:
