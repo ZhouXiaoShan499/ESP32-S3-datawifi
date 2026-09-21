@@ -335,6 +335,226 @@ def main_run():
     print("[PASS] /tasks?limit= 历史 %d 条：倒序、字段齐全、upload_id=%s 与详情一致、"
           "limit 夹取到 1..100" % (len(ts), done[0]["upload_id"]))
 
+    # 20) 周期上报控制（kind=pause/resume）：Web 建任务 → 板端领取 → applied 确认生效
+    #     → 服务端写 device_control（真相源）→ /api/v1/control 反映暂停状态。
+    #     用独立 device_id，避免影响上面的统计类断言。
+    ctrl_dev = "esp32s3-eye-ctrl"
+
+    def control_of(dev=ctrl_dev):
+        r = client.get("/api/v1/control", params={"device_id": dev})
+        assert r.status_code == 200, r.text
+        return r.json()["control"]
+
+    def device_of(dev=ctrl_dev):
+        devs2 = {d["device_id"]: d
+                 for d in client.get("/api/v1/devices").json()["devices"]}
+        return devs2.get(dev, {})
+
+    def claim(dev=ctrl_dev):
+        """领取该设备最早的待执行任务（/tasks/next 按 created_at 正序）。"""
+        return client.get("/api/v1/tasks/next", params={"device_id": dev}).json()
+
+    def task_of(request_id):
+        return client.get("/api/v1/tasks/%s" % request_id).json()["task"]
+
+    # 缺省 kind = capture（老客户端不带 kind 时行为与旧版一致）
+    seed_ctrl = client.post("/api/v1/tasks",
+                            json={"device_id": ctrl_dev, "sample_count": 3})
+    assert seed_ctrl.status_code == 201, seed_ctrl.text
+    cap0 = seed_ctrl.json()["task"]
+    assert cap0["kind"] == "capture" and cap0["kind_cn"] == "按需采集"
+    assert cap0["is_control"] is False and cap0["duration_s"] is None
+    assert claim()["task"]["request_id"] == cap0["request_id"]
+    drain = make_payload(device=ctrl_dev, n=3)
+    drain["request_id"] = cap0["request_id"]
+    assert client.post("/api/v1/upload", json=drain).status_code == 201
+    assert task_of(cap0["request_id"])["status"] == "completed"
+    print("[PASS] kind 缺省为 capture（老客户端兼容），字段 kind_cn/is_control 齐全")
+
+    # 21) 创建 pause：进入同一套任务状态机，但带 duration_s、trigger=control
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "kind": "pause", "duration_s": 30})
+    assert r.status_code == 201, r.text
+    pause_task = r.json()["task"]
+    pause_rid = pause_task["request_id"]
+    assert pause_task["status"] == "submitted" and pause_task["kind"] == "pause"
+    assert pause_task["duration_s"] == 30 and pause_task["is_control"] is True
+    assert pause_task["trigger"] == "control" and pause_task["expires_in_s"] > 0
+    assert control_of()["periodic_paused"] is False, "任务未 applied 就不该显示暂停"
+    print("[PASS] 创建暂停任务 request_id=%s（kind=pause, duration_s=30）" % pause_rid)
+
+    # 22) 连点「暂停周期」只复用同一条未完成任务（duplicate）
+    r2 = client.post("/api/v1/tasks",
+                     json={"device_id": ctrl_dev, "kind": "pause", "duration_s": 300})
+    assert r2.status_code == 200 and r2.json()["duplicate"] is True, r2.text
+    assert r2.json()["task"]["request_id"] == pause_rid
+    assert r2.json()["task"]["duration_s"] == 30, "重复请求不该改写已有任务的时长"
+    print("[PASS] 连点暂停：duplicate=true 且 request_id/duration_s 不变")
+
+    # 23) 去重键带 kind：一条待执行的 pause 不能把后续 capture 挡住
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "sample_count": 3})
+    assert r.status_code == 201 and r.json()["duplicate"] is False, r.text
+    cap_after_pause = r.json()["task"]["request_id"]
+    assert cap_after_pause != pause_rid
+    print("[PASS] pause 待执行时 capture 仍能新建（去重键 = device+source+kind）")
+
+    # 24) 方向相反的控制任务互斥：新建 resume 会把 pending pause 置 failed
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "kind": "resume"})
+    assert r.status_code == 201, r.text
+    resume_task = r.json()["task"]
+    resume_rid = resume_task["request_id"]
+    assert r.json()["superseded"] == 1, r.text
+    st_pause = task_of(pause_rid)
+    assert st_pause["status"] == "failed"
+    assert st_pause["error"] == "superseded by newer control task", st_pause["error"]
+    print("[PASS] resume 取代 pending pause：%s → failed（superseded by newer "
+          "control task）" % pause_rid[:8])
+
+    # 25) 控制任务不影响采集：先按 created_at 顺序领取 capture 并带 request_id 回传
+    got = claim()
+    assert got["found"] is True and got["task"]["request_id"] == cap_after_pause, got
+    assert got["task"]["kind"] == "capture"
+    upl = make_payload(device=ctrl_dev, n=3)
+    upl["request_id"] = cap_after_pause
+    assert client.post("/api/v1/upload", json=upl).status_code == 201
+    assert task_of(cap_after_pause)["status"] == "completed"
+    print("[PASS] 控制任务在队列里不影响按需采集（capture 仍能下发并完成）")
+
+    # 26) 板端领取 resume → POST /applied → 任务 completed，且控制状态为「未暂停」
+    got = claim()
+    assert got["task"]["request_id"] == resume_rid, got
+    assert got["task"]["kind"] == "resume" and got["task"]["duration_s"] is None
+    r = client.post("/api/v1/tasks/%s/ack" % resume_rid)
+    assert r.status_code == 200 and r.json()["task"]["status"] == "acked"
+    r = client.post("/api/v1/tasks/%s/applied" % resume_rid, json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["applied"] is True and body["updated"] is True and body["kind"] == "resume"
+    assert body["task"]["status"] == "completed"
+    assert body["control"]["periodic_paused"] is False
+    assert body["control"]["request_id"] == resume_rid
+    print("[PASS] resume 经 /applied 收尾 → completed，无关联 upload_id=%s"
+          % body["task"]["upload_id"])
+
+    # 27) pause + applied：写 device_control（真相源），/devices 同步标注暂停
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "kind": "pause", "duration_s": 45})
+    assert r.status_code == 201, r.text
+    pause2_rid = r.json()["task"]["request_id"]
+    got = claim()
+    assert got["task"]["request_id"] == pause2_rid
+    until_ms = int(time.time() * 1000) + 45000
+    r = client.post("/api/v1/tasks/%s/applied" % pause2_rid,
+                    json={"paused_until_ms": until_ms})
+    assert r.status_code == 200, r.text
+    ctrl = r.json()["control"]
+    assert r.json()["task"]["status"] == "completed"
+    assert ctrl["periodic_paused"] is True and ctrl["request_id"] == pause2_rid
+    assert 40 <= ctrl["remaining_s"] <= 46, ctrl["remaining_s"]
+    assert ctrl["paused_until_str"] and ctrl["paused_until"] > time.time()
+    assert control_of()["periodic_paused"] is True
+    dev_row = device_of()
+    assert dev_row.get("periodic_paused") is True, dev_row
+    print("[PASS] pause 经 /applied 生效：periodic_paused=True 剩余 %ss（板端报告终点被采用）"
+          % ctrl["remaining_s"])
+
+    # 28) applied 幂等重放（板端 POST 成功但响应丢失时会重试）：不把暂停终点往后推
+    before_until = control_of()["paused_until"]
+    r = client.post("/api/v1/tasks/%s/applied" % pause2_rid, json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["updated"] is False and r.json()["replay"] is True, r.text
+    assert control_of()["paused_until"] == before_until, "重放不该延长暂停窗口"
+    print("[PASS] /applied 重放幂等：updated=false, replay=true，暂停终点不变")
+
+    # 29) 采集任务不能走 /applied 收尾（否则会出现「completed 但 0 样本」）
+    r = client.post("/api/v1/tasks/%s/applied" % cap0["request_id"], json={})
+    assert r.status_code == 409 and r.json()["code"] == "WRONG_KIND", r.text
+    assert task_of(cap0["request_id"])["status"] == "completed", "误调用不该改动任务状态"
+    print("[PASS] capture 调 /applied → 409 WRONG_KIND（且任务状态未被改动）")
+
+    # 30) 控制任务不该收到带它 request_id 的上传：409 WRONG_KIND，不走 _check_task_match
+    bogus2 = make_payload(device=ctrl_dev, n=3)
+    bogus2["request_id"] = pause2_rid
+    bogus2["trigger"] = "manual"
+    r = client.post("/api/v1/upload", json=bogus2)
+    assert r.status_code == 409 and r.json()["code"] == "WRONG_KIND", r.text
+    assert "never carries samples" in r.json()["error"]
+    assert task_of(pause2_rid)["status"] == "completed"
+    print("[PASS] 控制任务收到 samples 上传 → 409 WRONG_KIND:",
+          r.json()["error"][:60])
+
+    # 31) 暂停到期自动恢复：paused_until 一过就被惰性归零（服务端无后台线程）
+    conn = main._connect()
+    try:
+        conn.execute("UPDATE device_control SET paused_until=? WHERE device_id=?",
+                     (time.time() - 1, ctrl_dev))
+        conn.commit()
+    finally:
+        conn.close()
+    expired = control_of()
+    assert expired["periodic_paused"] is False, expired
+    assert expired["paused_until"] is None and expired["remaining_s"] is None
+    assert expired["request_id"] == pause2_rid, "归零后仍应保留最近控制任务号以便追溯"
+    print("[PASS] 暂停到期自动恢复（惰性归零，保留 request_id 便于追溯）")
+
+    # 32) 控制任务的参数校验：kind / duration_s 越界都被 400 拒绝
+    for bad_body in ({"device_id": ctrl_dev, "kind": "explode"},
+                     {"device_id": ctrl_dev, "kind": "pause", "duration_s": 0},
+                     {"device_id": ctrl_dev, "kind": "pause", "duration_s": 601},
+                     {"device_id": ctrl_dev, "kind": "pause", "duration_s": "abc"},
+                     {"device_id": ctrl_dev, "kind": "pause", "duration_s": True}):
+        r = client.post("/api/v1/tasks", json=bad_body)
+        assert r.status_code == 400 and r.json()["code"] == "INVALID", (bad_body, r.text)
+    # resume 不接受 duration_s（恒为 None），pause 缺省时长 = 服务端默认值
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "kind": "resume", "duration_s": 99})
+    assert r.status_code == 201 and r.json()["task"]["duration_s"] is None, r.text
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": ctrl_dev, "kind": "pause"})
+    assert r.status_code == 201, r.text
+    assert r.json()["task"]["duration_s"] == main.PAUSE_DEFAULT_S, r.text
+    assert r.json()["superseded"] == 1, "新 pause 应把刚才的 resume 取代"
+    default_pause_rid = r.json()["task"]["request_id"]
+    print("[PASS] 控制任务参数校验：非法 kind/duration_s 400，缺省时长 %s s，resume 忽略"
+          " duration_s" % main.PAUSE_DEFAULT_S)
+
+    # 33) /api/v1/control 的入参校验与未知设备
+    assert client.get("/api/v1/control").status_code == 400
+    assert client.get("/api/v1/control", params={"device_id": ""}).status_code == 400
+    r = client.get("/api/v1/control",
+                   params={"device_id": "x" * (main.MAX_DEVICE_ID_LEN + 1)})
+    assert r.status_code == 400, r.text
+    unknown_ctrl = client.get("/api/v1/control",
+                              params={"device_id": "esp32s3-eye-unknown"}).json()
+    assert unknown_ctrl["control"]["periodic_paused"] is False
+    assert unknown_ctrl["control"]["request_id"] is None
+    assert client.get("/api/v1/control",
+                      params={"device_id": ctrl_dev,
+                              "source": "qma6100p"}).status_code == 200
+    print("[PASS] /api/v1/control 缺 device_id/超长 400；未知设备返回未暂停")
+
+    # 34) 控制任务也能被板端主动上报失败（板端执行不了时不会卡住队列）
+    got = claim()
+    assert got["task"]["request_id"] == default_pause_rid, got
+    r = client.post("/api/v1/tasks/%s/fail" % default_pause_rid,
+                    json={"error": "pause rejected by device"})
+    assert r.status_code == 200 and r.json()["task"]["status"] == "failed"
+    assert control_of()["periodic_paused"] is False
+    print("[PASS] 控制任务失败上报 → failed，控制状态不被改动")
+
+    # 35) 历史列表带上 kind / duration_s / is_control，供 Web 按类型渲染
+    tj2 = client.get("/api/v1/tasks",
+                     params={"device_id": ctrl_dev, "limit": 20}).json()
+    kinds = {t["kind"] for t in tj2["tasks"]}
+    assert kinds == {"capture", "pause", "resume"}, kinds
+    assert all("kind_cn" in t and "duration_s" in t and "is_control" in t
+               for t in tj2["tasks"]), "历史列表缺少控制任务字段"
+    assert len(tj2["tasks"]) >= 7, tj2["count"]
+    print("[PASS] 任务历史含控制任务：kinds=%s，共 %d 条"
+          % (sorted(kinds), tj2["count"]))
+
     print("\nALL CHECKS PASSED")
 
 

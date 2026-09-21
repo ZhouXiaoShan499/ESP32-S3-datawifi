@@ -141,6 +141,69 @@ def main():
         assert h["tasks_by_status"].get("completed") == 1, h
         print("[PASS] health 任务统计（真实 HTTP）:", h["tasks_by_status"])
 
+        # ---- 周期上报控制：真实 HTTP 全链路（建 pause → 领 → applied → device_control）----
+        ctrl_dev = "esp32s3-eye-0001-ctrl"
+        # 先让该设备出现在 /api/v1/devices 里（设备列表来自 uploads 表），
+        # 这样才能验证「暂停状态」在设备列表上被正确标注。
+        boot = dict(payload)
+        boot["device_id"] = ctrl_dev
+        boot["ts_ms"] = int(time.time() * 1000)
+        st, _ = request("POST", BASE + "/api/v1/upload", boot)
+        assert st == 201, st
+
+        st, cj = request("GET", BASE + "/api/v1/control?device_id=" + ctrl_dev)
+        assert st == 200 and cj["control"]["periodic_paused"] is False, (st, cj)
+        st, dj = request("GET", BASE + "/api/v1/devices")
+        ctrl_row = [d for d in dj["devices"] if d["device_id"] == ctrl_dev][0]
+        assert ctrl_row["periodic_paused"] is False, ctrl_row
+        print("[PASS] /api/v1/control 初始未暂停（真实 HTTP）")
+
+        st, pj = request("POST", BASE + "/api/v1/tasks",
+                         {"device_id": ctrl_dev, "kind": "pause", "duration_s": 20})
+        assert st == 201 and pj["task"]["kind"] == "pause", (st, pj)
+        assert pj["task"]["duration_s"] == 20 and pj["task"]["is_control"] is True
+        pause_rid = pj["task"]["request_id"]
+
+        next_url = BASE + "/api/v1/tasks/next?device_id=" + ctrl_dev
+        st, nx = request("GET", next_url)
+        assert nx["found"] is True and nx["task"]["request_id"] == pause_rid, nx
+        assert nx["task"]["kind"] == "pause", nx
+
+        until_ms = int(time.time() * 1000) + 20000
+        st, aj = request("POST",
+                         BASE + "/api/v1/tasks/%s/applied" % pause_rid,
+                         {"paused_until_ms": until_ms})
+        assert st == 200 and aj["task"]["status"] == "completed", (st, aj)
+        assert aj["control"]["periodic_paused"] is True, aj
+        assert 15 <= aj["control"]["remaining_s"] <= 21, aj["control"]
+        print("[PASS] pause 经 /applied 生效（真实 HTTP）：periodic_paused=True 剩余 %ss"
+              % aj["control"]["remaining_s"])
+
+        st, dj = request("GET", BASE + "/api/v1/devices")
+        ctrl_row = [d for d in dj["devices"] if d["device_id"] == ctrl_dev][0]
+        assert ctrl_row["periodic_paused"] is True, ctrl_row
+        print("[PASS] /api/v1/devices 标注 periodic_paused=True（真实 HTTP）")
+
+        st, rj = request("POST", BASE + "/api/v1/tasks",
+                         {"device_id": ctrl_dev, "kind": "resume"})
+        assert st == 201 and rj["superseded"] == 0, (st, rj)
+        st, nx = request("GET", next_url)
+        assert nx["task"]["request_id"] == rj["task"]["request_id"], nx
+        st, aj2 = request("POST",
+                          BASE + "/api/v1/tasks/%s/applied" % nx["task"]["request_id"],
+                          {})
+        assert st == 200 and aj2["control"]["periodic_paused"] is False, (st, aj2)
+        print("[PASS] resume 提前恢复（真实 HTTP）：periodic_paused=False")
+
+        st, wj = request("POST", BASE + "/api/v1/tasks/%s/applied" % rid, {})
+        assert st == 409 and wj["code"] == "WRONG_KIND", (st, wj)
+        print("[PASS] 采集任务调 /applied 被拒 409 WRONG_KIND（真实 HTTP）")
+
+        st, h = request("GET", BASE + "/api/v1/health")
+        assert h["tasks_by_status"].get("completed") == 3, h["tasks_by_status"]
+        assert h["tasks_by_status"].get("failed", 0) == 0, h["tasks_by_status"]
+        print("[PASS] health 任务统计（含控制任务）:", h["tasks_by_status"])
+
         print("\nE2E ALL CHECKS PASSED")
     finally:
         proc.terminate()

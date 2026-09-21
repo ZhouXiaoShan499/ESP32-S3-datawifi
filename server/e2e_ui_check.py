@@ -11,6 +11,10 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
   * 「手动 vs 周期」对照区两个来源各一行（走 /api/v1/latest?trigger=manual|periodic）
   * 任务被下发但迟迟没有 acked_at 时，页面给出「未收到设备回执」提示（第二次 dump）；
     板端回执后提示消失、acked_at 有值、状态文本含 acked（第三次 dump）
+  * 周期上报控制：「暂停周期」按钮代码路径（/ui/?autopause=1&pause=90）建出 kind=pause 任务、
+    控制卡片/任务卡片/历史表按控制任务渲染；模拟板端领取并 POST /applied 后，
+    控制卡片转为「停止中」+ 倒计时 + request_id 可追溯；「恢复周期」（?autoresume=1）
+    再把它恢复成「上报中」（第四/五/六次 dump）
 
 运行：python server/e2e_ui_check.py
   未找到浏览器时打印 [SKIP] 并以 0 退出；可用 EDGE_PATH 指定浏览器可执行文件。
@@ -317,6 +321,97 @@ def main_run():
           "仍未收到设备回执" not in any_text(dom3, "taskAckHint"))
     check("status text mentions acked", "状态码 acked" in field(dom3, "taskStatus"),
           field(dom3, "taskStatus"))
+
+    # 14) 周期上报控制（页面按钮代码路径）：?autopause=1&pause=90 打开页面即建一条
+    #     kind=pause 任务，控制卡片/任务卡片/历史表都要按控制任务渲染
+    dom4 = dump_dom(browser, BASE + "/ui/?autopause=1&pause=90")
+    check("pause input clamped to server limit",
+          bool(re.search(r'id="pauseInput"[^>]*max="600"[^>]*value="90"', dom4)),
+          "pauseInput max=600 value=90")
+    check("pause/resume buttons rendered",
+          'id="pauseBtn"' in dom4 and 'id="resumeBtn"' in dom4)
+    check("control card shows reporting state",
+          "上报中" in field(dom4, "ctrlBadge")
+          and "未暂停" in field(dom4, "ctrlRemaining"),
+          "%s / %s" % (field(dom4, "ctrlBadge"), field(dom4, "ctrlRemaining")))
+    check("control rid empty before any applied",
+          "还没有控制任务" in field(dom4, "ctrlRid"), field(dom4, "ctrlRid"))
+
+    rid_pause = field(dom4, "taskRid")
+    check("page created a pause task", len(rid_pause) == 32 and rid_pause != rid_page,
+          "rid=%s" % rid_pause)
+    st, body = get_json("/api/v1/tasks?device_id=%s&limit=20" % DEV)
+    pause_task = [t for t in body["tasks"] if t["request_id"] == rid_pause]
+    check("pause task stored with kind/duration from form",
+          bool(pause_task) and pause_task[0]["kind"] == "pause"
+          and pause_task[0]["duration_s"] == 90
+          and pause_task[0]["status"] == "submitted"
+          and pause_task[0]["trigger"] == "control",
+          str(pause_task[:1])[:160])
+    check("task card renders pause spec",
+          "暂停 90" in field(dom4, "taskSpec"), field(dom4, "taskSpec"))
+    check("task card explains control tasks carry no batch",
+          "不产生批次" in field(dom4, "taskUploadId"), field(dom4, "taskUploadId"))
+    check("history shows task kind column",
+          "暂停周期" in tbody_html(dom4, "taskHistoryBody"))
+
+    # 15) 板端领取 pause 并 POST /applied → 页面控制卡片转为「停止中」并显示倒计时
+    st, nx = get_json("/api/v1/tasks/next?device_id=" + DEV)
+    check("board claimed the pause task",
+          nx.get("found") is True and nx["task"]["request_id"] == rid_pause
+          and nx["task"]["kind"] == "pause", str(nx)[:140])
+    st, body = post_json("/api/v1/tasks/%s/applied" % rid_pause,
+                         {"paused_until_ms": int(time.time() * 1000) + 90000})
+    check("applied closes the page pause task",
+          st == 200 and body["task"]["status"] == "completed"
+          and body["control"]["periodic_paused"] is True, str(body)[:140])
+
+    dom5 = dump_dom(browser, BASE + "/ui/?autoresume=1")
+    check("control badge shows paused",
+          "停止中" in field(dom5, "ctrlBadge")
+          and "已暂停" in field(dom5, "ctrlState"),
+          "%s / %s" % (field(dom5, "ctrlBadge"), field(dom5, "ctrlState")))
+    check("control countdown rendered",
+          "后自动恢复" in field(dom5, "ctrlRemaining"), field(dom5, "ctrlRemaining"))
+    check("paused_until rendered",
+          "未暂停" not in field(dom5, "ctrlUntil") and
+          len(field(dom5, "ctrlUntil")) > 10, field(dom5, "ctrlUntil"))
+    check("control rid traced to the pause task",
+          rid_pause in field(dom5, "ctrlRid"), field(dom5, "ctrlRid"))
+
+    rid_resume = field(dom5, "taskRid")
+    check("page created a resume task", len(rid_resume) == 32 and rid_resume != rid_pause,
+          "rid=%s" % rid_resume)
+    st, body = get_json("/api/v1/tasks?device_id=%s&limit=20" % DEV)
+    resume_task = [t for t in body["tasks"] if t["request_id"] == rid_resume]
+    check("resume task stored with kind=resume",
+          bool(resume_task) and resume_task[0]["kind"] == "resume"
+          and resume_task[0]["duration_s"] is None
+          and resume_task[0]["status"] == "submitted", str(resume_task[:1])[:160])
+    check("history shows resume kind",
+          "恢复周期" in tbody_html(dom5, "taskHistoryBody"))
+
+    # 16) 板端领取 resume 并 applied → 页面回到「上报中」，任务卡片显示控制任务无批次
+    st, nx = get_json("/api/v1/tasks/next?device_id=" + DEV)
+    check("board claimed the resume task",
+          nx["task"]["request_id"] == rid_resume and nx["task"]["kind"] == "resume",
+          str(nx)[:140])
+    st, body = post_json("/api/v1/tasks/%s/applied" % rid_resume, {})
+    check("applied closes the resume task",
+          st == 200 and body["control"]["periodic_paused"] is False
+          and body["control"]["request_id"] == rid_resume, str(body)[:140])
+
+    dom6 = dump_dom(browser, BASE + "/ui/")
+    check("control badge back to reporting",
+          "上报中" in field(dom6, "ctrlBadge")
+          and "未暂停" in field(dom6, "ctrlRemaining"),
+          "%s / %s" % (field(dom6, "ctrlBadge"), field(dom6, "ctrlRemaining")))
+    check("control rid now the resume task",
+          rid_resume in field(dom6, "ctrlRid"), field(dom6, "ctrlRid"))
+    check("resume task card completed without batch",
+          "状态码 completed" in field(dom6, "taskStatus")
+          and "不产生批次" in field(dom6, "taskUploadId"),
+          "%s / %s" % (field(dom6, "taskStatus"), field(dom6, "taskUploadId")))
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 
