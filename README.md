@@ -64,10 +64,13 @@ QMA6100P (100Hz)          ──WiFi──▶  FastAPI (server/main.py)  ──H
 每 1s 打包 100 点 POST（periodic）      校验 → 存 SQLite                     每 0.8s 轮询刷新
 按需采集：板端每 3s 轮询 /tasks/next ◀── tasks 表（request_id） ◀──────── 「采集一次最新数据」
 每批 N 点 POST（manual，带 request_id） 写库与任务收尾在同一事务            任务状态 1s 刷新 + 三维视图
+暂停周期：同上一条任务链（kind=pause）    写 device_control（暂停真相源）  ◀──────── 「暂停周期 / 恢复周期」
+板端 POST /tasks/{id}/applied 确认生效    /api/v1/control 惰性归零到点记录       控制卡片显示停止中/倒计时
 ```
 
 > 两条上传通道共用 `POST /api/v1/upload`：周期上报不带 `request_id`（行为与旧版一致），
-> 按需采集带 `request_id` 并由服务端联动任务状态。详见 `docs/manual_capture_task.md`。
+> 按需采集带 `request_id` 并由服务端联动任务状态；`pause`/`resume` 不产生任何上传，
+> 由板端 `/applied` 收尾。详见 `docs/manual_capture_task.md`。
 
 ---
 
@@ -220,6 +223,9 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | **仅刷新（不采集）** | 只重新拉取查询接口，不打扰板端 |
 | **采集参数表单** | 样本数（默认 100，上限 **600**）、采样率（默认 100 Hz，上限 **100**）、有效期（默认 60 s，5–600）；越界在本地就拒绝，不发请求 |
 | **采集一次最新数据** | 按表单参数创建任务 → 板端轮询领取 → 暂停周期上报并按参数采集一批 → 带 `request_id` 回传；任务卡片实时显示状态与时间戳 |
+| **暂停时长 s** | 「暂停周期」的持续时间（默认 120，服务端允许 **5–600**；越界在本地就拒绝，不发请求） |
+| **暂停周期** | 建一条 `kind=pause` 任务 → 板端领取后**停喂 1 s 周期上传窗口**（采样/落盘/刷屏照旧，手动采集仍可用）→ 板端 `POST /applied` 确认生效；到点自动恢复 |
+| **恢复周期** | 建一条 `kind=resume` 任务，提前结束暂停窗口（方向相反的控制任务不会同时排队：新的会把旧的置 `failed: superseded by newer control task`） |
 
 - 任务状态机：`submitted → dispatched → acked → completed`，失败为 `failed`，超期未完成变 `timeout`
   （默认有效期 60 s，页面显示剩余时间）。
@@ -228,14 +234,22 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 - 任务卡片补齐 `dispatched_at` / `acked_at` / `completed_at` 与关联批次 `upload_id`（可一路追到具体批次）；
   任务停在 `dispatched` 超过 5 s 仍无回执时给出黄色提示（板端 ack 失败只写设备串口日志，服务端状态不会变）。
 - 页面下方两张表：「手动批次 vs 周期批次」对照（走 `/api/v1/latest?trigger=manual|periodic`，
-  用来确认手动采集没有污染周期链路）与「任务历史（最近 20 条）」（走 `/api/v1/tasks?device_id=…&limit=20`）。
+  用来确认手动采集没有污染周期链路）与「任务历史（最近 20 条）」（走 `/api/v1/tasks?device_id=…&limit=20`，
+  多一列「类型」区分 按需采集 / 暂停周期 / 恢复周期）。
+- **「周期上报控制」卡片**（暂停 / 恢复）：状态来自 `GET /api/v1/control?device_id=…`，
+  真相源是服务端 `device_control` 表（由板端 `POST /api/v1/tasks/{id}/applied` 写入，见 §五），
+  不靠「周期批次数为 0」反推；显示 `periodic_paused` / 剩余秒数 / 自动恢复时刻 `paused_until` /
+  最近控制任务 `request_id`。暂停到期由**板端自愈 + 服务端惰性归零**双向保证（忘点「恢复周期」
+  也不会永久静默），板端状态只存 RAM，重启即恢复正常上报。
 - 页面底部「三维姿态视图」：纯 Canvas 2D 手写正交投影（无外部库、无 CDN，局域网离线可用），
   画三轴箭头、当前加速度向量与其分量/地面投影、重力参考 `g=9.81`、最近 30 s 轨迹；
   支持**拖拽旋转、滚轮缩放、双击或按钮复位、自动旋转开关**。
 - 自动化核对：打开 `/ui/?autocapture=1` 会触发与按钮完全相同的代码路径，可再加
-  `&samples=250&rate=50&timeout=45` 指定参数（便于无人值守验证表单参数真的传到了任务里）。
-- 自检脚本：`test_receive.py`（27 项）、`e2e_server_check.py`（8 项）、
-  `e2e_ui_check.py`（41 项，无浏览器则 SKIP）、`e2e_device_check.py`（真机 11 项，无板则 SKIP）。
+  `&samples=250&rate=50&timeout=45` 指定参数（便于无人值守验证表单参数真的传到了任务里）；
+  `/ui/?autopause=1&pause=90` 触发「暂停周期」、`/ui/?autoresume=1` 触发「恢复周期」，
+  同样走的不是测试专用分支，而是按钮的事件处理函数。
+- 自检脚本：`test_receive.py`（43 项）、`e2e_server_check.py`（14 项）、
+  `e2e_ui_check.py`（64 项，无浏览器则 SKIP）、`e2e_device_check.py`（真机 28 项，无板则 SKIP）。
 
 > 完整说明（接口字段、状态机、板端实现、验证场景）见 `docs/manual_capture_task.md`；
 > 需求来源、交付物清单、实测结果与遗留事项见 `docs/manual_capture_task_work_log.md`；
@@ -251,12 +265,14 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | `GET` | `/api/v1/health` | 健康状态 + 汇总（总批次 / 总样本 / 设备列表 / 最近上报） |
 | `GET` | `/api/v1/devices` | 设备列表 |
 | `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本、`trigger`、`request_id`）；可选 `&trigger=manual\|periodic` 只看该来源的最近一批（页面「手动 vs 周期」对照区用） |
-| `POST` | `/api/v1/tasks` | 创建按需采集任务（Web 用；已有未完成任务时复用并返回 `duplicate=true`） |
-| `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`，默认最近 20 条） |
+| `POST` | `/api/v1/tasks` | 创建任务（Web 用；`kind=capture`（缺省）/`pause`/`resume`，`pause` 另带 `duration_s`）；同 `device+source+kind` 已有未完成任务时复用并返回 `duplicate=true` |
+| `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`，默认最近 20 条；含 `kind`/`kind_cn`/`duration_s`/`is_control`） |
 | `GET` | `/api/v1/tasks/next?device_id=…` | 板端轮询领取任务（原子领取，只返回 `submitted` 且未过期的任务） |
 | `GET` | `/api/v1/tasks/{request_id}` | 按任务号查询状态与关联上传摘要 |
 | `POST` | `/api/v1/tasks/{request_id}/ack` | 板端回执「已收到任务」 |
 | `POST` | `/api/v1/tasks/{request_id}/fail` | 板端上报任务失败（原因写入 `error`） |
+| `POST` | `/api/v1/tasks/{request_id}/applied` | 板端回执「控制任务已生效」（仅 `pause`/`resume`）：置 `completed` 并写 `device_control`；采集任务调用返回 `409 WRONG_KIND`（它必须靠带 `request_id` 的上传收尾）。可选 body `{"paused_until_ms": …}` 上报板端自己的定时器终点 |
+| `GET` | `/api/v1/control?device_id=…&source=…` | 板端周期上报的暂停状态（`device_control` 真相源，到点惰性归零）：`periodic_paused` / `remaining_s` / `paused_until_str` / `request_id` |
 | `GET` | `/` | 极简 HTML 首页 |
 | `GET` | `/ui/` | 实时监控面板 |
 
@@ -277,19 +293,23 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 }
 ```
 
-**数据库**（SQLite，三张表）：
+**数据库**（SQLite，四张表）：
 
 | 表 | 说明 |
 |----|------|
 | `uploads` | 每个上传批次一行（设备、来源、单位、起始时间、样本数、来源 IP、原始 JSON、`request_id`、`trigger`） |
 | `samples` | 每批内每个采样点一行（`ax`/`ay`/`az` + 相对时间偏移） |
-| `tasks` | 按需采集任务（`request_id` 主键、设备、状态、状态时间戳、有效期、关联 `upload_id`、错误原因） |
+| `tasks` | 任务（`request_id` 主键、设备、`kind`（`capture`/`pause`/`resume`）、`duration_s`、状态、状态时间戳、有效期、关联 `upload_id`、错误原因） |
+| `device_control` | 每个 `device+source` 一行的暂停状态（`periodic_paused`、`paused_until`、`request_id`、`updated_at`）——「是否真的暂停」的真相源 |
 
 - 老库升级：`CREATE TABLE IF NOT EXISTS` 不会给已有表加列，服务端启动时用 `PRAGMA table_info`
-  检查并 `ALTER TABLE` 补 `uploads.request_id` / `uploads.trigger`，再建 **部分唯一索引**
-  `idx_uploads_request`（同 `request_id` 只允许一条上传 → 重复上传幂等且不重复写样本）。
+  检查并 `ALTER TABLE` 补 `uploads.request_id` / `uploads.trigger`（再建 **部分唯一索引**
+  `idx_uploads_request`：同 `request_id` 只允许一条上传 → 重复上传幂等且不重复写样本）
+  与 `tasks.kind` / `tasks.duration_s`（历史任务自动按 `capture` 看待，Web 渲染不受影响）。
 - 任务超时是**惰性判定**：创建/查询/领取路径先把过期的非终态任务置 `timeout`（无后台线程，
   服务重启后状态依然自洽），过期任务也不会被 `/tasks/next` 下发。
+- 暂停到期同样是**惰性归零**：任何读控制状态的路径（`/api/v1/control`、`/api/v1/devices`、
+  `/api/v1/tasks/{id}/applied`）先把 `paused_until` 已过的行置回「未暂停」，同样不需要后台线程。
 
 ---
 
@@ -300,6 +320,11 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 3. **上传策略**：板端上传带**有界重试**（最多 3 次，500 ms / 1 s 退避；4xx 表示服务端拒绝载荷、不再重试），RAM 队列 8 批（约 8 s）作为慢网缓冲。重试耗尽或队列满时仍会丢弃批次——这是为保证 100 Hz 采样不被网络阻塞的刻意取舍；**批量落盘重放 / 掉电续传未实现**。
 4. **鉴权**：默认不鉴权，面向局域网联调。如需公网部署：给服务端设 `SENSOR_TOKEN`，并同步配置板端 `SENSOR_TOKEN`，板端会带 `Authorization: Bearer <token>`，不匹配返回 `401`。注意本机直连仅为「备用路径」，正式公网部署仍需在 VPS 上补 TLS/反向代理与进程守护。
 5. **CORS**：监控页 `/ui/` 与接口同源，浏览器不会触发跨域；板端上传是 HTTP 客户端而非浏览器，与 CORS 无关，故未配置 CORS 中间件。
+6. **控制任务需新版固件**：`pause`/`resume` 依赖板端解析 `kind` 字段。若板端仍是本次改动前的固件，
+   它会把控制任务当成一次普通采集（`sample_count`/`sample_rate_hz` 的默认值恰好合法）——
+   服务端会用 `409 WRONG_KIND` 拒绝这次上传（**不会写入任何样本**），任务最终变 `failed`。
+   使用「暂停周期 / 恢复周期」前请先 `idf.py build && idf.py flash` 重新烧录，并跑
+   `python server/e2e_device_check.py` 验收（该脚本会打印明确的固件过旧提示）。
 
 ---
 
@@ -335,7 +360,8 @@ ESP32-S3-EYE ──WiFi(局域网)──▶ 本机 PC:8000 (FastAPI + SQLite) �
 | 停采后保留旧时间、提示未更新 | 停止采集 30 s 后状态由「更新中」变「未更新」 |
 | 显示无数据 | 空库时首页/面板显示「无数据」 |
 | 按需采集链路 | `/ui/` 点「采集一次最新数据」→ 任务卡片从 `submitted` 走到 `completed`；板端日志有 `[task] accepted/capturing/captured/done` |
-| 暂停周期上报 | 采集窗口内服务端只收到带该 `request_id` 的 manual 批次，周期批次计数为 0 |
+| 暂停周期上报（采集窗口内） | 采集窗口内服务端只收到带该 `request_id` 的 manual 批次，周期批次计数为 0 |
+| 暂停周期上报（Web 按钮） | `/ui/` 点「暂停周期」→ 控制卡片显示「停止中」与倒计时；板端日志有 `[ctrl] pause applied`，此后服务端**没有任何新的 periodic 批次**；点「恢复周期」（或等到期）后周期批次重新出现 |
 | request_id 可追溯 | `uploads.request_id` ↔ `tasks.request_id` ↔ 页面「任务号」，`/api/v1/tasks/{id}` 返回关联 `upload_id` |
 | 连点不并行 | 连续点击 5 次：任务列表只有 1 条非终态任务，同一 `request_id` 只有 1 条上传 |
 | 掉电/超时 | 断开板端电源后任务在有效期（默认 60 s）变为 `timeout`，不产生上传；重启服务端状态不变，`/tasks/next` 返回 `found:false` |
