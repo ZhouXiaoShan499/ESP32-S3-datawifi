@@ -99,6 +99,27 @@ TASK_STATUS_CN = {
     "failed": "失败",
     "timeout": "超时",
 }
+# 任务类型 kind（Web 三个按钮共用同一套任务链路与状态机）：
+#   capture = 按需采集一批数据（「采集一次最新数据」），靠带 request_id 的上传收尾；
+#   pause   = 暂停板端周期上报（「暂停周期」）；
+#   resume  = 提前恢复周期上报（「恢复周期」）。
+# pause/resume 不产生观测数据，无法靠 upload 收尾，改由板端确认「已生效」的
+# POST /api/v1/tasks/{id}/applied 收尾（完成后同事务写 device_control）。
+TASK_KIND_CAPTURE = "capture"
+TASK_KIND_PAUSE = "pause"
+TASK_KIND_RESUME = "resume"
+TASK_KINDS = (TASK_KIND_CAPTURE, TASK_KIND_PAUSE, TASK_KIND_RESUME)
+TASK_KIND_CN = {
+    TASK_KIND_CAPTURE: "按需采集",
+    TASK_KIND_PAUSE: "暂停周期上报",
+    TASK_KIND_RESUME: "恢复周期上报",
+}
+TASK_CONTROL_KINDS = (TASK_KIND_PAUSE, TASK_KIND_RESUME)
+
+# 暂停时长（秒）：到点板端自愈恢复、服务端惰性归零，忘点「恢复周期」也不会永久哑掉。
+PAUSE_DEFAULT_S = 120
+PAUSE_MIN_S, PAUSE_MAX_S = 5, 600
+
 # request_id 允许的字符集（uuid4().hex 天然满足，也兼容自定 id）
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
@@ -151,6 +172,27 @@ def _migrate_uploads_columns(conn):
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_request"
         " ON uploads (request_id) WHERE request_id IS NOT NULL"
+    )
+
+
+def _migrate_tasks_columns(conn):
+    """老库补列：tasks.kind / tasks.duration_s。
+
+    同 _migrate_uploads_columns：CREATE TABLE IF NOT EXISTS 不会给已存在的表
+    加字段，升级服务端后旧库必须靠 ALTER TABLE 补齐，否则插入控制任务会报错。
+    kind 默认 'capture'，所以历史任务在新接口下仍按「按需采集」渲染。
+    """
+    cols = _table_columns(conn, "tasks")
+    if "kind" not in cols:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'capture'"
+        )
+    if "duration_s" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN duration_s REAL")
+    # 去重键从 device+source 变成 device+source+kind，补一个匹配索引。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_device_kind"
+        " ON tasks (device_id, source, kind, status)"
     )
 
 
@@ -207,6 +249,8 @@ def init_db():
                     sample_rate_hz INTEGER NOT NULL,
                     sample_count   INTEGER NOT NULL,
                     trigger        TEXT NOT NULL DEFAULT 'manual',
+                    kind           TEXT NOT NULL DEFAULT 'capture',  -- capture/pause/resume
+                    duration_s     REAL,             -- 仅 pause：暂停时长（到期板端自愈恢复）
                     status         TEXT NOT NULL,   -- submitted/dispatched/acked/completed/failed/timeout
                     created_at     REAL NOT NULL,
                     dispatched_at  REAL,
@@ -220,9 +264,22 @@ def init_db():
                     ON tasks (device_id, status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_pending
                     ON tasks (device_id, status, created_at);
+                -- 周期上报暂停状态（每个 device+source 一行）：这是「暂停是否真的生效」
+                -- 的真相源，Web 直接查 /api/v1/control，不必靠「periodic 批次数为 0」反推。
+                -- paused_until 到点即视为自动恢复（惰性归零，不引入后台线程）。
+                CREATE TABLE IF NOT EXISTS device_control (
+                    device_id       TEXT NOT NULL,
+                    source          TEXT NOT NULL,
+                    periodic_paused INTEGER NOT NULL DEFAULT 0,
+                    paused_until    REAL,
+                    request_id      TEXT,
+                    updated_at      REAL,
+                    PRIMARY KEY (device_id, source)
+                );
                 """
             )
             _migrate_uploads_columns(conn)
+            _migrate_tasks_columns(conn)
             conn.commit()
         finally:
             conn.close()
@@ -364,6 +421,34 @@ def validate_task_request(payload):
             )
         parsed[name] = value
 
+    # kind：capture（缺省，兼容旧客户端）/ pause / resume。
+    # 控制任务的 sample_count / sample_rate_hz 对板端无意义（不采数据），
+    # 但仍照常校验默认值，保证 tasks 表的 NOT NULL 字段有合法值。
+    raw_kind = payload.get("kind")
+    if raw_kind is None or (isinstance(raw_kind, str) and not raw_kind.strip()):
+        task_kind = TASK_KIND_CAPTURE
+    elif isinstance(raw_kind, str) and raw_kind.strip() in TASK_KINDS:
+        task_kind = raw_kind.strip()
+    else:
+        return False, (
+            f"invalid 'kind' (expect one of {'/'.join(TASK_KINDS)})"
+        )
+
+    # duration_s：仅 pause 有效（到点板端自愈恢复）；capture/resume 恒为 None。
+    duration_s = None
+    if task_kind == TASK_KIND_PAUSE:
+        raw_dur = payload.get("duration_s", PAUSE_DEFAULT_S)
+        if isinstance(raw_dur, bool):
+            return False, "invalid 'duration_s'"
+        try:
+            duration_s = float(raw_dur)
+        except (TypeError, ValueError):
+            return False, "invalid 'duration_s'"
+        if duration_s < PAUSE_MIN_S or duration_s > PAUSE_MAX_S:
+            return False, (
+                f"invalid 'duration_s' (expect {PAUSE_MIN_S}-{PAUSE_MAX_S} seconds)"
+            )
+
     return True, {
         "device_id": device_id,
         "source": source,
@@ -371,6 +456,8 @@ def validate_task_request(payload):
         "sample_rate_hz": parsed["sample_rate_hz"],
         "sample_count": parsed["sample_count"],
         "timeout_s": parsed["timeout_s"],
+        "kind": task_kind,
+        "duration_s": duration_s,
     }
 
 
@@ -505,10 +592,77 @@ def _task_view(row):
     task = dict(row)
     task["status_cn"] = TASK_STATUS_CN.get(task["status"], task["status"])
     task["terminal"] = task["status"] in TASK_TERMINAL_STATES
+    # 老库/老客户端没有 kind 列时按 capture 处理，保持向前兼容
+    if not task.get("kind"):
+        task["kind"] = TASK_KIND_CAPTURE
+    task["kind_cn"] = TASK_KIND_CN.get(task["kind"], task["kind"])
+    task["is_control"] = task["kind"] in TASK_CONTROL_KINDS
     for key in ("created_at", "dispatched_at", "acked_at", "completed_at", "expires_at"):
         task[f"{key}_str"] = _fmt_time(task.get(key))
     task["expires_in_s"] = round(task["expires_at"] - time.time(), 1)
     return task
+
+
+def _lazy_reset_control(conn):
+    """到点的暂停状态惰性归零（自动恢复），返回归零行数。
+
+    与 _expire_stale_tasks 同一哲学：不引入后台线程，任何读控制状态的路径先调用，
+    所以服务重启/长时间没人访问之后状态依然自洽。request_id 保留，便于追溯
+    「上一次是哪条任务把它暂停/恢复的」。
+    """
+    now = time.time()
+    return conn.execute(
+        "UPDATE device_control SET periodic_paused=0, paused_until=NULL, updated_at=?"
+        " WHERE periodic_paused=1 AND paused_until IS NOT NULL AND paused_until <= ?",
+        (now, now),
+    ).rowcount
+
+
+def _control_view(conn, device_id, source):
+    """device_control 行 → 对外结构（paused_until 到点则先惰性归零）。"""
+    _lazy_reset_control(conn)
+    row = conn.execute(
+        "SELECT * FROM device_control WHERE device_id=? AND source=?",
+        (device_id, source),
+    ).fetchone()
+    now = time.time()
+    if row is None:
+        return {
+            "device_id": device_id,
+            "source": source,
+            "periodic_paused": False,
+            "paused_until": None,
+            "paused_until_str": None,
+            "remaining_s": None,
+            "request_id": None,
+            "updated_at": None,
+            "updated_at_str": None,
+        }
+    ctrl = dict(row)
+    paused = bool(ctrl["periodic_paused"])
+    remaining = None
+    if paused and ctrl["paused_until"] is not None:
+        remaining = round(max(0.0, ctrl["paused_until"] - now), 1)
+    return {
+        "device_id": ctrl["device_id"],
+        "source": ctrl["source"],
+        "periodic_paused": paused,
+        "paused_until": ctrl["paused_until"],
+        "paused_until_str": _fmt_time(ctrl["paused_until"]),
+        "remaining_s": remaining,
+        "request_id": ctrl["request_id"],
+        "updated_at": ctrl["updated_at"],
+        "updated_at_str": _fmt_time(ctrl["updated_at"]),
+    }
+
+
+def _paused_devices(conn):
+    """当前处于暂停中的 device_id 集合（先惰性归零），供 /api/v1/devices 标注。"""
+    _lazy_reset_control(conn)
+    rows = conn.execute(
+        "SELECT DISTINCT device_id FROM device_control WHERE periodic_paused=1"
+    ).fetchall()
+    return {r["device_id"] for r in rows}
 
 
 def _check_task_match(request_id, data):
@@ -529,6 +683,18 @@ def _check_task_match(request_id, data):
                          "error": f"unknown request_id: {request_id}"},
             )
         task = dict(row)
+        # 控制任务（pause/resume）不产生观测数据，因此永远不应该收到带它 request_id
+        # 的上传。板端若真这么干了，属于板端 bug，直接拒绝且不动任务状态。
+        if task.get("kind") in TASK_CONTROL_KINDS:
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "WRONG_KIND", "ok": False,
+                         "error": (f"request_id {request_id} belongs to a "
+                                   f"'{task['kind']}' control task"
+                                   " which never carries samples"),
+                         "request_id": request_id},
+            )
         problems = []
         if task["device_id"] != data["device_id"]:
             problems.append(
@@ -639,10 +805,15 @@ async def upload(request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/api/v1/tasks")
 async def create_task(request: Request):
-    """Web「采集一次最新数据」：创建一个按需采集任务并返回 request_id。
+    """Web 下发任务：按需采集（capture）/ 暂停周期（pause）/ 恢复周期（resume）。
 
-    去重：同 device + source 若已有未终态任务，则不再新建，直接返回已有任务
-    （duplicate=True），避免连点产生多个并行采集任务。
+    去重：同 device + source + kind 若已有未终态任务，则不再新建，直接返回已有任务
+    （duplicate=True），避免连点产生多个并行任务。去重键必须带 kind：否则一条待执行
+    的 pause 会把后续的 capture 一直挡住。
+
+    互斥：pause 与 resume 方向相反，两条同时排队会让板端按 created_at 顺序来回抖动，
+    因此新建控制任务时把反方向那条未终态控制任务置 failed（superseded by newer
+    control task）。
     """
     try:
         payload = await request.json()
@@ -660,15 +831,18 @@ async def create_task(request: Request):
             content={"code": "INVALID", "ok": False, "error": result},
         )
 
+    kind = result["kind"]
+    is_control = kind in TASK_CONTROL_KINDS
+
     conn = _connect()
     try:
         # 先清超时，避免一个已过期任务把新任务挡在去重逻辑外
         _expire_stale_tasks(conn, result["device_id"])
         existing = conn.execute(
-            "SELECT * FROM tasks WHERE device_id=? AND source=?"
+            "SELECT * FROM tasks WHERE device_id=? AND source=? AND kind=?"
             " AND status NOT IN ('completed','failed','timeout')"
             " ORDER BY created_at ASC LIMIT 1",
-            (result["device_id"], result["source"]),
+            (result["device_id"], result["source"], kind),
         ).fetchone()
         if existing is not None:
             conn.commit()
@@ -678,12 +852,25 @@ async def create_task(request: Request):
                          "task": _task_view(existing)},
             )
 
-        request_id = uuid.uuid4().hex
         now = time.time()
+        superseded = 0
+        if is_control:
+            other = (TASK_KIND_RESUME if kind == TASK_KIND_PAUSE
+                     else TASK_KIND_PAUSE)
+            cur = conn.execute(
+                "UPDATE tasks SET status='failed', completed_at=?,"
+                " error='superseded by newer control task'"
+                " WHERE device_id=? AND source=? AND kind=?"
+                " AND status NOT IN ('completed','failed','timeout')",
+                (now, result["device_id"], result["source"], other),
+            )
+            superseded = cur.rowcount
+
+        request_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO tasks (request_id, device_id, source, unit, sample_rate_hz,"
-            " sample_count, trigger, status, created_at, expires_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " sample_count, trigger, kind, duration_s, status, created_at, expires_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id,
                 result["device_id"],
@@ -691,7 +878,10 @@ async def create_task(request: Request):
                 result["unit"],
                 result["sample_rate_hz"],
                 result["sample_count"],
-                "manual",
+                # trigger 供 uploads 侧统一口径：控制任务不产生批次，标记为 control
+                "manual" if not is_control else "control",
+                kind,
+                result["duration_s"],
                 "submitted",
                 now,
                 now + result["timeout_s"],
@@ -714,6 +904,7 @@ async def create_task(request: Request):
     return JSONResponse(
         status_code=201,
         content={"code": "OK", "ok": True, "duplicate": False,
+                 "superseded": superseded,
                  "task": _task_view(row)},
     )
 
@@ -924,6 +1115,173 @@ async def fail_task(request_id: str, request: Request):
                                  "task": _task_view(row)})
 
 
+@app.post("/api/v1/tasks/{request_id}/applied")
+async def applied_task(request_id: str, request: Request):
+    """板端确认「控制任务已生效」（仅 pause / resume）。
+
+    控制任务不产生观测数据，所以无法像采集任务那样靠带 request_id 的上传收尾，
+    改由板端在真的切换了周期上报开关之后调用本接口。服务端在同一事务里：
+      1) 把任务置 completed（终态）；
+      2) 写 device_control —— 这是「当前是否真的暂停」的真相源，页面直接查它，
+         而不是靠「periodic 批次数为 0」这种间接信号反推。
+
+    可选 body: {"paused_until_ms": <epoch ms>}：板端带上自己定时器的终点，服务端
+    在校验合理后优先采用，这样页面倒计时与板端自愈恢复时刻一致；不合理则回退到
+    now + duration_s。
+
+    采集任务（kind=capture）调本接口一律 409 WRONG_KIND：它必须靠上传收尾，
+    否则会出现「任务 completed 但一个样本都没有」的假完成。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    reported_until_ms = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw = body.get("paused_until_ms")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                reported_until_ms = float(raw)
+    except Exception:
+        reported_until_ms = None
+
+    now = time.time()
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn)
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "ok": False,
+                         "error": f"unknown request_id: {request_id}"},
+            )
+
+        task = dict(row)
+        kind = task.get("kind") or TASK_KIND_CAPTURE
+        if kind not in TASK_CONTROL_KINDS:
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "WRONG_KIND", "ok": False,
+                         "error": (f"task {request_id} is kind='{kind}':采集任务由带"
+                                   " request_id 的上传收尾（POST /api/v1/upload）"),
+                         "task": _task_view(row)},
+            )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status='completed', completed_at=?"
+            " WHERE request_id=? AND status NOT IN ('completed','failed','timeout')",
+            (now, request_id),
+        )
+        updated = cur.rowcount == 1
+
+        prev = conn.execute(
+            "SELECT * FROM device_control WHERE device_id=? AND source=?",
+            (task["device_id"], task["source"]),
+        ).fetchone()
+        # 幂等重放保护：板端 POST 成功但响应丢失时会重试一次同一 request_id。
+        # 任务已是 completed 且控制行就是这条任务写的 → 不再重写，否则每次重试都会
+        # 把 paused_until 往后推，页面倒计时会比板端真实的自动恢复时刻更晚。
+        replay = (not updated
+                  and prev is not None
+                  and prev["request_id"] == request_id)
+
+        # 迟到的 applied 仍然要写控制状态：例如任务在板端已生效后，回执因网络
+        # 重试而在 expires_at 之后才到（任务已被判 timeout）。此时板端确实暂停了，
+        # 若不记录，页面就会显示「上报中」而实际静默 120 s —— 与真相源矛盾。
+        # 但比它更新的控制任务已存在时不再覆盖（避免旧回执翻掉新决定）。
+        newer = conn.execute(
+            "SELECT request_id FROM tasks WHERE device_id=? AND source=? AND kind IN"
+            " ('pause','resume') AND created_at > ? LIMIT 1",
+            (task["device_id"], task["source"], task["created_at"]),
+        ).fetchone()
+        stale = newer is not None
+
+        if not stale and not replay:
+            if kind == TASK_KIND_PAUSE:
+                duration = float(task["duration_s"] or PAUSE_DEFAULT_S)
+                until = now + duration
+                if reported_until_ms is not None:
+                    cand = reported_until_ms / 1000.0
+                    # 只接受「不早于现在 5 s、不晚于服务端预期 + 60 s」的报告值
+                    if (now - 5.0) <= cand <= (until + 60.0):
+                        until = cand
+                new_paused, new_until = 1, until
+            else:
+                new_paused, new_until = 0, None
+
+            cur2 = conn.execute(
+                "UPDATE device_control SET periodic_paused=?, paused_until=?,"
+                " request_id=?, updated_at=? WHERE device_id=? AND source=?",
+                (new_paused, new_until, request_id, now,
+                 task["device_id"], task["source"]),
+            )
+            if cur2.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO device_control (device_id, source, periodic_paused,"
+                    " paused_until, request_id, updated_at) VALUES (?,?,?,?,?,?)",
+                    (task["device_id"], task["source"], new_paused, new_until,
+                     request_id, now),
+                )
+        conn.commit()
+        control = _control_view(conn, task["device_id"], task["source"])
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    ESP = "ok"
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "applied": True, "updated": updated,
+                 "stale": stale, "replay": replay, "kind": kind,
+                 "control": control, "task": _task_view(row)},
+    )
+
+
+@app.get("/api/v1/control")
+def get_control(request: Request):
+    """查询板端周期上报的暂停状态（Web「周期上报控制」卡片的真相源）。
+
+    ?device_id=（必填）·&source=（可选，默认 qma6100p）
+
+    paused_until 到点即自动恢复：本接口先做惰性归零再返回，因此不需要后台线程，
+    也不怕服务重启。`remaining_s` 为剩余秒数（停止中才非空）。
+    """
+    device_id = (request.query_params.get("device_id") or "").strip()
+    if not device_id:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "missing 'device_id'"},
+        )
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+        )
+    source = (request.query_params.get("source") or TASK_DEFAULT_SOURCE)
+    source = source.strip()[:MAX_SOURCE_LEN] or TASK_DEFAULT_SOURCE
+
+    conn = _connect()
+    try:
+        control = _control_view(conn, device_id, source)
+        conn.commit()          # 惰性归零可能改了行，提交以免下次读到旧值
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "control": control},
+    )
+
+
 @app.get("/api/v1/health")
 def health():
     """服务健康状态 + 汇总，便于验证/排错。"""
@@ -990,6 +1348,9 @@ def devices():
             "  AND t.status NOT IN ('completed','failed','timeout')) AS pending_tasks"
             " FROM uploads u GROUP BY device_id ORDER BY device_id"
         ).fetchall()
+        # 暂停状态真相源：device_control 里到点的行先惰性归零，避免页面显示过期状态
+        paused = _paused_devices(conn)
+        conn.commit()
     finally:
         conn.close()
     return JSONResponse(
@@ -1001,6 +1362,7 @@ def devices():
                     "uploads": r["uploads"],
                     "last_seen": _fmt_time(r["last_seen"]),
                     "pending_tasks": r["pending_tasks"],
+                    "periodic_paused": r["device_id"] in paused,
                 }
                 for r in rows
             ]
