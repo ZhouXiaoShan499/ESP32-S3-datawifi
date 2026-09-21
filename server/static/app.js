@@ -7,8 +7,10 @@
  *   GET /api/v1/latest?device_id=..&trigger=manual|periodic  -> 对照区各取一类批次
  *   GET /api/v1/window?device_id=..&seconds=30               -> 波形与三维轨迹
  *   GET /api/v1/tasks?device_id=..&limit=20                  -> 任务历史
+ *   GET /api/v1/control?device_id=..                         -> 周期上报暂停状态
  * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）、
  *      按需采集任务（参数表单 → 创建 → 跟踪 → 时间戳/upload_id 回显 → 无回执提示）、
+ *      周期上报控制（暂停 N 秒 / 提前恢复 → kind=pause|resume 任务 → 板端 applied 生效）、
  *      手动批次与周期批次对照、三维姿态视图。
  */
 
@@ -26,6 +28,9 @@ const $ = {
   deviceSel: el('deviceSel'),
   refreshBtn: el('refreshBtn'),
   captureBtn: el('captureBtn'),
+  pauseInput: el('pauseInput'),
+  pauseBtn: el('pauseBtn'),
+  resumeBtn: el('resumeBtn'),
   sourceSel: el('sourceSel'),
   countInput: el('countInput'),
   rateInput: el('rateInput'),
@@ -63,6 +68,12 @@ const $ = {
   taskAckHint: el('taskAckHint'),
   taskHistoryBody: el('taskHistoryBody'),
   taskHistoryInfo: el('taskHistoryInfo'),
+  ctrlBadge: el('ctrlBadge'),
+  ctrlState: el('ctrlState'),
+  ctrlRemaining: el('ctrlRemaining'),
+  ctrlUntil: el('ctrlUntil'),
+  ctrlRid: el('ctrlRid'),
+  ctrlUpdated: el('ctrlUpdated'),
   cmpBody: el('cmpBody'),
   cmpInfo: el('cmpInfo'),
   scene3d: el('scene3d'),
@@ -465,6 +476,8 @@ function rebuildSelect(devs) {
   const empty = !devs.length;
   sel.disabled = empty;
   $.refreshBtn.disabled = empty;
+  if ($.pauseBtn) $.pauseBtn.disabled = empty;
+  if ($.resumeBtn) $.resumeBtn.disabled = empty;
   sel.title = empty ? '暂无设备' : '';
 }
 
@@ -517,7 +530,19 @@ const TASK_LIMITS = {
   countMin: 1, countMax: 600,
   rateMin: 10, rateMax: 100,
   timeoutMin: 5, timeoutMax: 600,
+  pauseMin: 5, pauseMax: 600, pauseDefault: 120,   // 与服务端 PAUSE_MIN_S/MAX_S 对齐
 };
+
+/* 任务类型：capture 由带 request_id 的上传收尾；pause/resume 靠板端 /applied 收尾 */
+const TASK_KIND = {
+  capture: { text: '按需采集', short: 'capture', spec: (t) => (t.sample_count ?? '—') + ' 点 @ ' + (t.sample_rate_hz ?? '—') + ' Hz' },
+  pause: { text: '暂停周期', short: 'pause', spec: (t) => '暂停 ' + (t.duration_s ?? TASK_LIMITS.pauseDefault) + ' s（到期自动恢复）' },
+  resume: { text: '恢复周期', short: 'resume', spec: () => '立即恢复周期上报' },
+};
+
+function taskKindMeta(kind) {
+  return TASK_KIND[kind] || TASK_KIND.capture;
+}
 
 /* 已下发超过该秒数仍无 acked_at → 页面给出「回执未收到」提示（纯前端推断，服务端状态不变） */
 const NO_ACK_WARN_S = 5;
@@ -554,8 +579,8 @@ function renderTask(task, note, upload) {
 
   if ($.taskRid) $.taskRid.textContent = task.request_id || '—';
   if ($.taskSpec) {
-    $.taskSpec.textContent = (task.sample_count ?? '—') + ' 点 @ ' +
-                             (task.sample_rate_hz ?? '—') + ' Hz';
+    // 控制任务（pause/resume）没有采样点数，按类型渲染各自的说明
+    $.taskSpec.textContent = taskKindMeta(task.kind).spec(task);
   }
   if ($.taskStatus) {
     let text = meta.text + '（状态码 ' + task.status + '）· ' + meta.hint;
@@ -575,12 +600,16 @@ function renderTask(task, note, upload) {
   }
   // 关联数据：任务详情接口带回 uploads 摘要（upload），列表接口只有 upload_id
   const up = upload || task.upload || null;
+  const kindMeta = taskKindMeta(task.kind);
   if ($.taskUploadId) {
     if (up && up.id) {
       $.taskUploadId.textContent = up.id + '（' + (up.trigger || 'manual') + ' · ' +
         (up.sample_count ?? '—') + ' 点 · ' + (up.received_at_str || '—') + '）';
     } else if (task.upload_id) {
       $.taskUploadId.textContent = String(task.upload_id);
+    } else if (task.kind && task.kind !== 'capture') {
+      // 暂停/恢复不产生观测数据，靠板端 /applied 收尾，永远没有关联批次
+      $.taskUploadId.textContent = '—（' + kindMeta.text + '任务不产生批次，靠板端 /applied 收尾）';
     } else {
       $.taskUploadId.textContent = '—（任务未完成，暂无关联批次）';
     }
@@ -636,6 +665,8 @@ function watchTask(requestId) {
       renderTask(data.task, undefined, data.upload);
       if (data.task && data.task.terminal) {
         stopTaskWatch();
+        // 控制任务（pause/resume）的终态就是 device_control 已被写入的时刻，立刻回读
+        refreshControl();
         poll();          // 任务完成后立刻刷新数据面板，不用等下一次轮询
       }
     } catch (e) {
@@ -678,7 +709,7 @@ function taskDuration(t) {
   return (t.completed_at ? '' : '进行中 ') + Math.max(0, end - start).toFixed(1) + ' s';
 }
 
-/** 任务历史表：最近 20 条任务（状态/参数/关联批次 upload_id/耗时） */
+/** 任务历史表：最近 20 条任务（类型/状态/参数/关联批次 upload_id/耗时） */
 function renderTaskHistory(tasks) {
   const list = tasks || [];
   if ($.taskHistoryInfo) {
@@ -690,17 +721,19 @@ function renderTaskHistory(tasks) {
   const body = $.taskHistoryBody;
   if (!body) return;
   if (!list.length) {
-    body.innerHTML = '<tr><td colspan="6">—（本设备还没有任务）</td></tr>';
+    body.innerHTML = '<tr><td colspan="7">—（本设备还没有任务）</td></tr>';
     return;
   }
   const frag = document.createDocumentFragment();
   for (const t of list) {
     const meta = TASK_STATUS_META[t.status] || { cls: 'off', text: t.status };
+    const kind = taskKindMeta(t.kind);
     const tr = document.createElement('tr');
     tr.innerHTML =
       '<td>' + (t.created_at_str || '—') + '</td>' +
+      '<td>' + kind.text + '</td>' +
       '<td title="' + (t.request_id || '') + '">' + shortRid(t.request_id) + '</td>' +
-      '<td>' + (t.sample_count ?? '—') + ' @ ' + (t.sample_rate_hz ?? '—') + '</td>' +
+      '<td>' + taskSpecShort(t) + '</td>' +
       '<td>' + meta.text + '（' + (t.status || '—') + '）</td>' +
       '<td>' + (t.upload_id ?? '—') + '</td>' +
       '<td>' + taskDuration(t) + '</td>';
@@ -708,6 +741,18 @@ function renderTaskHistory(tasks) {
   }
   body.innerHTML = '';
   body.appendChild(frag);
+}
+
+/** 历史表里的参数列：采集任务显示「点数 @ Hz」，控制任务显示自己的语义（板端不采数据） */
+function taskSpecShort(t) {
+  const kind = taskKindMeta(t.kind);
+  if ((t.kind || 'capture') === 'capture') {
+    return (t.sample_count ?? '—') + ' @ ' + (t.sample_rate_hz ?? '—');
+  }
+  if (t.kind === 'pause') {
+    return '暂停 ' + (t.duration_s ?? TASK_LIMITS.pauseDefault) + ' s';
+  }
+  return kind.spec(t);
 }
 
 /** 对照区：同设备「最近一批 manual」vs「最近一批 periodic」（后端只多了一个 trigger 过滤） */
@@ -746,13 +791,14 @@ async function renderCompare() {
   }
 }
 
-/** 侧栏刷新：对照区 + 任务历史（切换设备 / 建任务 / 任务终态 / 主轮询节流都会调用） */
+/** 侧栏刷新：对照区 + 任务历史 + 周期上报控制（切设备 / 建任务 / 终态 / 主轮询节流都会调用） */
 function refreshSidePanels() {
   renderCompare();
   refreshLatestTask();
+  refreshControl();
 }
 
-/** URL 参数（?source=&samples=&rate=&timeout=）覆盖表单初值，便于自动化构造任务参数 */
+/** URL 参数（?source=&samples=&rate=&timeout=&pause=）覆盖表单初值，便于自动化构造任务参数 */
 function syncFormFromUrl() {
   let params;
   try {
@@ -771,6 +817,7 @@ function syncFormFromUrl() {
   set($.countInput, 'samples');
   set($.rateInput, 'rate');
   set($.timeoutInput, 'timeout');
+  set($.pauseInput, 'pause');
 }
 
 /** 读取参数表单；越界/非整数抛错（不发请求，错误信息直接显示在状态条） */
@@ -797,34 +844,126 @@ function readTaskParams() {
 
 /** 点击「采集一次最新数据」：按表单参数建任务 → 跟踪到终态 */
 async function captureOnce() {
+  return createTask('capture');
+}
+
+/** 点击「暂停周期」：建 kind=pause 任务（带 duration_s），板端 applied 后即生效 */
+async function pausePeriodic() {
+  return createTask('pause');
+}
+
+/** 点击「恢复周期」：建 kind=resume 任务，提前结束暂停窗口 */
+async function resumePeriodic() {
+  return createTask('resume');
+}
+
+/** 读取「暂停时长」输入（服务端允许 5-600 s 整数，默认 120） */
+function readPauseDuration() {
+  const raw = ($.pauseInput && $.pauseInput.value) || TASK_LIMITS.pauseDefault;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < TASK_LIMITS.pauseMin || n > TASK_LIMITS.pauseMax) {
+    throw new Error('暂停时长必须是 ' + TASK_LIMITS.pauseMin + '-' +
+                    TASK_LIMITS.pauseMax + ' 的整数（当前 ' + raw + '）');
+  }
+  return n;
+}
+
+/** 建一条任务（capture / pause / resume 共用同一条链路，只有 kind 与收尾方式不同） */
+async function createTask(kind, extra) {
   if (!state.current) {
     renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
-    return;
+    return null;
   }
-  let params;
+  const body = { device_id: state.current, kind: kind, timeout_s: TASK.timeoutS };
   try {
-    params = readTaskParams();
+    if (kind === 'capture') {
+      const params = readTaskParams();
+      body.source = params.source;
+      body.sample_count = params.sample_count;
+      body.sample_rate_hz = params.sample_rate_hz;
+      body.timeout_s = params.timeout_s;
+    } else {
+      // 控制任务不采数据，但仍需合法的 source/unit/sample_*（服务端 NOT NULL 字段）
+      body.source = ($.sourceSel && $.sourceSel.value) || TASK_LIMITS.source;
+      if (kind === 'pause') {
+        body.duration_s = (extra && extra.duration_s) ?? readPauseDuration();
+      }
+    }
   } catch (e) {
     renderStatus('⚠ 任务参数不合法：' + e.message, 'error');
-    return;
+    return null;
   }
-  $.captureBtn.disabled = true;
+
+  const buttons = kind === 'capture' ? [$.captureBtn] : [$.pauseBtn, $.resumeBtn];
+  for (const b of buttons) if (b) b.disabled = true;
   try {
-    const data = await apiPost('/api/v1/tasks', {
-      device_id: state.current,
-      source: params.source,
-      sample_count: params.sample_count,
-      sample_rate_hz: params.sample_rate_hz,
-      timeout_s: params.timeout_s,
-    });
-    renderTask(data.task, data.duplicate ? '已复用未完成任务，未产生并行任务' : '任务已创建');
+    const data = await apiPost('/api/v1/tasks', body);
+    renderTask(data.task,
+                data.duplicate ? '已复用未完成任务，未产生并行任务'
+                               : (data.superseded ? '任务已创建（旧的反方向控制任务被取代）'
+                                                  : '任务已创建'));
     watchTask(data.task.request_id);
     renderStatus('', 'hidden');
+    refreshControl();       // 控制任务：板端 applied 前仍显示旧状态，倒计时会实时刷新
     refreshSidePanels();
+    return data.task;
   } catch (e) {
-    renderStatus('⚠ 创建采集任务失败：' + e.message, 'error');
+    renderStatus('⚠ 创建任务失败（' + kind + '）：' + e.message, 'error');
+    return null;
   } finally {
-    $.captureBtn.disabled = false;
+    for (const b of buttons) if (b) b.disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  周期上报控制卡片（暂停 / 恢复）
+ *
+ *  真相源是服务端的 device_control 表（由板端 POST /applied 写入），页面通过
+ *  GET /api/v1/control 读取；paused_until 到点后服务端惰性归零，所以这里显示
+ *  的「剩余」与板端自动恢复时刻一致，不需要前端自己猜。
+ * ------------------------------------------------------------------ */
+
+/** 渲染暂停状态：徽标 + 状态/剩余/自动恢复时刻/最近控制任务/更新时间 */
+function renderPeriodicControl(control) {
+  const c = control || {};
+  const paused = !!c.periodic_paused;
+  if ($.ctrlBadge) {
+    $.ctrlBadge.className = 'badge ' + (paused ? 'warn' : 'ok');
+    $.ctrlBadge.textContent = paused ? '停止中' : '上报中';
+  }
+  if ($.ctrlState) {
+    $.ctrlState.textContent = paused
+      ? '已暂停（板端不再上传周期批次）'
+      : '正常周期上报（每 1 s 一批 100 点）';
+  }
+  if ($.ctrlRemaining) {
+    const left = Number(c.remaining_s);
+    $.ctrlRemaining.textContent = paused
+      ? (isFinite(left) ? Math.max(0, left).toFixed(0) + ' s 后自动恢复' : '—')
+      : '—（未暂停）';
+  }
+  if ($.ctrlUntil) {
+    $.ctrlUntil.textContent = paused
+      ? (c.paused_until_str || '—') + '（板端自愈 + 服务端惰性归零）'
+      : '—（未暂停）';
+  }
+  if ($.ctrlRid) {
+    $.ctrlRid.textContent = c.request_id || '—（还没有控制任务）';
+  }
+  if ($.ctrlUpdated) {
+    $.ctrlUpdated.textContent = c.updated_at_str || '—';
+  }
+}
+
+/** 拉一次 /api/v1/control（主轮询节流触发 + 建控制任务后立即调用） */
+async function refreshControl() {
+  if (!state.current || !$.ctrlBadge) return;
+  try {
+    const data = await apiGet('/api/v1/control?device_id=' +
+                              encodeURIComponent(state.current));
+    renderPeriodicControl(data.control);
+  } catch (e) {
+    /* 控制接口不可用不应影响主面板 */
   }
 }
 
@@ -842,6 +981,8 @@ function renderTrace(latest) {
 }
 
 $.captureBtn.addEventListener('click', () => captureOnce());
+$.pauseBtn.addEventListener('click', () => pausePeriodic());
+$.resumeBtn.addEventListener('click', () => resumePeriodic());
 
 // 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
@@ -851,7 +992,9 @@ $.deviceSel.addEventListener('change', () => {
 
 // 设备列表首次加载后按钮才可用；这里先放开，点击时会校验是否已选设备
 $.captureBtn.disabled = false;
-syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source= 覆盖表单初值
+$.pauseBtn.disabled = false;
+$.resumeBtn.disabled = false;
+syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source=/&pause= 覆盖表单初值
 refreshSidePanels();
 
 // 便于自动化验证：用 /ui/?autocapture=1 打开页面即触发一次采集（等价于点按钮），
@@ -860,6 +1003,16 @@ try {
   const params = new URLSearchParams(window.location.search);
   if (params.get('autocapture') === '1') {
     setTimeout(captureOnce, 1200);
+  }
+  // ?autopause=1[&pause=90]：打开页面即触发一次「暂停周期」（等价于点按钮），
+  // 用于自动核对「建 pause 任务 → 板端 applied → device_control 置停止中」这条链路。
+  if (params.get('autopause') === '1') {
+    const dur = Number(params.get('pause') || TASK_LIMITS.pauseDefault);
+    setTimeout(() => createTask('pause', { duration_s: dur }), 1200);
+  }
+  // ?autoresume=1：打开页面即触发一次「恢复周期」（提前结束暂停窗口）
+  if (params.get('autoresume') === '1') {
+    setTimeout(() => createTask('resume'), 1200);
   }
 } catch (e) {
   /* 不支持 URLSearchParams 的环境忽略即可 */

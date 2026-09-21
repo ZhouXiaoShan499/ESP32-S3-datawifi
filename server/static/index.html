@@ -139,6 +139,12 @@
   <input type="number" id="timeoutInput" min="5" max="600" step="5" value="60"
          title="服务端允许 5-600 s">
   <button id="captureBtn" type="button" class="primary" disabled>采集一次最新数据</button>
+  <span class="sep"></span>
+  <label for="pauseInput">暂停时长 s</label>
+  <input type="number" id="pauseInput" min="5" max="600" step="5" value="120"
+         title="到点板端自动恢复上报；服务端允许 5-600 s">
+  <button id="pauseBtn" type="button" disabled>暂停周期</button>
+  <button id="resumeBtn" type="button" disabled>恢复周期</button>
   <span id="lastPoll">—</span>
 </section>
 
@@ -169,6 +175,29 @@
   </p>
 </section>
 
+<section id="ctrlCard" class="card">
+  <h2>周期上报控制（暂停 / 恢复）<span id="ctrlBadge" class="badge ok">上报中</span></h2>
+  <div class="grid">
+    <div class="kv"><span class="k">板端周期上报</span><span class="v" id="ctrlState">—</span></div>
+    <div class="kv"><span class="k">剩余暂停时间</span><span class="v" id="ctrlRemaining">—</span></div>
+    <div class="kv"><span class="k">自动恢复时刻 paused_until</span><span class="v" id="ctrlUntil">—</span></div>
+    <div class="kv"><span class="k">最近控制任务 request_id</span><span class="v" id="ctrlRid">—</span></div>
+    <div class="kv"><span class="k">状态更新时间</span><span class="v" id="ctrlUpdated">—</span></div>
+  </div>
+  <p class="hint">
+    「暂停周期」= 建一条 <code>kind=pause</code> 任务（<code>POST /api/v1/tasks</code>，带
+    <code>duration_s</code>）→ 板端 ≤3 s 轮询领取 → <b>停止喂 1 s 周期上传窗口</b>
+    （采样、SD/CSV 落盘、屏幕刷新照旧，<b>手动采集仍可用</b>）→ 板端
+    <code>POST /api/v1/tasks/{id}/applied</code> 确认已生效，任务完成。<br>
+    本卡片的状态来自 <code>GET /api/v1/control</code>：服务端 <code>device_control</code>
+    表是「是否真的停止上报」的真相源，不靠「周期批次数为 0」反推。
+    <b>暂停到期自动恢复</b>（板端按自己的定时器自愈，服务端把到期的记录惰性归零），
+    所以忘记点「恢复周期」也不会永久静默；点「恢复周期」= 建一条 <code>kind=resume</code>
+    任务提前恢复。方向相反的两条控制任务不会同时排队（新的一条会把旧的置
+    <code>failed: superseded by newer control task</code>）。
+  </p>
+</section>
+
 <section id="cmpCard" class="card">
   <h2>手动批次 vs 周期批次（同一设备对照）<span id="cmpInfo" class="poll-hint"></span></h2>
   <table>
@@ -190,9 +219,9 @@
   <table>
     <caption>该设备的任务流水（<code>/api/v1/tasks?device_id=…&amp;limit=20</code>，按创建时间倒序）</caption>
     <thead>
-      <tr><th>创建时间</th><th>request_id</th><th>点数 @ Hz</th><th>状态</th><th>upload_id</th><th>耗时</th></tr>
+      <tr><th>创建时间</th><th>类型</th><th>request_id</th><th>点数 @ Hz</th><th>状态</th><th>upload_id</th><th>耗时</th></tr>
     </thead>
-    <tbody id="taskHistoryBody"><tr><td colspan="6">—</td></tr></tbody>
+    <tbody id="taskHistoryBody"><tr><td colspan="7">—</td></tr></tbody>
   </table>
 </section>
 
@@ -267,7 +296,8 @@
   查询接口：/api/v1/devices · /api/v1/latest?device_id=…（可加 &amp;trigger=manual|periodic） ·
   /api/v1/window?device_id=…&amp;seconds=30<br>
   任务接口：POST /api/v1/tasks · GET /api/v1/tasks?device_id=…&amp;limit=20 ·
-  GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id}
+  GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id} ·
+  POST /api/v1/tasks/{request_id}/applied · GET /api/v1/control?device_id=…
   　|　
   <a href="/" target="_blank" rel="noopener">服务端首页</a>
 </footer>
