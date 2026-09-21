@@ -78,9 +78,14 @@
 #define TASK_API_PATH_NEXT       "/api/v1/tasks/next"
 #define TASK_API_PATH_ACK        "/api/v1/tasks/%s/ack"
 #define TASK_API_PATH_FAIL       "/api/v1/tasks/%s/fail"
+#define TASK_API_PATH_APPLIED    "/api/v1/tasks/%s/applied"
 #define TASK_REQUEST_ID_LEN      40       /* 与服务端 uuid4().hex(32) 对齐 */
 #define TASK_TRIGGER_LEN         16
+#define TASK_KIND_LEN            12       /* "capture" / "pause" / "resume" */
 #define TASK_MAX_SAMPLES         600      /* 板端单次采集上限（600×24B ≈ 14 KB 堆） */
+#define TASK_MAX_PAUSE_S         600      /* 暂停时长上限（与 server PAUSE_MAX_S 对齐） */
+#define TASK_PAUSE_FALLBACK_S    120      /* 服务端 duration_s 缺失/越界时的兜底时长 */
+#define TASK_APPLIED_RETRY_MAX   2        /* applied 回执重试次数（每 3 s 一轮询） */
 #define TASK_HTTP_TIMEOUT_MS     5000
 #define TASK_RESP_BUF_LEN        2048     /* /tasks/next 响应缓冲 */
 
@@ -2259,6 +2264,101 @@ static bool manual_capture_is_active(void)
     return manual_capture_state() != MANUAL_IDLE;
 }
 
+/* ---------------- 周期上报暂停（pause / resume 控制任务） ----------------
+ *
+ *  Web「暂停周期」POST 一条 kind=pause 的任务，板端领到后：
+ *    sampler 照常采样/落盘/刷 UI，但**不再喂 1 s 周期上传窗口**，到点自动恢复。
+ *
+ *  两个关键设计点：
+ *   1) 真相源是任务链路（pause 任务 applied 后服务端写 device_control），
+ *      板端只是执行者；这里的状态仅 RAM，重启即恢复上报（不会永久静音）。
+ *   2) 双时钟：esp_timer 单调钟是主判据（SNTP 没同步时 epoch 是 1970 起点，
+ *      用它算差值会立刻「以为到点」）；epoch 只在 s_time_synced 时做二次兜底，
+ *      以防单调钟因重启被重置。到点在 sampler / poll 两侧惰性清零，不引入定时器。
+ */
+static bool    s_periodic_paused = false;
+static int64_t s_pause_until_mono_ms  = 0;  /* esp_timer 终点（主判据） */
+static int64_t s_pause_until_epoch_ms = 0;  /* epoch 终点（仅已同步时非 0） */
+/* 未被服务端确认的控制任务（applied 回执待重试），与人工采集的 fail 回执同构 */
+static char    s_ctrl_pending_rid[TASK_REQUEST_ID_LEN];
+static int64_t s_ctrl_pending_until_ms = 0;
+static int     s_ctrl_pending_left = 0;
+
+/* 周期上报是否处于暂停窗口内。惰性到点恢复；调用方可持 s_state_mutex
+ * （sampler 路径与 manual_capture_consumes_sample 的加锁顺序一致）。 */
+static bool periodic_upload_paused(void)
+{
+    if (!s_task_mutex) {
+        return false;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    bool paused = s_periodic_paused;
+    if (paused) {
+        int64_t mono_now = esp_timer_get_time() / 1000;
+        bool expired = (s_pause_until_mono_ms > 0
+                        && mono_now >= s_pause_until_mono_ms);
+        if (!expired && s_time_synced && s_pause_until_epoch_ms > 0
+            && manual_now_epoch_ms() >= s_pause_until_epoch_ms) {
+            expired = true;   /* 单调钟重启后不可信：用已同步的 UTC 钟兜底 */
+        }
+        if (expired) {
+            s_periodic_paused = false;
+            s_pause_until_mono_ms = 0;
+            s_pause_until_epoch_ms = 0;
+            ESP_LOGI(TAG, "[ctrl] pause window elapsed - periodic uploads resumed");
+        }
+        paused = !expired;
+    }
+    xSemaphoreGive(s_task_mutex);
+    return paused;
+}
+
+/* 应用一条控制任务（在 task_poll_task 里调用，不在 sampler 里）。
+ * 返回 true = 已生效，调用方需发 ack + applied 回执。
+ * 注意：这里绝不放 s_ctrl_pending_* 之外的阻塞操作，也不碰 s_upload_count
+ * （它归 sampler 在 s_state_mutex 下管；恢复后的空窗口由 sampler 自己丢）。 */
+static bool task_apply_control(const char *request_id, const char *kind,
+                               double duration_s)
+{
+    if (!s_task_mutex || !request_id || !kind) {
+        return false;
+    }
+
+    bool is_pause = (strcmp(kind, "pause") == 0);
+    if (!is_pause && strcmp(kind, "resume") != 0) {
+        return false;      /* 未知 kind：交给服务端超时，不猜 */
+    }
+
+    int64_t mono_now = esp_timer_get_time() / 1000;
+    if (is_pause) {
+        if (!(duration_s > 0) || duration_s > TASK_MAX_PAUSE_S) {
+            duration_s = TASK_PAUSE_FALLBACK_S;
+        }
+    }
+
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (is_pause) {
+        s_periodic_paused = true;
+        s_pause_until_mono_ms = mono_now + (int64_t)(duration_s * 1000.0 + 0.5);
+        s_pause_until_epoch_ms = s_time_synced
+            ? manual_now_epoch_ms() + (int64_t)(duration_s * 1000.0 + 0.5)
+            : 0;      /* 未同步就不报绝对时刻，服务端回退到 now + duration_s */
+    } else {
+        s_periodic_paused = false;
+        s_pause_until_mono_ms = 0;
+        s_pause_until_epoch_ms = 0;
+    }
+    /* 新的控制决定覆盖旧的待重试回执（旧的已被服务端 supersede） */
+    snprintf(s_ctrl_pending_rid, sizeof(s_ctrl_pending_rid), "%s", request_id);
+    s_ctrl_pending_until_ms = is_pause ? s_pause_until_epoch_ms : 0;
+    s_ctrl_pending_left = TASK_APPLIED_RETRY_MAX + 1;
+    xSemaphoreGive(s_task_mutex);
+
+    ESP_LOGI(TAG, "[ctrl] %s applied for %s (%.0f s window)",
+             kind, request_id, is_pause ? duration_s : 0.0);
+    return true;
+}
+
 /* Failure bookkeeping; caller must hold s_task_mutex. */
 static void manual_fail_locked(const char *reason)
 {
@@ -2539,6 +2639,69 @@ static bool task_post_fail(const char *request_id, const char *reason)
     return http_post_text(url, body);
 }
 
+/* POST /api/v1/tasks/{id}/applied - "the control task took effect".
+ * Unlike ack this one is NOT best effort: it is what closes a pause/resume task
+ * server-side (control tasks carry no samples), and it is also what makes the
+ * server write device_control, i.e. the Web page's source of truth. */
+static bool task_post_applied(const char *request_id, int64_t paused_until_epoch_ms)
+{
+    char path[96];
+    char url[192];
+    char body[96];
+    snprintf(path, sizeof(path), TASK_API_PATH_APPLIED, request_id);
+    if (!server_api_url(url, sizeof(url), path)) {
+        return false;
+    }
+    if (paused_until_epoch_ms > 0) {
+        /* Board's own deadline in epoch ms: the server prefers it inside a sane
+         * window so the page countdown matches the board's auto-resume exactly. */
+        snprintf(body, sizeof(body), "{\"paused_until_ms\": %" PRId64 "}",
+                 paused_until_epoch_ms);
+    } else {
+        snprintf(body, sizeof(body), "{}");   /* unsynced clock: server uses now+duration_s */
+    }
+    return http_post_text(url, body);
+}
+
+/* Retry the applied receipt of the last control task (bounded: a receipt older
+ * than a couple of polls is no longer useful, the server task has timed out and
+ * a newer control decision must win). Runs in task_poll_task. */
+static void task_report_pending_control(void)
+{
+    char request_id[TASK_REQUEST_ID_LEN];
+    int64_t until_ms;
+    if (!s_task_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+    if (s_ctrl_pending_rid[0] == '\0') {
+        xSemaphoreGive(s_task_mutex);
+        return;
+    }
+    if (s_ctrl_pending_left <= 0) {
+        ESP_LOGW(TAG, "[ctrl] giving up on applied receipt for %s",
+                 s_ctrl_pending_rid);
+        s_ctrl_pending_rid[0] = '\0';
+        xSemaphoreGive(s_task_mutex);
+        return;
+    }
+    snprintf(request_id, sizeof(request_id), "%s", s_ctrl_pending_rid);
+    until_ms = s_ctrl_pending_until_ms;
+    s_ctrl_pending_left--;
+    xSemaphoreGive(s_task_mutex);
+
+    if (task_post_applied(request_id, until_ms)) {
+        xSemaphoreTake(s_task_mutex, portMAX_DELAY);
+        if (strcmp(s_ctrl_pending_rid, request_id) == 0) {
+            s_ctrl_pending_rid[0] = '\0';
+        }
+        xSemaphoreGive(s_task_mutex);
+        ESP_LOGI(TAG, "[ctrl] applied receipt delivered for %s", request_id);
+    } else {
+        ESP_LOGW(TAG, "[ctrl] applied receipt retry pending for %s", request_id);
+    }
+}
+
 /* Send the pending fail receipt, then go back to IDLE. A report that fails is
  * retried on the next poll because the state stays MANUAL_ERROR. */
 static void task_report_pending_failure(void)
@@ -2603,13 +2766,46 @@ static void task_handle_next_response(const char *resp)
                             ? cJSON_GetObjectItem(task, "sample_rate_hz") : NULL;
     const cJSON *exp = cJSON_IsObject(task)
                            ? cJSON_GetObjectItem(task, "expires_at") : NULL;
-    if (!cJSON_IsString(rid) || !cJSON_IsNumber(cnt) || !cJSON_IsNumber(rate)) {
+    const cJSON *kind = cJSON_IsObject(task)
+                            ? cJSON_GetObjectItem(task, "kind") : NULL;
+    const cJSON *dur = cJSON_IsObject(task)
+                           ? cJSON_GetObjectItem(task, "duration_s") : NULL;
+    if (!cJSON_IsString(rid)) {
         cJSON_Delete(root);
         return;         /* found=false or unexpected body: nothing to do */
     }
 
     char request_id[TASK_REQUEST_ID_LEN];
     snprintf(request_id, sizeof(request_id), "%s", rid->valuestring);
+
+    /* Control tasks (pause/resume) are handled first and never reach the sample
+     * bookkeeping below: they carry no samples, so sample_count / rate must not
+     * be validated against them. */
+    if (cJSON_IsString(kind) && kind->valuestring
+        && (strcmp(kind->valuestring, "pause") == 0
+            || strcmp(kind->valuestring, "resume") == 0)) {
+        char ctrl_kind[TASK_KIND_LEN];
+        snprintf(ctrl_kind, sizeof(ctrl_kind), "%s", kind->valuestring);
+        double duration_s = cJSON_IsNumber(dur) ? dur->valuedouble : 0.0;
+        cJSON_Delete(root);
+        if (!task_apply_control(request_id, ctrl_kind, duration_s)) {
+            return;
+        }
+        /* ack is optional bookkeeping; applied is what actually closes the task,
+         * so a failed ack only logs (the applied receipt is retried by the poll
+         * loop while a failed ack would just leave acked_at empty). */
+        if (!task_post_ack(request_id)) {
+            ESP_LOGW(TAG, "[ctrl] ack failed for %s (state already applied)",
+                     request_id);
+        }
+        task_report_pending_control();
+        return;
+    }
+
+    if (!cJSON_IsNumber(cnt) || !cJSON_IsNumber(rate)) {
+        cJSON_Delete(root);
+        return;         /* capture task without a usable spec: ignore */
+    }
     uint32_t target = (uint32_t)cnt->valuedouble;
     uint32_t rate_hz = (uint32_t)rate->valuedouble;
     int64_t expires_ms = cJSON_IsNumber(exp)
@@ -2686,6 +2882,12 @@ static void task_poll_task(void *arg)
             continue;       /* capture/upload in flight: do not claim another */
         }
 
+        /* A pause/resume task that the server never acknowledged is re-reported
+         * here (bounded), exactly like the failed-capture receipt above. This is
+         * the one place that must keep running while uploads are paused: if the
+         * poll stopped, the resume task could never be received. */
+        task_report_pending_control();
+
         if (http_get_text(url, resp, TASK_RESP_BUF_LEN)) {
             task_handle_next_response(resp);
         }
@@ -2725,6 +2927,9 @@ static void sampler_task(void *arg)
     /* Sampling-gate state of the previous iteration: a gate that opens after
      * being closed is a brand-new sampling session (see the gate below). */
     bool gate_was_open = false;
+    /* Previous tick's periodic-upload pause state: the falling edge (paused →
+     * resumed) is where the half-filled 1 s window is dropped. */
+    bool periodic_pause_was_on = false;
 
     while (true) {
         /* Do NOT refresh UI in every loop — only when state changes or periodically.
@@ -2864,8 +3069,18 @@ static void sampler_task(void *arg)
                     bool manual_tick = manual_capture_consumes_sample(
                         timestamp_ms, ax_ms2, ay_ms2, az_ms2);
 
+                    /* Web「暂停周期」窗口内：照常采样/落盘/刷 UI，只是不再喂 1 s
+                     * 上传窗口（手动采集不受影响）。窗口结束的第一拍丢掉未满的
+                     * 周期窗口，恢复后的第一批仍是干净的 UPLOAD_WINDOW_SIZE 点，
+                     * 不会把暂停前后的样本缝进同一批。 */
+                    bool periodic_paused = periodic_upload_paused();
+                    if (!periodic_paused && periodic_pause_was_on) {
+                        s_upload_count = 0;
+                    }
+                    periodic_pause_was_on = periodic_paused;
+
                     /* Feed this sample into the 1 s upload window (WiFi only). */
-                    if (!manual_tick && s_wifi_connected) {
+                    if (!manual_tick && !periodic_paused && s_wifi_connected) {
                         upload_accumulate(timestamp_ms, ax_ms2, ay_ms2, az_ms2);
                     }
                     
