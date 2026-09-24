@@ -15,22 +15,30 @@
     --warn: #b8860b;
     --err: #cf222e;
     --accent: #2563eb;
+    /* 字号统一为 5 档（原先散落 11/12/13/14/15/16/20 共 7 档，表单还另继承 body 的 16px），
+       11px 并入 12px、15px 并入 14px，正文与表单统一走 body 的 --fs-md */
+    --fs-xs: 12px;   /* 次要说明：表格、徽章、页脚 */
+    --fs-sm: 13px;   /* 元信息：控制条说明、图表标题 */
+    --fs-md: 14px;   /* 正文与表单默认 */
+    --fs-lg: 16px;   /* 卡片标题 */
+    --fs-xl: 20px;   /* 页面主标题 */
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 20px; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: var(--fs-md);
     background: var(--bg); color: var(--text);
   }
   header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
-  header h1 { font-size: 20px; margin: 0; }
-  .poll-hint { color: var(--muted); font-size: 13px; }
+  header h1 { font-size: var(--fs-xl); margin: 0; }
+  .poll-hint { color: var(--muted); font-size: var(--fs-sm); }
 
   .controls {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     padding: 14px 16px; margin-bottom: 16px;
   }
-  .controls label { font-size: 14px; color: var(--muted); }
+  .controls label { color: var(--muted); }   /* 字号沿用 body 的 --fs-md，不再单独声明 */
   select, input, button {
     font: inherit; padding: 7px 12px; border: 1px solid var(--border);
     border-radius: 6px; background: #fff; color: var(--text);
@@ -45,24 +53,24 @@
   button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   button.primary:hover { background: #1d4ed8; }
   button.primary:active { background: #1e40af; }
-  .hint { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 12px 0 0; }
+  .hint { color: var(--muted); font-size: var(--fs-xs); line-height: 1.7; margin: 12px 0 0; }
   .hint code { background: #f1f3f6; padding: 1px 5px; border-radius: 4px; }
   .ack-warn {
-    color: var(--warn); font-size: 13px; font-weight: 600;
+    color: var(--warn); font-size: var(--fs-sm); font-weight: 600;
     line-height: 1.7; margin: 12px 0 0;
   }
-  #lastPoll { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #lastPoll { margin-left: auto; color: var(--muted); font-size: var(--fs-sm); }
 
   .notice {
     border: 1px dashed var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px;
     text-align: center; color: var(--muted); background: var(--card);
   }
-  .notice .big { display: block; font-size: 16px; color: var(--err); margin-bottom: 6px; font-weight: 600; }
+  .notice .big { display: block; font-size: var(--fs-lg); color: var(--err); margin-bottom: 6px; font-weight: 600; }
   .notice.no-device .big { color: var(--muted); }
   .hidden { display: none !important; }
 
   .badge {
-    display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: var(--fs-xs);
     color: #fff; font-weight: 600; margin-left: 6px; vertical-align: 1px;
   }
   .badge.ok   { background: var(--ok); }
@@ -74,16 +82,16 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     padding: 16px 18px; margin-bottom: 16px;
   }
-  .card h2 { font-size: 16px; margin: 0 0 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .card h2 { font-size: var(--fs-lg); margin: 0 0 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
   .grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 18px;
   }
-  .kv { font-size: 13px; }
-  .kv .k { display: block; color: var(--muted); font-size: 12px; margin-bottom: 2px; }
-  .kv .v { font-size: 15px; font-weight: 600; word-break: break-all; }
+  .kv { font-size: var(--fs-sm); }
+  .kv .k { display: block; color: var(--muted); font-size: var(--fs-xs); margin-bottom: 2px; }
+  .kv .v { font-size: var(--fs-md); font-weight: 600; word-break: break-all; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
-  caption { text-align: left; color: var(--muted); font-size: 12px; padding: 6px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); margin-top: 8px; }
+  caption { text-align: left; color: var(--muted); font-size: var(--fs-xs); padding: 6px 0; }
   th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 600; }
   th:first-child, td:first-child { text-align: left; }
@@ -92,9 +100,9 @@
   .chart-box { margin-top: 18px; }
   .chart-head {
     display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
-    color: var(--muted); font-size: 12px; padding: 6px 0;
+    color: var(--muted); font-size: var(--fs-xs); padding: 6px 0;
   }
-  .chart-title { font-weight: 600; color: var(--text); font-size: 13px; }
+  .chart-title { font-weight: 600; color: var(--text); font-size: var(--fs-sm); }
   .chart-count { margin-left: auto; }
   #chart {
     display: block; width: 100%; height: 240px;
@@ -102,7 +110,7 @@
   }
   .scene-controls {
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    margin-bottom: 10px; font-size: 13px; color: var(--muted);
+    margin-bottom: 10px; font-size: var(--fs-sm); color: var(--muted);
   }
   .scene-controls label { display: inline-flex; align-items: center; gap: 6px; }
   #scene3d {
@@ -110,8 +118,46 @@
     border: 1px solid var(--border); border-radius: 6px; background: #fff;
   }
   #scene3d:active { cursor: grabbing; }
+  /* 实时拍照：控制条 + 缩略图画廊（每张图一个删除按钮） */
+  .photo-controls {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 10px; font-size: var(--fs-sm); color: var(--muted);
+  }
+  .photo-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+  }
+  .photo-card {
+    border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+    background: #fff; display: flex; flex-direction: column;
+  }
+  .photo-card img {
+    display: block; width: 100%; height: 140px; object-fit: cover;
+    background: #f6f8fa; cursor: zoom-in;
+  }
+  .photo-card .photo-meta {
+    padding: 6px 8px; font-size: var(--fs-xs); color: var(--muted); line-height: 1.6;
+  }
+  .photo-card .photo-meta b { color: var(--text); }
+  .photo-card .photo-actions { display: flex; gap: 6px; padding: 0 8px 8px; }
+  .photo-card .photo-actions button { padding: 3px 10px; font-size: var(--fs-xs); }
+  .photo-empty { grid-column: 1 / -1; color: var(--muted); font-size: var(--fs-xs); padding: 6px 0; }
+  /* 摄像头实时画面（直播）：大图 + 状态元信息；未推流时显示占位提示 */
+  .live-box { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .live-frame {
+    position: relative; width: 480px; max-width: 100%; aspect-ratio: 4 / 3;
+    border: 1px solid var(--border); border-radius: 6px; background: #f6f8fa;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  .live-frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .live-off { color: var(--muted); font-size: var(--fs-sm); padding: 10px 14px; text-align: center; }
+  .live-meta {
+    font-size: var(--fs-xs); color: var(--muted); line-height: 1.9;
+    min-width: 260px; flex: 1 1 260px; white-space: pre-line;
+  }
+  .live-meta b { color: var(--text); }
   .err-msg { color: var(--err); }
-  footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  footer { color: var(--muted); font-size: var(--fs-xs); margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -158,21 +204,9 @@
     <div class="kv"><span class="k">下发时间 dispatched_at</span><span class="v" id="taskDispatched">—</span></div>
     <div class="kv"><span class="k">设备回执 acked_at</span><span class="v" id="taskAcked">—</span></div>
     <div class="kv"><span class="k">完成时间 completed_at</span><span class="v" id="taskCompleted">—</span></div>
-    <div class="kv"><span class="k">关联数据 upload_id</span><span class="v" id="taskUploadId">—</span></div>
+    <div class="kv"><span class="k">关联数据 upload_id / 照片</span><span class="v" id="taskUploadId">—</span></div>
   </div>
   <p class="ack-warn hidden" id="taskAckHint"></p>
-  <p class="hint">
-    点击「采集一次最新数据」：按上面的表单参数创建任务（<code>POST /api/v1/tasks</code>）→
-    板端轮询领取（≤3 s，<code>GET /api/v1/tasks/next</code>）→ 暂停周期上报并按任务的采样率采集
-    <code>sample_count</code> 点 → 带 <code>request_id</code> 回传完成任务，任务卡片会显示关联的
-    <code>upload_id</code> 与各阶段时间戳（<code>*_at_str</code>）。<br>
-    表单范围已取两侧限制的交集：<b>样本数 ≤ 600</b>（板端 <code>TASK_MAX_SAMPLES</code>）、
-    <b>采样率 ≤ 100 Hz</b>（板端 <code>TARGET_SAMPLE_FREQ_HZ</code>），服务端本身允许到
-    2000 点 / 200 Hz，超限由服务端 400 或板端 <code>POST /fail</code> 拒绝。
-    <code>source</code> 固定 <code>qma6100p</code>、<code>unit</code> 固定 <code>m/s^2</code>
-    （必须与板端上报一致，故不开放编辑）。<br>
-    连点只会复用一个未完成任务；request_id 贯穿任务、回执与样本，重复上传不会重复写样本。
-  </p>
 </section>
 
 <section id="ctrlCard" class="card">
@@ -223,6 +257,57 @@
     </thead>
     <tbody id="taskHistoryBody"><tr><td colspan="7">—</td></tr></tbody>
   </table>
+</section>
+
+<section id="liveCard" class="card">
+  <h2>摄像头实时画面（板端长按 Button A 推流）<span id="liveBadge" class="badge off">未推流</span>
+      <span id="liveInfo" class="poll-hint"></span></h2>
+  <div class="live-box">
+    <div class="live-frame">
+      <span id="liveOff" class="live-off">—（板端长按 Button A 2 s 开启推流后，此处自动显示实时画面）</span>
+      <img id="liveImg" class="hidden" alt="摄像头实时画面">
+    </div>
+    <div class="live-meta" id="liveMeta">—</div>
+  </div>
+  <p class="hint">
+    板端<b>长按 Button A（2 s）</b>开始推流：<code>live_stream_task</code> 循环「拍一帧
+    <b>640×480 JPEG</b>（esp_video/DVP，原始字节直传）→
+    <code>POST /api/v1/live?device_id=…&amp;ts_ms=…&amp;w=…&amp;h=…</code>」，
+    约 <b>1-2 fps</b>；再长按一次停止（LCD 状态栏会显示 <code>Live:ON/OFF</code>）。<br>
+    服务端<b>只在内存里保留每台设备的最新一帧</b>（不落盘、不进 <code>photos</code> 表、不建任务），
+    本卡片按 <code>GET /api/v1/live</code> 的 <code>seq</code> 轮询 <code>GET /api/v1/live/frame</code>
+    刷新 <code>&lt;img&gt;</code>，即得到实时画面。直播是连续流：<b>丢一帧下一帧立刻补上</b>，
+    不做逐帧 ACK；超过 <span id="liveTimeoutS">5</span> s 没有新帧即视为「未推流」（板端按停止 /
+    断网 / 掉电），画面停在最后一帧而不是报错。<br>
+    直播与「拍一张照片」共用相机，板端用互斥锁串行化（单帧拍照最多等多一帧的时间）；
+    不占用 IMU 采样器、不暂停周期上报。
+  </p>
+</section>
+
+<section id="photoCard" class="card">
+  <h2>实时拍照（单帧 JPEG）<span id="photoBadge" class="badge off">暂无照片</span>
+      <span id="photoInfo" class="poll-hint"></span></h2>
+  <div class="photo-controls">
+    <button id="photoBtn" type="button" class="primary" disabled>拍一张照片</button>
+    <span id="photoStatus">—</span>
+  </div>
+  <div id="photoGrid" class="photo-grid">
+    <div class="photo-empty">—（该设备还没有照片，点「拍一张照片」触发板端拍摄）</div>
+  </div>
+  <p class="hint">
+    点击「拍一张照片」= 建一条 <code>kind=camera</code> 任务（<code>POST /api/v1/tasks</code>）→
+    板端 ≤3 s 轮询领取（<code>GET /api/v1/tasks/next</code>）→ 用 esp_video/DVP 拍一帧
+    <b>640×480 JPEG</b>（板端不重新编码，原始字节直传）→
+    <code>POST /api/v1/photos?device_id=…&amp;request_id=…</code> → 服务端把图片落盘到
+    <code>server/photos/&lt;device_id&gt;/&lt;id&gt;.jpg</code>，并在<b>同一事务</b>里把任务置
+    <code>completed</code>（幂等：同一 request_id 重传不会存第二张）。<br>
+    画廊读取 <code>GET /api/v1/photos?device_id=…&amp;limit=12</code>，缩略图直接是
+    <code>GET /api/v1/photos/{id}</code>；点图或「原图」在新标签页看原尺寸，点「删除」
+    （<code>DELETE /api/v1/photos/{id}</code>）会同时删掉数据库记录与磁盘 JPEG 文件。<br>
+    拍照不占用 IMU 采样器、不暂停周期上报；板端没有相机/未启用
+    <code>CONFIG_CAMERA_OV2640</code> 时会以 <code>POST /fail</code> 明确回执，
+    任务卡片会显示原因而不是静默超时。
+  </p>
 </section>
 
 <section id="noDeviceMsg" class="notice no-device hidden">
@@ -297,7 +382,12 @@
   /api/v1/window?device_id=…&amp;seconds=30<br>
   任务接口：POST /api/v1/tasks · GET /api/v1/tasks?device_id=…&amp;limit=20 ·
   GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id} ·
-  POST /api/v1/tasks/{request_id}/applied · GET /api/v1/control?device_id=…
+  POST /api/v1/tasks/{request_id}/applied · GET /api/v1/control?device_id=…<br>
+  拍照接口：POST /api/v1/photos?device_id=…（body = JPEG 字节） ·
+  GET /api/v1/photos?device_id=…&amp;limit=12 · GET /api/v1/photos/{id} ·
+  DELETE /api/v1/photos/{id}<br>
+  直播接口（板端长按 Button A）：POST /api/v1/live?device_id=…（body = JPEG 字节） ·
+  GET /api/v1/live?device_id=… · GET /api/v1/live/frame?device_id=…（最新一帧 JPEG）
   　|　
   <a href="/" target="_blank" rel="noopener">服务端首页</a>
 </footer>

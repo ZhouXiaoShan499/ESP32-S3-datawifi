@@ -8,8 +8,16 @@
  *   GET /api/v1/window?device_id=..&seconds=30               -> 波形与三维轨迹
  *   GET /api/v1/tasks?device_id=..&limit=20                  -> 任务历史
  *   GET /api/v1/control?device_id=..                         -> 周期上报暂停状态
+ *   GET /api/v1/photos?device_id=..&limit=12                 -> 照片画廊（实时拍照）
+ *   GET /api/v1/photos/{id}                                  -> 照片 JPEG 原图
+ *   GET /api/v1/live?device_id=..                            -> 直播状态（板端长按 Button A 推流）
+ *   GET /api/v1/live/frame?device_id=..&seq=..               -> 直播最新一帧 JPEG（内存态）
  * 能力：设备下拉选择、最新数据展示、无数据/无设备提示、更新状态（更新中/未更新）、
  *      按需采集任务（参数表单 → 创建 → 跟踪 → 时间戳/upload_id 回显 → 无回执提示）、
+ *      实时拍照（拍一张照片 → kind=camera 任务 → 板端单帧 JPEG 上传 → 画廊缩略图/
+ *      原图/逐张删除）、
+ *      摄像头实时画面（板端长按 Button A 推流 → POST /api/v1/live → 本页按 seq 轮询
+ *      最新一帧 <img>，约 1-2 fps；超时无新帧自动显示「未推流」）、
  *      周期上报控制（暂停 N 秒 / 提前恢复 → kind=pause|resume 任务 → 板端 applied 生效）、
  *      手动批次与周期批次对照、三维姿态视图。
  */
@@ -22,6 +30,12 @@ const NUM = 5;                 // 展示头部/尾部样本条数
 const CHART_WINDOW_S = 30;     // 波形窗口秒数（与 /api/v1/window?seconds= 一致）
 const CHART_AXES = ['ax', 'ay', 'az'];
 const CHART_COLORS = { ax: '#cf222e', ay: '#1a7f37', az: '#2563eb' };
+/* 照片画廊：一次拉最近 N 张（对应 GET /api/v1/photos?limit=），点删除走 DELETE */
+const PHOTO_LIMIT = 12;
+/* 摄像头实时画面（直播）：板端长按 Button A 推流，服务端只在内存里保留最新一帧。
+   本页按 seq 轮询 GET /api/v1/live/frame，两次取图之间留最小间隔，避免图片请求
+   拖慢 800 ms 的主轮询（板端实际约 1-2 fps）。 */
+const LIVE_POLL_MIN_MS = 500;
 
 const el = (id) => document.getElementById(id);
 const $ = {
@@ -81,6 +95,17 @@ const $ = {
   sceneWin: el('sceneWin'),
   autoRotate: el('autoRotate'),
   resetView: el('resetView'),
+  photoBtn: el('photoBtn'),
+  photoBadge: el('photoBadge'),
+  photoInfo: el('photoInfo'),
+  photoStatus: el('photoStatus'),
+  photoGrid: el('photoGrid'),
+  liveBadge: el('liveBadge'),
+  liveInfo: el('liveInfo'),
+  liveMeta: el('liveMeta'),
+  liveImg: el('liveImg'),
+  liveOff: el('liveOff'),
+  liveTimeoutS: el('liveTimeoutS'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '' };
@@ -134,6 +159,27 @@ async function apiPost(path, body) {
   }
   if (!data) throw new Error('响应不是合法 JSON：' + path);
   return data;
+}
+
+/** 容错 DELETE：网络/非 2xx 都抛出带可读信息的 Error（优先用服务端 error 字段） */
+async function apiDelete(path) {
+  let res;
+  try {
+    res = await fetch(path, { method: 'DELETE', cache: 'no-store' });
+  } catch (e) {
+    throw new Error('无法连接服务器，请确认服务端已启动：' + path);
+  }
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = null;
+  }
+  if (!res.ok) {
+    const msg = (data && data.error) ? data.error : ('接口返回 ' + res.status);
+    throw new Error(msg + '：' + path);
+  }
+  return data || { ok: true };
 }
 
 function fmtTsMs(tsMs) {
@@ -424,6 +470,10 @@ async function poll() {
     }
     rebuildSelect(devs);
 
+    // 3') 摄像头实时画面：每轮都试一次（内部有 500 ms 最小间隔 + busy 保护），
+    //     不 await —— 图片/状态请求再慢也不该拖住 800 ms 的主轮询和数据面板。
+    refreshLive();
+
     if (!ids.length) {
       showNoData(false);
       return;
@@ -533,9 +583,10 @@ const TASK_LIMITS = {
   pauseMin: 5, pauseMax: 600, pauseDefault: 120,   // 与服务端 PAUSE_MIN_S/MAX_S 对齐
 };
 
-/* 任务类型：capture 由带 request_id 的上传收尾；pause/resume 靠板端 /applied 收尾 */
+/* 任务类型：capture/camera 由带 request_id 的上传收尾；pause/resume 靠板端 /applied 收尾 */
 const TASK_KIND = {
   capture: { text: '按需采集', short: 'capture', spec: (t) => (t.sample_count ?? '—') + ' 点 @ ' + (t.sample_rate_hz ?? '—') + ' Hz' },
+  camera: { text: '实时拍照', short: 'camera', spec: () => '拍一帧 640×480 JPEG 并上传（不采样本）' },
   pause: { text: '暂停周期', short: 'pause', spec: (t) => '暂停 ' + (t.duration_s ?? TASK_LIMITS.pauseDefault) + ' s（到期自动恢复）' },
   resume: { text: '恢复周期', short: 'resume', spec: () => '立即恢复周期上报' },
 };
@@ -571,7 +622,7 @@ function renderTaskBadge(status) {
   return meta;
 }
 
-function renderTask(task, note, upload) {
+function renderTask(task, note, upload, photo) {
   if (!task) return;
   const meta = renderTaskBadge(task.status);
   taskState.last = task;
@@ -602,7 +653,15 @@ function renderTask(task, note, upload) {
   const up = upload || task.upload || null;
   const kindMeta = taskKindMeta(task.kind);
   if ($.taskUploadId) {
-    if (up && up.id) {
+    if (task.kind === 'camera') {
+      // 拍照任务不产生样本批次：任务详情接口带回关联照片（photo），直接显示照片信息
+      const ph = photo || task.photo || null;
+      $.taskUploadId.textContent = ph
+        ? ('照片 #' + ph.id + '（' + (ph.size_kb ?? '—') + ' KB · ' +
+           (ph.width ?? '?') + '×' + (ph.height ?? '?') + ' · ' +
+           (ph.received_at_str || '—') + '）')
+        : '—（尚无照片：板端拍好并 POST /api/v1/photos 后才有关联照片）';
+    } else if (up && up.id) {
       $.taskUploadId.textContent = up.id + '（' + (up.trigger || 'manual') + ' · ' +
         (up.sample_count ?? '—') + ' 点 · ' + (up.received_at_str || '—') + '）';
     } else if (task.upload_id) {
@@ -662,11 +721,13 @@ function watchTask(requestId) {
   const tick = async () => {
     try {
       const data = await apiGet('/api/v1/tasks/' + encodeURIComponent(requestId));
-      renderTask(data.task, undefined, data.upload);
+      renderTask(data.task, undefined, data.upload, data.photo);
       if (data.task && data.task.terminal) {
         stopTaskWatch();
         // 控制任务（pause/resume）的终态就是 device_control 已被写入的时刻，立刻回读
         refreshControl();
+        // 拍照任务的终态 = 照片已入库，立刻刷新画廊（不用等下一次侧栏刷新）
+        if (data.task.kind === 'camera') refreshGallery();
         poll();          // 任务完成后立刻刷新数据面板，不用等下一次轮询
       }
     } catch (e) {
@@ -689,7 +750,18 @@ async function refreshLatestTask() {
     const task = tasks[0];
     if (!task) return;
     renderTask(task, task.terminal ? '历史任务（已结束）' : '继续跟踪');
-    if (!task.terminal) watchTask(task.request_id);
+    if (!task.terminal) {
+      watchTask(task.request_id);
+    } else if (task.kind === 'camera') {
+      // 历史拍照任务：关联照片只在任务详情接口里（列表接口只有 upload_id），
+      // 补一次详情请求，任务卡片才能显示「照片 #id（尺寸/大小/时间）」。
+      try {
+        const detail = await apiGet('/api/v1/tasks/' + encodeURIComponent(task.request_id));
+        renderTask(detail.task, '历史任务（已结束）', detail.upload, detail.photo);
+      } catch (e) {
+        /* 详情接口不可用：保留列表渲染结果（不显示照片信息，不影响主面板） */
+      }
+    }
   } catch (e) {
     /* 任务接口不可用不应影响主面板 */
   }
@@ -791,11 +863,13 @@ async function renderCompare() {
   }
 }
 
-/** 侧栏刷新：对照区 + 任务历史 + 周期上报控制（切设备 / 建任务 / 终态 / 主轮询节流都会调用） */
+/** 侧栏刷新：对照区 + 任务历史 + 周期上报控制 + 照片画廊
+ *  （切设备 / 建任务 / 终态 / 主轮询节流都会调用） */
 function refreshSidePanels() {
   renderCompare();
   refreshLatestTask();
   refreshControl();
+  refreshGallery();
 }
 
 /** URL 参数（?source=&samples=&rate=&timeout=&pause=）覆盖表单初值，便于自动化构造任务参数 */
@@ -894,7 +968,8 @@ async function createTask(kind, extra) {
     return null;
   }
 
-  const buttons = kind === 'capture' ? [$.captureBtn] : [$.pauseBtn, $.resumeBtn];
+  const buttons = kind === 'capture' ? [$.captureBtn]
+                : (kind === 'camera' ? [$.photoBtn] : [$.pauseBtn, $.resumeBtn]);
   for (const b of buttons) if (b) b.disabled = true;
   try {
     const data = await apiPost('/api/v1/tasks', body);
@@ -967,6 +1042,247 @@ async function refreshControl() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ *  摄像头实时画面（直播：板端长按 Button A 推流）
+ *
+ *  链路：板端长按 Button A（2 s）→ live_stream_task 每 ~500 ms 拍一帧
+ *  640×480 JPEG 并 POST /api/v1/live?device_id=…&ts_ms=…&w=…&h=… →
+ *  服务端只把最新一帧留在内存（不落盘、不入库、不建任务）→ 本页每轮
+ *  poll() 调 refreshLive()：GET /api/v1/live 看状态，seq 变了才去
+ *  GET /api/v1/live/frame 刷新 <img>（额外带 &seq= 防缓存）。
+ *  active=false（超过 timeout_s 没有新帧）= 板端已停止推流 / 断网 / 掉电：
+ *  画面保留最后一帧并标记「已停止」，而不是报错。
+ * ------------------------------------------------------------------ */
+
+const LIVE = { busy: false, lastAt: 0, lastSeq: -1, device: '' };
+
+/** 未推流 / 查询失败 / 无帧时统一走这里：占位提示 + 隐藏 <img> + 徽章与元信息 */
+function renderLiveOff(text, meta, badgeText) {
+  if ($.liveImg) $.liveImg.classList.add('hidden');
+  if ($.liveOff) {
+    $.liveOff.classList.remove('hidden');
+    $.liveOff.textContent = text ||
+      '—（板端长按 Button A 2 s 开启推流后，此处自动显示实时画面）';
+  }
+  if ($.liveMeta) $.liveMeta.textContent = meta || '—';
+  if ($.liveBadge) {
+    $.liveBadge.className = 'badge off';
+    $.liveBadge.textContent = badgeText || '未推流';
+  }
+}
+
+/** 直播状态 → 元信息文本（多行，CSS 用 white-space: pre-line 渲染） */
+function liveMetaText(st, dev) {
+  const age = (st.age_ms == null) ? '—' : (st.age_ms / 1000).toFixed(1) + ' s 前';
+  return '设备：' + dev +
+    '\n帧序号 seq：' + (st.seq ?? '—') +
+    '\n分辨率：' + (st.width ?? '?') + '×' + (st.height ?? '?') +
+    '\n单帧大小：' + (st.bytes ? (st.bytes / 1024).toFixed(1) + ' KB' : '—') +
+    '\n最近一帧：' + (st.received_at_str || '—') + '（' + age + '）' +
+    '\n板端拍摄时刻：' + (st.ts_ms_str || '—') +
+    '\n来源 IP：' + (st.ip || '—') +
+    '\n名义帧率：约 ' + (st.nominal_fps ?? '—') + ' fps（阈值 ' + st.timeout_s + ' s 无帧即视为停止）';
+}
+
+/** 每轮 poll() 调用（不 await）：只取最新一帧，没有新帧就不动 <img> */
+async function refreshLive() {
+  const img = $.liveImg;
+  if (!img) return;
+  const now = Date.now();
+  if (LIVE.busy || now - LIVE.lastAt < LIVE_POLL_MIN_MS) return;
+  LIVE.busy = true;
+  LIVE.lastAt = now;
+  try {
+    // 未选设备时也查一次：板端可能正在推流、却还没上传过 IMU 周期数据（下拉里暂时没有它）
+    const q = state.current ? '?device_id=' + encodeURIComponent(state.current) : '';
+    let st = await apiGet('/api/v1/live' + q);
+    if (LIVE.device !== (st.device_id || '')) {
+      LIVE.lastSeq = -1;
+      LIVE.device = st.device_id || '';
+    }
+
+    let dev = st.device_id || '';
+    if (!dev) {
+      const hot = (st.devices || []).find((d) => d.active) ||
+                  (st.devices || [])[0] || null;
+      if (!hot) {
+        renderLiveOff();
+        if ($.liveInfo) $.liveInfo.textContent = '· 暂无设备推流';
+        return;
+      }
+      dev = hot.device_id;
+      st = await apiGet('/api/v1/live?device_id=' + encodeURIComponent(dev));
+      if (LIVE.device !== dev) {
+        LIVE.lastSeq = -1;
+        LIVE.device = dev;
+      }
+    }
+
+    if ($.liveTimeoutS && st.timeout_s) $.liveTimeoutS.textContent = String(st.timeout_s);
+    if ($.liveInfo) $.liveInfo.textContent = '· ' + dev;
+
+    const meta = liveMetaText(st, dev);
+    if (!st.seq) {      // 该设备从未推过流（服务端内存里没有它的帧）
+      renderLiveOff('—（' + dev + ' 尚未推流：请在板端长按 Button A 2 s 开启）',
+                    meta, '未推流');
+      return;
+    }
+
+    if (st.seq !== LIVE.lastSeq) {
+      LIVE.lastSeq = st.seq;
+      // 服务端已带 Cache-Control: no-store；seq 兜底避免浏览器复用上一帧
+      img.src = '/api/v1/live/frame?device_id=' + encodeURIComponent(dev) +
+                '&seq=' + st.seq + '&t=' + now;
+    }
+    img.classList.remove('hidden');
+    if ($.liveOff) $.liveOff.classList.add('hidden');
+    if ($.liveMeta) $.liveMeta.textContent = meta;
+    if ($.liveBadge) {
+      $.liveBadge.className = 'badge ' + (st.active ? 'ok' : 'warn');
+      $.liveBadge.textContent = st.active
+        ? ('推流中 · ' + (st.width ?? '?') + '×' + (st.height ?? '?'))
+        : '已停止（保留最后一帧）';
+    }
+  } catch (e) {
+    renderLiveOff('—（直播状态查询失败：' + e.message + '）', '—', '查询失败');
+  } finally {
+    LIVE.busy = false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  实时拍照（kind=camera 任务 + 照片画廊）
+ *
+ *  链路：点「拍一张照片」→ POST /api/v1/tasks {kind:"camera"} →
+ *  板端 ≤3 s 轮询领取 → 拍一帧 640×480 JPEG 原样 POST /api/v1/photos →
+ *  服务端落盘 + 入库并在同一事务里把任务置 completed。
+ *  画廊数据来自 GET /api/v1/photos?device_id=…&limit=12（新的在前），
+ *  每张照片的缩略图直接用 GET /api/v1/photos/{id}，删除走
+ *  DELETE /api/v1/photos/{id}（服务端同时删库行与磁盘文件）。
+ * ------------------------------------------------------------------ */
+
+/** 点击「拍一张照片」：建 kind=camera 任务 → 跟踪任务 → 终态后画廊自动刷新 */
+async function capturePhoto() {
+  if (!state.current) {
+    renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
+    return null;
+  }
+  if ($.photoStatus) $.photoStatus.textContent = '已下发拍照任务，等待板端领取…';
+  if ($.photoBadge) {
+    $.photoBadge.className = 'badge warn';
+    $.photoBadge.textContent = '等待板端';
+  }
+  const task = await createTask('camera');
+  if (!task) {
+    if ($.photoStatus) $.photoStatus.textContent = '—';
+    if ($.photoBadge) {
+      $.photoBadge.className = 'badge off';
+      $.photoBadge.textContent = '空闲';
+    }
+    return null;
+  }
+  if ($.photoStatus) {
+    $.photoStatus.textContent = '任务 ' + shortRid(task.request_id) +
+      ' 已下发（板端 ≤3 s 轮询领取，拍好即上传）';
+  }
+  return task;
+}
+
+/** 画廊：拉该设备最近 PHOTO_LIMIT 张照片并渲染（失败只在卡片内提示，不影响主面板） */
+async function refreshGallery() {
+  const grid = $.photoGrid;
+  if (!grid) return;
+  if (!state.current) {
+    grid.innerHTML = '<div class="photo-empty">—（请先选择设备）</div>';
+    if ($.photoInfo) $.photoInfo.textContent = '· 未选择设备';
+    return;
+  }
+  let data;
+  try {
+    data = await apiGet('/api/v1/photos?device_id=' + encodeURIComponent(state.current) +
+                        '&limit=' + PHOTO_LIMIT);
+  } catch (e) {
+    grid.innerHTML = '<div class="photo-empty">—（照片列表查询失败：' + e.message + '）</div>';
+    return;
+  }
+  const list = (data && data.photos) || [];
+  if ($.photoInfo) {
+    $.photoInfo.textContent = '· ' + state.current + ' · 共 ' + (data.total ?? 0) +
+      ' 张（显示最近 ' + list.length + ' 张）';
+  }
+  if ($.photoBadge) {
+    $.photoBadge.className = 'badge ' + (list.length ? 'ok' : 'off');
+    $.photoBadge.textContent = list.length ? (list.length + ' 张') : '暂无照片';
+  }
+  if (!list.length) {
+    grid.innerHTML = '<div class="photo-empty">—（该设备还没有照片，点「拍一张照片」触发板端拍摄）</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const p of list) frag.appendChild(photoCard(p));
+  grid.innerHTML = '';
+  grid.appendChild(frag);
+}
+
+/** 单张照片卡片：缩略图（点击看原图）+ 元数据 + 原图/删除按钮 */
+function photoCard(p) {
+  const url = p.url || ('/api/v1/photos/' + p.id);
+  const wrap = document.createElement('div');
+  wrap.className = 'photo-card';
+  wrap.dataset.photoId = p.id;
+
+  const img = document.createElement('img');
+  // 服务端已带 Cache-Control: no-store；加时间戳兜底，避免删后重建同 id 时命中浏览器缓存
+  img.src = url + '?t=' + Date.now();
+  img.alt = 'photo #' + p.id;
+  img.title = '点击查看原图';
+  img.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+
+  const meta = document.createElement('div');
+  meta.className = 'photo-meta';
+  meta.innerHTML =
+    '<b>#' + p.id + '</b> · ' + (p.size_kb ?? '—') + ' KB · ' +
+    (p.width ?? '?') + '×' + (p.height ?? '?') + '<br>' +
+    '接收 ' + (p.received_at_str || '—') + '<br>' +
+    (p.request_id ? '任务 ' + shortRid(p.request_id) : '来源：直接上传（无任务号）') +
+    (p.note ? '<br>备注：' + p.note : '');
+
+  const actions = document.createElement('div');
+  actions.className = 'photo-actions';
+  const openBtn = document.createElement('button');
+  openBtn.type = 'button';
+  openBtn.textContent = '原图';
+  openBtn.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.textContent = '删除';
+  delBtn.title = 'DELETE /api/v1/photos/' + p.id + '（同时删除数据库记录与磁盘 JPEG）';
+  delBtn.addEventListener('click', () => deletePhoto(p.id));
+  actions.appendChild(openBtn);
+  actions.appendChild(delBtn);
+
+  wrap.appendChild(img);
+  wrap.appendChild(meta);
+  wrap.appendChild(actions);
+  return wrap;
+}
+
+/** 删除一张照片：确认 → DELETE → 重新拉画廊（无论成功失败都重拉，避免界面与库不一致） */
+async function deletePhoto(photoId) {
+  const ok = window.confirm('确定删除照片 #' + photoId +
+                            '？服务端会同时删除数据库记录与磁盘 JPEG 文件，不可恢复。');
+  if (!ok) return;
+  try {
+    const res = await apiDelete('/api/v1/photos/' + photoId);
+    renderStatus('已删除照片 #' + photoId +
+                 (res && res.file_deleted === false ? '（磁盘文件此前已不存在）' : ''),
+                 'info');
+  } catch (e) {
+    renderStatus('⚠ 删除照片 #' + photoId + ' 失败：' + e.message, 'error');
+  }
+  refreshGallery();
+}
+
 /** /api/v1/latest 现在带回 trigger / request_id，回填到数据卡片 */
 function renderTrace(latest) {
   const up = (latest && latest.upload) || {};
@@ -983,6 +1299,7 @@ function renderTrace(latest) {
 $.captureBtn.addEventListener('click', () => captureOnce());
 $.pauseBtn.addEventListener('click', () => pausePeriodic());
 $.resumeBtn.addEventListener('click', () => resumePeriodic());
+$.photoBtn.addEventListener('click', () => capturePhoto());
 
 // 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
@@ -994,6 +1311,7 @@ $.deviceSel.addEventListener('change', () => {
 $.captureBtn.disabled = false;
 $.pauseBtn.disabled = false;
 $.resumeBtn.disabled = false;
+$.photoBtn.disabled = false;
 syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source=/&pause= 覆盖表单初值
 refreshSidePanels();
 
@@ -1003,6 +1321,11 @@ try {
   const params = new URLSearchParams(window.location.search);
   if (params.get('autocapture') === '1') {
     setTimeout(captureOnce, 1200);
+  }
+  // ?autophoto=1：打开页面即触发一次拍照（等价于点「拍一张照片」），
+  // 用于自动核对「建 camera 任务 → 板端拍照上传 → 画廊出现新照片」这条链路。
+  if (params.get('autophoto') === '1') {
+    setTimeout(capturePhoto, 1200);
   }
   // ?autopause=1[&pause=90]：打开页面即触发一次「暂停周期」（等价于点按钮），
   // 用于自动核对「建 pause 任务 → 板端 applied → device_control 置停止中」这条链路。

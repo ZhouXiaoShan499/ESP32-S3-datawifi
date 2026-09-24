@@ -24,6 +24,7 @@ build_log.txt
 
 # ---- Web/server runtime artifacts ----
 server/data/
+server/photos/
 server/__pycache__/
 __pycache__/
 *.db

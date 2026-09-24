@@ -33,6 +33,23 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
   （/api/v1/upload、/api/v1/tasks/next、/tasks/{id}/ack、/tasks/{id}/fail）在设置了 SENSOR_TOKEN
   时才要求 Bearer Token。
 
+实时拍照（kind=camera）—— 对应 Web 上「拍一张照片」按钮：
+  * Web 侧：POST /api/v1/tasks {kind:"camera"} 创建任务 → 轮询任务详情 → 刷新画廊
+  * 板端侧：领到 camera 任务后拍一帧 JPEG，POST /api/v1/photos?device_id=…&request_id=… 上传
+  * 服务端：图片原样落盘 server/photos/<device_id>/<photo_id>.jpg，元数据进 photos 表，
+    并在同一事务里把任务置 completed（幂等：同一 request_id 重复上传不会重复存图）
+  查询/管理接口：GET /api/v1/photos（列表）· GET /api/v1/photos/{id}（JPEG 字节）
+  · DELETE /api/v1/photos/{id}（删库行 + 删文件）。
+
+摄像头实时直播（live camera）—— 对应板端长按 Button A 的「实时画面」：
+  * 板端侧：长按 Button A 开启后，live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」
+    （约 1-2 fps，body 即 JPEG 字节，带 device_id/ts_ms/w/h 查询参数），再长按一次停止。
+  * 服务端：**只在内存里保留每台设备的最新一帧**（不落盘、不进 photos 表、不建任务），
+    Web 侧 GET /api/v1/live 看状态、GET /api/v1/live/frame 取最新一帧 JPEG，
+    <img> 按 seq 轮询即形成实时画面。直播是连续流，刻意不做逐帧 ACK/幂等：
+    丢一帧下一帧立刻补上，服务端重启/板端断网只是画面停在最后一帧（active=false）。
+  超过 LIVE_TIMEOUT_S 没有新帧即视为「已停止推流」（板端被按键停止 / 断网 / 掉电）。
+
 运行（本地电脑）：
   python server/main.py          # 默认 http://127.0.0.1:8000
 可用环境变量覆盖：SENSOR_HOST / SENSOR_PORT / SENSOR_DB / SENSOR_TOKEN
@@ -49,8 +66,8 @@ import time
 import uuid
 from datetime import datetime
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
@@ -101,16 +118,19 @@ TASK_STATUS_CN = {
 }
 # 任务类型 kind（Web 三个按钮共用同一套任务链路与状态机）：
 #   capture = 按需采集一批数据（「采集一次最新数据」），靠带 request_id 的上传收尾；
+#   camera  = 按需拍一帧 JPEG（「拍一张照片」），靠带 request_id 的照片上传收尾；
 #   pause   = 暂停板端周期上报（「暂停周期」）；
 #   resume  = 提前恢复周期上报（「恢复周期」）。
 # pause/resume 不产生观测数据，无法靠 upload 收尾，改由板端确认「已生效」的
 # POST /api/v1/tasks/{id}/applied 收尾（完成后同事务写 device_control）。
 TASK_KIND_CAPTURE = "capture"
+TASK_KIND_CAMERA = "camera"
 TASK_KIND_PAUSE = "pause"
 TASK_KIND_RESUME = "resume"
-TASK_KINDS = (TASK_KIND_CAPTURE, TASK_KIND_PAUSE, TASK_KIND_RESUME)
+TASK_KINDS = (TASK_KIND_CAPTURE, TASK_KIND_CAMERA, TASK_KIND_PAUSE, TASK_KIND_RESUME)
 TASK_KIND_CN = {
     TASK_KIND_CAPTURE: "按需采集",
+    TASK_KIND_CAMERA: "实时拍照",
     TASK_KIND_PAUSE: "暂停周期上报",
     TASK_KIND_RESUME: "恢复周期上报",
 }
@@ -120,8 +140,33 @@ TASK_CONTROL_KINDS = (TASK_KIND_PAUSE, TASK_KIND_RESUME)
 PAUSE_DEFAULT_S = 120
 PAUSE_MIN_S, PAUSE_MAX_S = 5, 600
 
+# 实时拍照（kind=camera）：板端拍一帧 JPEG 后 POST /api/v1/photos（body 即 JPEG 字节）。
+# 图片按 device_id 分目录落盘（server/photos/<device_id>/<photo_id>.jpg），
+# 元数据进 photos 表；带 request_id 时在同一事务里把 camera 任务置 completed，
+# 与「上传样本收尾采集任务」完全同一哲学（store_upload）。
+PHOTO_DIR = os.environ.get("SENSOR_PHOTO_DIR") or os.path.join(_BASE_DIR, "photos")
+MAX_PHOTO_BYTES = 512 * 1024          # 单张 JPEG 上限 512 KiB（640x480 约 20-60 KB）
+PHOTO_DEFAULT_LIMIT = 20              # GET /api/v1/photos 默认返回张数
+PHOTO_MAX_LIMIT = 200
+PHOTO_JPEG_MAGIC = b"\xff\xd8\xff"    # JPEG SOI + 首个 marker，用于拒绝非图片 body
+PHOTO_MAX_NOTE_LEN = 200
+PHOTO_ID_RE = re.compile(r"^\d{1,18}$")
+
 # request_id 允许的字符集（uuid4().hex 天然满足，也兼容自定 id）
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+
+# 摄像头实时直播（板端长按 Button A 开启）：
+#   板端循环 POST /api/v1/live（body 即 JPEG 字节）→ 服务端只在内存里保留每台设备的
+#   「最新一帧」，供 Web「摄像头实时画面」卡片按 seq 轮询取图（<img> 即实时画面）。
+#   刻意不落盘、不进 photos 表、不产生任务：直播是连续流，逐帧 ACK/幂等只会拖慢节拍。
+LIVE_TIMEOUT_S = float(os.environ.get("SENSOR_LIVE_TIMEOUT_S", "5"))   # 无新帧超过该秒数 = 已停止
+LIVE_MAX_FRAME_BYTES = MAX_PHOTO_BYTES          # 单帧上限沿用拍照（512 KiB）
+LIVE_JPEG_MAGIC = PHOTO_JPEG_MAGIC              # 同样用 JPEG SOI 拒绝非图片 body
+LIVE_DEFAULT_FPS = 2.0                          # 板端 LIVE_FRAME_INTERVAL_MS=500 的名义帧率
+_live_lock = threading.Lock()
+# device_id -> {"jpeg": bytes, "width":…, "height":…, "ts_ms":…, "received_at":…, "seq":…, "ip":…}
+_live_frames = {}
+_live_seq = 0                                   # 全局单调帧序号（Web 侧用它判断“有新帧了”）
 
 app = FastAPI(
     title="ESP32-S3 IMU Sensor Receiver",
@@ -276,6 +321,25 @@ def init_db():
                     updated_at      REAL,
                     PRIMARY KEY (device_id, source)
                 );
+                -- 实时拍照：一行 = 一张 JPEG 文件（path 是相对 server/ 的路径）。
+                -- 图片字节不进库（BLOB 会让备份/查询变重），只存元数据 + 路径。
+                CREATE TABLE IF NOT EXISTS photos (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id   TEXT NOT NULL,
+                    request_id  TEXT,             -- 来自 kind=camera 任务（手动拍照才有）
+                    ts_ms       INTEGER,          -- 板端拍摄时刻(epoch ms)
+                    received_at REAL NOT NULL,    -- 服务端入库时间(epoch s)
+                    bytes       INTEGER NOT NULL,
+                    width       INTEGER,
+                    height      INTEGER,
+                    ip          TEXT,
+                    path        TEXT NOT NULL,    -- 相对 _BASE_DIR 的 jpg 路径
+                    note        TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_photos_device_time
+                    ON photos (device_id, received_at);
+                CREATE INDEX IF NOT EXISTS idx_photos_request
+                    ON photos (request_id);
                 """
             )
             _migrate_uploads_columns(conn)
@@ -375,6 +439,80 @@ def validate_payload(payload):
         "samples": cleaned,
         "request_id": request_id,
         "trigger": trigger,
+    }
+
+
+def validate_photo_payload(payload):
+    """校验 POST /api/v1/photos 的参数，返回 (ok, data|error_message)。
+
+    payload 是「查询参数 + body」拼出来的 dict：
+      device_id(必填) / request_id(可选) / ts_ms(可选) / width,height(可选)
+      / note(可选) / jpeg(body 原始字节) / ip。
+    """
+    if not isinstance(payload, dict):
+        return False, "payload must be a mapping"
+
+    device_id = payload.get("device_id")
+    if not isinstance(device_id, str) or not device_id.strip():
+        return False, "missing or empty 'device_id'"
+    device_id = device_id.strip()
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+
+    jpeg = payload.get("jpeg")
+    if not isinstance(jpeg, (bytes, bytearray)) or len(jpeg) < 4:
+        return False, "empty request body (expected raw JPEG bytes)"
+    if len(jpeg) > MAX_PHOTO_BYTES:
+        return False, (f"photo too large ({len(jpeg)} > {MAX_PHOTO_BYTES} bytes)")
+    # 只接受 JPEG：服务端按 .jpg 落盘并原样回吐给 <img>，非图片 body 一律拒绝
+    if bytes(jpeg[:len(PHOTO_JPEG_MAGIC)]) != PHOTO_JPEG_MAGIC:
+        return False, "body is not a JPEG image (expected SOI marker FF D8 FF)"
+
+    request_id = payload.get("request_id")
+    if request_id is not None:
+        if not isinstance(request_id, str) or not REQUEST_ID_RE.match(request_id.strip()):
+            return False, "invalid 'request_id'"
+        request_id = request_id.strip() or None
+
+    raw_ts = payload.get("ts_ms")
+    if raw_ts in (None, ""):
+        ts_ms = None
+    else:
+        try:
+            ts_ms = int(raw_ts)
+        except (TypeError, ValueError):
+            return False, "invalid 'ts_ms'"
+        if ts_ms < 0:
+            return False, "invalid 'ts_ms'"
+
+    dims = {}
+    for name in ("width", "height"):
+        raw = payload.get(name)
+        if raw in (None, ""):
+            dims[name] = None
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return False, f"invalid '{name}'"
+        if value <= 0 or value > 8192:
+            return False, f"invalid '{name}' (expect 1-8192)"
+        dims[name] = value
+
+    note = payload.get("note")
+    if note is not None and not isinstance(note, str):
+        return False, "invalid 'note'"
+    note = (note or "").strip()[:PHOTO_MAX_NOTE_LEN] or None
+
+    return True, {
+        "device_id": device_id,
+        "request_id": request_id,
+        "ts_ms": ts_ms,
+        "width": dims["width"],
+        "height": dims["height"],
+        "note": note,
+        "jpeg": bytes(jpeg),
+        "ip": payload.get("ip"),
     }
 
 
@@ -534,6 +672,105 @@ def store_upload(data, ip=None):
         return upload_id, False
     except sqlite3.Error:
         conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 实时拍照（JPEG）— 与 store_upload 同一哲学：图片落盘 + 元数据入库 + 任务收尾
+# ---------------------------------------------------------------------------
+def _safe_device_dir(device_id):
+    """device_id → 文件系统安全的目录名（path traversal 防护）。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", device_id or "")
+    safe = safe.strip("._") or "unknown"
+    return safe[:MAX_DEVICE_ID_LEN]
+
+
+def _photo_rel_path(device_id, photo_id):
+    """照片文件相对 PHOTO_DIR 的路径（存进 photos.path，换机器也能读）。"""
+    return os.path.join(_safe_device_dir(device_id), f"{photo_id}.jpg")
+
+
+def _photo_view(row):
+    """photos 行 → 对外结构（附可读时间、KB 与取图 URL）。"""
+    photo = dict(row)
+    photo["received_at_str"] = _fmt_time(photo.get("received_at"))
+    photo["ts_ms_str"] = _fmt_epoch_ms(photo["ts_ms"]) if photo.get("ts_ms") else None
+    photo["size_kb"] = round((photo.get("bytes") or 0) / 1024.0, 1)
+    photo["url"] = f"/api/v1/photos/{photo['id']}"
+    return photo
+
+
+def store_photo(data):
+    """一个事务内写 photos 行 + 落盘 JPEG；带 request_id 时联动 camera 任务收尾。
+
+    data 由 validate_photo_payload() 产出（含已读进内存的 jpeg 字节）。
+    返回 (photo_id, idempotent)。幂等规则与 store_upload 一致：同一 request_id
+    已入库时不再写第二行、第二个文件 —— 板端重试/重复点击不会产生重复照片。
+
+    文件先写 xxx.jpg.part 再 os.replace() 原子改名：进程被杀/断电不会留下
+    半张 JPEG 被当成完整照片。
+    """
+    request_id = data.get("request_id")
+    conn = _connect()
+    abs_path = None
+    try:
+        if request_id:
+            row = conn.execute(
+                "SELECT id FROM photos WHERE request_id=? ORDER BY id LIMIT 1",
+                (request_id,),
+            ).fetchone()
+            if row is not None:
+                conn.rollback()      # 未写任何行，回滚只是保险
+                return row["id"], True
+
+        received_at = time.time()
+        cur = conn.execute(
+            "INSERT INTO photos (device_id, request_id, ts_ms, received_at, bytes,"
+            " width, height, ip, path, note) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                data["device_id"],
+                request_id,
+                data["ts_ms"],
+                received_at,
+                len(data["jpeg"]),
+                data["width"],
+                data["height"],
+                data.get("ip"),
+                "",                      # 真实路径依赖自增 id，写完文件再回填
+                data.get("note"),
+            ),
+        )
+        photo_id = cur.lastrowid
+        rel_path = _photo_rel_path(data["device_id"], photo_id)
+        abs_path = os.path.join(PHOTO_DIR, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        tmp_path = abs_path + ".part"
+        with open(tmp_path, "wb") as fh:
+            fh.write(data["jpeg"])
+        os.replace(tmp_path, abs_path)
+        conn.execute("UPDATE photos SET path=? WHERE id=?", (rel_path, photo_id))
+
+        if request_id:
+            # 任务收尾与图片入库同一事务：要么都成功，要么都不写，
+            # 不会出现「任务已完成但没有照片」或反之（与 store_upload 相同）。
+            conn.execute(
+                "UPDATE tasks SET status='completed', completed_at=?, error=NULL"
+                " WHERE request_id=?",
+                (received_at, request_id),
+            )
+        conn.commit()
+        return photo_id, False
+    except (sqlite3.Error, OSError):
+        conn.rollback()
+        if abs_path:
+            for path in (abs_path, abs_path + ".part"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass          # 清理失败不应掩盖原始错误
         raise
     finally:
         conn.close()
@@ -733,6 +970,62 @@ def _check_task_match(request_id, data):
         conn.close()
 
 
+def _check_photo_task_match(request_id, data):
+    """校验带 request_id 的照片是否属于该 camera 任务；不匹配则把任务置 failed。
+
+    返回 None 表示校验通过；否则返回应当发给板端的错误响应（4xx → 板端不重试）。
+    与 _check_task_match 的区别：只认 kind='camera'（采集任务必须靠样本收尾，
+    照片不能替它收尾，否则会出现「任务完成但一个样本都没有」的假完成），
+    并且不校验样本数/单位，只看 device_id 归属。
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return JSONResponse(
+                status_code=404,
+                content={"code": "TASK_NOT_FOUND", "ok": False,
+                         "error": f"unknown request_id: {request_id}"},
+            )
+        task = dict(row)
+        kind = task.get("kind") or TASK_KIND_CAPTURE
+        if kind != TASK_KIND_CAMERA:
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "WRONG_KIND", "ok": False,
+                         "error": (f"request_id {request_id} belongs to a '{kind}'"
+                                   " task, not a 'camera' task"),
+                         "request_id": request_id},
+            )
+        problems = []
+        if task["device_id"] != data["device_id"]:
+            problems.append(
+                f"device_id mismatch (task={task['device_id']},"
+                f" photo={data['device_id']})"
+            )
+        if problems:
+            message = "; ".join(problems)
+            conn.execute(
+                "UPDATE tasks SET status='failed', completed_at=?, error=?"
+                " WHERE request_id=? AND status NOT IN ('completed','failed','timeout')",
+                (time.time(), message, request_id),
+            )
+            conn.commit()
+            return JSONResponse(
+                status_code=400,
+                content={"code": "INVALID", "ok": False, "error": message,
+                         "request_id": request_id},
+            )
+        conn.commit()
+        return None
+    finally:
+        conn.close()
+
+
 @app.post("/api/v1/upload")
 async def upload(request: Request):
     """接收开发板上传的传感数据批次（periodic 周期上报 / manual 按需采集）。"""
@@ -795,6 +1088,442 @@ async def upload(request: Request):
             "idempotent": idempotent,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 实时拍照路由（POST 上传 / 列表 / 取图 / 删除）
+#
+# 板端 = GET /api/v1/tasks/next 领到 kind=camera 任务后拍一帧 JPEG，
+# 再 POST /api/v1/photos?device_id=…&request_id=… 上传；服务端在同一事务里
+# 落盘 + 入库 + 把任务置 completed（幂等：同一 request_id 重复上传不重复存）。
+# 注意：/api/v1/photos/{photo_id} 与 /api/v1/tasks/{request_id} 不同前缀，
+# 无路由顺序问题。
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/photos")
+async def upload_photo(request: Request):
+    """接收板端拍摄的一帧 JPEG（body 即图片字节，Content-Type: image/jpeg）。
+
+    查询参数：device_id(必填) · request_id(camera 任务号, 可选) ·
+    ts_ms(板端拍摄时刻 epoch ms) · w / h(尺寸) · note(备注)。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    raw = await request.body()
+    if len(raw) > MAX_PHOTO_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"code": "TOO_LARGE", "ok": False,
+                     "error": f"photo too large (max {MAX_PHOTO_BYTES} bytes)"},
+        )
+
+    qp = request.query_params
+    params = {
+        "device_id": qp.get("device_id"),
+        "request_id": qp.get("request_id"),
+        "ts_ms": qp.get("ts_ms"),
+        "width": qp.get("w"),
+        "height": qp.get("h"),
+        "note": qp.get("note"),
+        "jpeg": raw,
+        "ip": request.client.host if request.client else None,
+    }
+    ok, result = validate_photo_payload(params)
+    if not ok:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": result},
+        )
+
+    request_id = result.get("request_id")
+    if request_id:
+        # 带任务号的照片先校验归属；不匹配则把任务置 failed 并返回 4xx（板端不重试）
+        mismatch = _check_photo_task_match(request_id, result)
+        if mismatch is not None:
+            return mismatch
+
+    try:
+        photo_id, idempotent = store_photo(result)
+    except (sqlite3.Error, OSError) as e:
+        return JSONResponse(
+            status_code=500,
+            content={"code": "STORE_ERROR", "ok": False,
+                     "error": f"store photo failed: {e}"},
+        )
+
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+    finally:
+        conn.close()
+    return JSONResponse(
+        status_code=200 if idempotent else 201,
+        content={
+            "code": "OK",
+            "ok": True,
+            "photo_id": photo_id,
+            "device_id": result["device_id"],
+            "request_id": request_id,
+            "bytes": len(result["jpeg"]),
+            "idempotent": idempotent,
+            "photo": _photo_view(row),
+        },
+    )
+
+
+@app.get("/api/v1/photos")
+def list_photos(request: Request):
+    """照片列表（新的在前）。
+
+    ?device_id=（可选，按设备过滤）· ?limit=（可选，默认 20，范围 1-200）
+    返回 photos 元数据数组（含 url，Web 画廊直接用它做 <img src>）。
+    """
+    qp = request.query_params
+    device_id = (qp.get("device_id") or "").strip()
+    raw_limit = qp.get("limit")
+    try:
+        limit = int(raw_limit) if raw_limit not in (None, "") else PHOTO_DEFAULT_LIMIT
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": "invalid 'limit'"},
+        )
+    if limit < 1 or limit > PHOTO_MAX_LIMIT:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"invalid 'limit' (expect 1-{PHOTO_MAX_LIMIT})"},
+        )
+
+    conn = _connect()
+    try:
+        where, args = "", []
+        if device_id:
+            where, args = " WHERE device_id=?", [device_id]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM photos" + where, args
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT * FROM photos" + where + " ORDER BY id DESC LIMIT ?",
+            args + [limit],
+        ).fetchall()
+    finally:
+        conn.close()
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "count": len(rows), "total": total,
+                 "device_id": device_id or None,
+                 "photos": [_photo_view(r) for r in rows]},
+    )
+
+
+@app.get("/api/v1/photos/{photo_id}")
+def get_photo(photo_id: str):
+    """取一张照片的 JPEG 字节（Web 画廊的 <img src> 直接指向本接口）。
+
+    photo_id 非法/不存在 → 404；库里有行但文件被手工删掉 → 410
+    （meta 仍在，便于发现磁盘异常，而不是伪装成 404 说照片不存在）。
+    """
+    if not PHOTO_ID_RE.match(photo_id or ""):
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown photo id: {photo_id}"},
+        )
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM photos WHERE id=?", (int(photo_id),)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown photo id: {photo_id}"},
+        )
+    abs_path = os.path.join(PHOTO_DIR, row["path"])
+    if not os.path.isfile(abs_path):
+        return JSONResponse(
+            status_code=410,
+            content={"code": "FILE_MISSING", "ok": False,
+                     "error": f"photo {photo_id} metadata exists but the JPEG file"
+                              " is missing on disk",
+                     "photo": _photo_view(row)},
+        )
+    # no-store：画廊里点删除后必须立刻看不到旧图（与 /ui 的轮询口径一致）
+    return FileResponse(abs_path, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/v1/photos/{photo_id}")
+def delete_photo(photo_id: str):
+    """删除一张照片：先删库行（提交事务）再删磁盘文件。
+
+    文件已丢失不算失败（file_deleted=False），因为「库里没有这张照片了」
+    才是用户看到的结果。重复删除同一个 id 返回 404：该照片确实已不存在。
+    """
+    if not PHOTO_ID_RE.match(photo_id or ""):
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown photo id: {photo_id}"},
+        )
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM photos WHERE id=?", (int(photo_id),)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "ok": False,
+                         "error": f"unknown photo id: {photo_id} (already deleted?)"},
+            )
+        photo = _photo_view(row)
+        conn.execute("DELETE FROM photos WHERE id=?", (int(photo_id),))
+        conn.commit()
+    except sqlite3.Error as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content={"code": "DB_ERROR", "ok": False,
+                     "error": f"delete photo failed: {e}"},
+        )
+    finally:
+        conn.close()
+
+    abs_path = os.path.join(PHOTO_DIR, row["path"])
+    file_deleted = False
+    warning = None
+    try:
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+            file_deleted = True
+    except OSError as e:
+        # 库行已删，文件残留只是磁盘垃圾：不返回错误，但要告诉调用方
+        warning = f"file not removed: {e}"
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "deleted": True,
+                 "photo_id": int(photo_id), "file_deleted": file_deleted,
+                 "warning": warning, "photo": photo},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 摄像头实时直播路由（板端长按 Button A：内存态最新帧，不落盘 / 不入库 / 不建任务）
+#
+#   POST /api/v1/live       板端推一帧 JPEG（body 即图片字节，Content-Type: image/jpeg）
+#   GET  /api/v1/live       推流状态（active / seq / age_ms / 分辨率 / 已知设备列表）
+#   GET  /api/v1/live/frame 最新一帧 JPEG 字节（Web 的 <img src> 直接指向本接口）
+#
+# 与 /api/v1/photos 的区别：照片是「一次事件」，要入库、要幂等、要能删；
+# 直播是「连续流」，只保留最新一帧 —— 丢帧无所谓（下一帧 500 ms 后就到），
+# 因此这里刻意不写数据库（否则 1-2 fps × 多设备会瞬间把库和磁盘刷爆）。
+# ---------------------------------------------------------------------------
+def _live_entry_view(entry, now=None):
+    """内存帧 → 对外状态结构（active 由帧龄判定：超过 LIVE_TIMEOUT_S 视为已停止）。"""
+    if entry is None:
+        return None
+    now = time.time() if now is None else now
+    age = max(0.0, now - float(entry["received_at"]))
+    return {
+        "active": age <= LIVE_TIMEOUT_S,
+        "seq": entry["seq"],
+        "age_ms": int(round(age * 1000)),
+        "width": entry.get("width"),
+        "height": entry.get("height"),
+        "bytes": len(entry.get("jpeg") or b""),
+        "ts_ms": entry.get("ts_ms"),
+        "ts_ms_str": _fmt_epoch_ms(entry["ts_ms"]) if entry.get("ts_ms") else None,
+        "received_at": entry["received_at"],
+        "received_at_str": _fmt_time(entry["received_at"]),
+        "ip": entry.get("ip"),
+    }
+
+
+def _live_int_param(qp, name):
+    """可选整数查询参数：缺失/空 → None；非法 → 'INVALID'（调用方返回 400）。"""
+    value = qp.get(name)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return "INVALID"
+
+
+@app.post("/api/v1/live")
+async def upload_live_frame(request: Request):
+    """接收板端直播推流的一帧 JPEG，覆盖该设备在内存里的上一帧。
+
+    查询参数：device_id(必填) · ts_ms(板端拍摄时刻 epoch ms, 可选) ·
+    w / h(帧尺寸, 可选)。返回 201 + 全局单调 seq（Web 侧靠它判断「有新帧了」）。
+    不落盘、不写库：直播状态只活在服务端进程的内存里。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    raw = await request.body()
+    if len(raw) > LIVE_MAX_FRAME_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"code": "TOO_LARGE", "ok": False,
+                     "error": f"live frame too large (max {LIVE_MAX_FRAME_BYTES} bytes)"},
+        )
+
+    qp = request.query_params
+    device_id = (qp.get("device_id") or "").strip()
+    if not device_id:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "missing or empty 'device_id'"},
+        )
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+        )
+    if not raw:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "empty body (expect raw JPEG bytes)"},
+        )
+    if not raw.startswith(LIVE_JPEG_MAGIC):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "body is not a JPEG (expect SOI marker FF D8 FF)"},
+        )
+
+    ts_ms = _live_int_param(qp, "ts_ms")
+    width = _live_int_param(qp, "w")
+    height = _live_int_param(qp, "h")
+    if ts_ms == "INVALID" or width == "INVALID" or height == "INVALID":
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "ts_ms / w / h must be integers when present"},
+        )
+
+    global _live_seq
+    with _live_lock:
+        _live_seq += 1
+        _live_frames[device_id] = {
+            "jpeg": raw,
+            "width": width,
+            "height": height,
+            "ts_ms": int(ts_ms) if ts_ms else int(time.time() * 1000),
+            "received_at": time.time(),
+            "seq": _live_seq,
+            "ip": request.client.host if request.client else None,
+        }
+        seq = _live_seq
+        entry = dict(_live_frames[device_id])
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "code": "OK",
+            "ok": True,
+            "device_id": device_id,
+            "seq": seq,
+            "bytes": len(raw),
+            "received_at": entry["received_at"],
+            "received_at_str": _fmt_time(entry["received_at"]),
+        },
+    )
+
+
+@app.get("/api/v1/live")
+def live_status(request: Request):
+    """直播状态查询（Web 每轮轮询一次，决定是否刷新 <img> 与显示什么徽章）。
+
+    ?device_id=（可选）：指定设备时，顶层字段即该设备状态（从未推流 → active=false，
+    仍返回 200，页面据此显示「未推流」而不是报接口错误）。
+    无论是否指定设备，devices 总列出已知设备（新帧在前），便于页面/脚本排查多设备。
+    """
+    qp = request.query_params
+    device_id = (qp.get("device_id") or "").strip()
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+        )
+
+    now = time.time()
+    with _live_lock:
+        entries = {dev: dict(e) for dev, e in _live_frames.items()}
+
+    view = _live_entry_view(entries.get(device_id), now) if device_id else None
+    devices = []
+    for dev, entry in sorted(entries.items(),
+                             key=lambda kv: kv[1]["received_at"], reverse=True):
+        devices.append({"device_id": dev, **_live_entry_view(entry, now)})
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "code": "OK",
+            "ok": True,
+            "device_id": device_id or None,
+            "timeout_s": LIVE_TIMEOUT_S,
+            "nominal_fps": LIVE_DEFAULT_FPS,
+            "active": bool(view and view["active"]),
+            "seq": view["seq"] if view else None,
+            "age_ms": view["age_ms"] if view else None,
+            "width": view["width"] if view else None,
+            "height": view["height"] if view else None,
+            "bytes": view["bytes"] if view else None,
+            "ts_ms": view["ts_ms"] if view else None,
+            "ts_ms_str": view["ts_ms_str"] if view else None,
+            "received_at": view["received_at"] if view else None,
+            "received_at_str": view["received_at_str"] if view else None,
+            "ip": view["ip"] if view else None,
+            "devices": devices,
+        },
+    )
+
+
+@app.get("/api/v1/live/frame")
+def live_frame(request: Request):
+    """最新一帧 JPEG 字节（device_id 缺失/从未推流 → 400 / 404）。
+
+    no-store：画面每帧都要重新取，浏览器缓存会让「实时画面」冻住。
+    Web 侧额外带 &seq=（帧序号）做缓存兜底，服务端忽略该参数。
+    """
+    device_id = (request.query_params.get("device_id") or "").strip()
+    if not device_id:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "missing or empty 'device_id'"},
+        )
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+        )
+
+    with _live_lock:
+        entry = _live_frames.get(device_id)
+        jpeg = entry["jpeg"] if entry else None
+    if not jpeg:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NO_FRAME", "ok": False,
+                     "error": f"no live frame received from '{device_id}' yet"},
+        )
+    return Response(content=jpeg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1740,16 @@ def get_task(request_id: str):
             if up is not None:
                 upload = dict(up)
                 upload["received_at_str"] = _fmt_time(up["received_at"])
+        # camera 任务没有 upload，但有照片：把最近一张带上，页面就能直接显示缩略图
+        photo = None
+        if row is not None:
+            ph = conn.execute(
+                "SELECT id, ts_ms, received_at, bytes, width, height, note"
+                " FROM photos WHERE request_id=? ORDER BY id DESC LIMIT 1",
+                (request_id,),
+            ).fetchone()
+            if ph is not None:
+                photo = _photo_view(ph)
         conn.commit()
     finally:
         conn.close()
@@ -1023,7 +1762,7 @@ def get_task(request_id: str):
         )
     return JSONResponse(status_code=200,
                         content={"ok": True, "task": _task_view(row),
-                                 "upload": upload})
+                                 "upload": upload, "photo": photo})
 
 
 @app.post("/api/v1/tasks/{request_id}/ack")
@@ -1300,6 +2039,13 @@ def health():
             task_rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
+            n_photos = conn.execute(
+                "SELECT COUNT(*) FROM photos"
+            ).fetchone()[0]
+            last_photo = conn.execute(
+                "SELECT id, device_id, ts_ms, received_at, bytes, width, height"
+                " FROM photos ORDER BY id DESC LIMIT 1"
+            ).fetchone()
             last = conn.execute(
                 "SELECT device_id, ts_ms, received_at, sample_count, source, unit"
                 " FROM uploads ORDER BY received_at DESC LIMIT 1"
@@ -1322,6 +2068,9 @@ def health():
             "received_at_str": _fmt_time(last["received_at"]),
             "sample_count": last["sample_count"],
         }
+    latest_photo = None
+    if last_photo:
+        latest_photo = _photo_view(last_photo)
     return JSONResponse(
         status_code=200,
         content={
@@ -1332,6 +2081,8 @@ def health():
             "devices": [r["device_id"] for r in dev_rows],
             "total_tasks": sum(r["n"] for r in task_rows),
             "tasks_by_status": {r["status"]: r["n"] for r in task_rows},
+            "total_photos": n_photos,
+            "latest_photo": latest_photo,
             "latest": latest,
         },
     )
@@ -1342,11 +2093,17 @@ def devices():
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT device_id, COUNT(*) AS uploads,"
-            " MAX(received_at) AS last_seen,"
-            " (SELECT COUNT(*) FROM tasks t WHERE t.device_id = u.device_id"
+            # 设备集合 = 上传过样本的设备 ∪ 拍过照片的设备（只有照片没样本的设备
+            # 也必须出现在下拉里，否则画廊里会看不到它自己的照片）。
+            "SELECT d.device_id AS device_id,"
+            " (SELECT COUNT(*) FROM uploads u WHERE u.device_id = d.device_id) AS uploads,"
+            " (SELECT MAX(u.received_at) FROM uploads u WHERE u.device_id = d.device_id)"
+            "  AS last_seen,"
+            " (SELECT COUNT(*) FROM photos p WHERE p.device_id = d.device_id) AS photos,"
+            " (SELECT COUNT(*) FROM tasks t WHERE t.device_id = d.device_id"
             "  AND t.status NOT IN ('completed','failed','timeout')) AS pending_tasks"
-            " FROM uploads u GROUP BY device_id ORDER BY device_id"
+            " FROM (SELECT device_id FROM uploads UNION SELECT device_id FROM photos) d"
+            " ORDER BY d.device_id"
         ).fetchall()
         # 暂停状态真相源：device_control 里到点的行先惰性归零，避免页面显示过期状态
         paused = _paused_devices(conn)
@@ -1360,6 +2117,7 @@ def devices():
                 {
                     "device_id": r["device_id"],
                     "uploads": r["uploads"],
+                    "photos": r["photos"],
                     "last_seen": _fmt_time(r["last_seen"]),
                     "pending_tasks": r["pending_tasks"],
                     "periodic_paused": r["device_id"] in paused,
