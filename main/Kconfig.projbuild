@@ -20,6 +20,80 @@ menu "Project WiFi Configuration"
 
 endmenu
 
+menu "Time (SNTP) Configuration"
+
+    config SNTP_SERVER
+        string "SNTP/NTP server (hostname or IP)"
+        default "pool.ntp.org"
+        help
+            NTP server used to set the board clock. May be a hostname (resolved
+            again on every request, so it also works when the network comes up
+            long after boot) or a literal IP address (works even if DNS in the
+            LAN is broken).
+
+            The board syncs in the background and retries forever with backoff
+            (5 s -> 60 s), so an offline boot is no longer fatal: once the
+            network is up the clock is corrected without a reboot. Until a sync
+            succeeds the LCD shows "-- (up HH:MM:SS)" instead of a date.
+
+            Set via "idf.py menuconfig" or by editing the local "sdkconfig"
+            file (git-ignored, NOT committed). Keep the placeholder value for
+            any committed config.
+
+endmenu
+
+menu "Static IP Fallback (subnets where DHCP never answers)"
+
+    config USE_STATIC_IP_FALLBACK
+        bool "Fall back to a static IP when DHCP never hands out a lease"
+        default n
+        help
+            On this lab's subnet the DHCP server stopped answering: the board
+            associates (L2) but never receives an OFFER, so it has no IP, SNTP
+            can never sync and the LCD keeps showing "Time: -- (up HH:MM:SS)"
+            with "NTP:--". Neither DHCP-client restarts nor re-association can
+            fix that from the firmware side.
+
+            When enabled, wifi_health_check() still gives DHCP its full chance
+            (3 client restarts + one forced re-association, ~100 s). If there is
+            still no lease it stops the DHCP client, applies the fixed address
+            below and marks the board connected - the code path is the same as
+            for a normal lease (esp_netif_set_ip_info() posts GOT_IP itself).
+            The address stays until reboot; it is re-applied automatically after
+            a re-connect because lwIP clears the IP when the link drops.
+
+            Set the four values below in the local sdkconfig (git-ignored) to
+            addresses that are free on your subnet, and keep the placeholder
+            values in this committed Kconfig default.
+
+    config STATIC_IP_ADDR
+        string "Static IPv4 address"
+        default "192.168.4.200"
+        help
+            Address to apply when DHCP does not answer for ~100 s. Must not be
+            in use by another host on that segment (nothing may answer its ARP).
+
+    config STATIC_IP_NETMASK
+        string "Static IPv4 netmask"
+        default "255.255.255.0"
+
+    config STATIC_IP_GATEWAY
+        string "Static IPv4 gateway"
+        default "192.168.4.1"
+        help
+            Router of that subnet, so the board can reach the NTP server and the
+            PC-side FastAPI receiver.
+
+    config STATIC_IP_DNS
+        string "Static DNS server"
+        default "223.5.5.5"
+        help
+            Explicit DNS is required: when DHCP is dead there is no DNS server
+            either, so SNTP could not resolve CONFIG_SNTP_SERVER. Ignore this by
+            putting a literal IP into CONFIG_SNTP_SERVER instead.
+
+endmenu
+
 menu "Real-Sensor Upload Configuration"
 
     config SENSOR_DEVICE_ID

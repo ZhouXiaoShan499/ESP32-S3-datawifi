@@ -33,3 +33,75 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # Reserve 32 KiB internal for DMA-only users: i2c links, SDMMC, esp_timer.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# ---- Camera: OV2640 on the DVP interface, JPEG 640x480 (esp_video) ----
+# sdkconfig is gitignored, so the sensor selection MUST live here: without
+# CONFIG_CAMERA_OV2640 esp_video finds no sensor at runtime ("sensor not found")
+# and every photo task fails. JPEG is mandatory because the Web gallery stores
+# the raw JPEG bytes (no encoding on the board).
+CONFIG_ESP_VIDEO_ENABLE_DVP_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_CHECK_PARAMETERS=y
+CONFIG_CAMERA_OV2640=y
+# Auto-detect the sensor on the DVP interface at esp_video_init() time.
+CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
+# Enable the JPEG VGA format AND make it the sensor default, so VIDIOC_G_FMT
+# already reports JPEG 640x480 (the DVP device rejects S_FMT size mismatches).
+CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS=y
+CONFIG_CAMERA_OV2640_DVP_DEFAULT_FMT_JPEG_640X480_25FPS=y
+
+# ---- I2C: one bus (BSP port 1, GPIO4/5, 400 kHz), one driver ----
+# The IMU moved to driver/i2c_master.h so it can share the bus with the camera
+# SCCB. The legacy driver (driver/i2c.h) is no longer used, but IDF's legacy
+# conflict constructor aborts the boot whenever it is *linked* together with the
+# new driver (components/driver/i2c/i2c.c: check_i2c_driver_conflict -> abort()).
+# No port is driven by both drivers here, so skipping the check is safe and it
+# removes a boot-time abort that cannot be diagnosed from the field.
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ---- WiFi / DHCP: 现场「关联成功但永远拿不到 IP」的修复 ----
+# 现象：串口日志停在 "wifi:AP's beacon interval = ..."，既没有 Got IP 也没有
+# DISCONNECTED 事件，板子没有 IP、局域网里 ARP 也查不到它。
+# 根因：LWIP 拿到 DHCP 地址后会先做地址冲突探测（IDF 5.4 用 choice
+# LWIP_DHCP_CHECKS_OFFERED_ADDRESS 三选一：ARP_CHECK 默认 / ACD_CHECK(RFC5227) /
+# NOT_CHECK_OFFERED_IP）。只要网段里有设备或陈旧 ARP 应答该地址，客户端就静默
+# 丢弃租约并无限重来 —— 永远拿不到 IP。
+# 这里选「不探测」，直接绑定 DHCP 服务器分配的地址。
+# 注意：不能写 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n，choice 成员必须靠选中另一个
+# 成员来切换，否则 CMake 会打印 "Trying to set symbol ... to n, but it is
+# currently selected by choice ..." 并把设置丢掉。
+CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
+# 默认主机名 "espressif" 会让同一局域网里所有 ESP 板子重名（本网段实测有 3 台
+# 94:a9:90:* 设备），部分路由器/DHCP 会因此拒绝/复用租约。
+CONFIG_LWIP_LOCAL_HOSTNAME="esp32s3-eye-0001"
+
+# ---- Flash 容量：板子是 8 MB，工程里之前写成 2 MB ----
+# 不修的话每次启动都打印
+#   W spi_flash: Detected size(8192k) larger than the size in the binary image header(2048k)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
+# ---- SNTP 对时：服务器地址进 Kconfig，现场可改（不必改代码重编） ----
+# 板子开机后在 sntp_sync_task 里后台对时：只在拿到 IP 后才发请求，失败退避重试
+# （5 s 翻倍到 60 s 上限，永不放弃），成功即刷新 LCD 的 Time 字段。
+# 所以「开机时没网」不再等于「时间永远不对」：网络恢复后会自动补上，不用重启。
+# 可以填域名（每次请求都会重新解析）或直接填 IP（网内 DNS 坏掉时依然能对时）。
+CONFIG_SNTP_SERVER="pool.ntp.org"
+
+# ---- 静态 IP 兜底：网段里根本没有 DHCP 服务时 ----
+# 现场实测（server/dhcp_probe.py）10.1.41.0/24 收不到任何 DHCP OFFER：
+# 任何新接入的客户端都拿不到 IP，固件侧的 DHCP 重启/重关联注定失败。
+# 打开后 wifi_health_check() 会给 DHCP 完整窗口（3 次重启客户端 + 1 次强制重关联，
+# 约 100 s），确认没救才停掉 DHCP 客户端套固定地址，让 SNTP 至少能对时。
+#
+# 这四项是「现场值」，按仓库惯例只放在本地 sdkconfig（已被 .gitignore 忽略），
+# 这里只留占位说明：菜单 idf.py menuconfig → "Static IP Fallback (subnets where
+# DHCP never answers)"。COMMIT 时保持下面四行注释状态即可。
+#
+# CONFIG_USE_STATIC_IP_FALLBACK=y
+# CONFIG_STATIC_IP_ADDR="192.168.4.200"
+# CONFIG_STATIC_IP_NETMASK="255.255.255.0"
+# CONFIG_STATIC_IP_GATEWAY="192.168.4.1"
+# CONFIG_STATIC_IP_DNS="223.5.5.5"
+#
+# 注意：DNS 必须显式设置，DHCP 死掉时拿不到 DNS 服务器；否则只能把
+# CONFIG_SNTP_SERVER 直接填成 IP 才能对时。

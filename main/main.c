@@ -8,6 +8,10 @@
  *  - Real-sensor upload: every 1 s batches the m/s² accelerometer samples
  *    as JSON and POSTs them to a local FastAPI receiver via esp_http_client
  *  - Button A start/stop SD card CSV logging (from data_capture_sim)
+ *  - Button A long press (2s): camera live streaming — captures a JPEG every
+ *    ~500 ms and POSTs it to /api/v1/live, where the server keeps only the
+ *    latest frame per device in memory for the Web "摄像头实时画面" card
+ *    (~1-2 fps); long press again to stop.
  *  - LVGL real-time display (from data_capture_sim)
  *  - 6-face calibration mode: +X, -X, +Y, -Y, +Z, -Z, 10s each
  *
@@ -24,6 +28,10 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -44,8 +52,13 @@
 #include "cJSON.h"
 #include "esp_http_client.h"
 #include "nvs_flash.h"
-#include "qma6100p.h"
 #include "sdmmc_cmd.h"
+/* Shared BSP I2C bus (IMU + camera SCCB) - the NEW driver, never driver/i2c.h */
+#include "driver/i2c_master.h"
+/* esp_video V4L2 user-space API: /dev/videoX ioctl + structs */
+#include "linux/videodev2.h"
+#include "esp_video_device.h"
+#include "esp_video_ioctl.h"     /* VIDIOC_S_DQBUF_TIMEOUT 等私有 ioctl */
 #include <stdlib.h>
 #include "freertos/queue.h"
 
@@ -88,6 +101,29 @@
 #define TASK_APPLIED_RETRY_MAX   2        /* applied 回执重试次数（每 3 s 一轮询） */
 #define TASK_HTTP_TIMEOUT_MS     5000
 #define TASK_RESP_BUF_LEN        2048     /* /tasks/next 响应缓冲 */
+
+/* 实时拍照任务（kind=camera）config。
+ * Web 点「拍一张照片」→ 建 camera 任务 → 本板拍一帧 JPEG → POST /api/v1/photos，
+ * 服务端在同一事务里存图并把任务置 completed。不占用采样器、不暂停周期上报。 */
+#define PHOTO_API_PATH           "/api/v1/photos"
+#define PHOTO_HTTP_TIMEOUT_MS    20000    /* 一帧 JPEG（数十 KB）上传上限 */
+#define PHOTO_RESP_BUF_LEN       512      /* 只看状态码，响应体只收一小段 */
+#define CAMERA_BUFFER_COUNT      2        /* V4L2 mmap 缓冲数（PSRAM） */
+#define CAMERA_FRAME_SKIP_MAX    8        /* 跳过坏帧（V4L2_BUF_FLAG_ERROR）上限 */
+#define CAMERA_DQBUF_TIMEOUT_MS  3000     /* 单帧等待上限（VIDIOC_S_DQBUF_TIMEOUT） */
+#define CAMERA_LOCK_TIMEOUT_MS   5000     /* 等相机锁上限（直播 vs 单帧拍照串行化） */
+
+/* 摄像头实时直播（长按 Button A 切换）config。
+ * 开启后 live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」，
+ * 服务端只在内存里保留每台设备的最新一帧（不落盘、不入 photos 表），
+ * Web 页「摄像头实时画面」卡片按 seq 轮询取图，形成 ~1-2 fps 的实时画面。
+ * 再长按一次停止；不占用采样器、不暂停周期上报，与按需单帧拍照共用相机（加锁串行）。 */
+#define LIVE_API_PATH            "/api/v1/live"
+#define LIVE_FRAME_INTERVAL_MS   500      /* 帧间最小间隔（Wi-Fi 下实际约 1-2 fps） */
+#define LIVE_HTTP_TIMEOUT_MS     8000     /* 单帧上传上限（比单帧拍照短，避免拖慢节拍） */
+#define LIVE_FAIL_LIMIT          5        /* 连续失败上限 → 自动停止推流并记日志 */
+#define LIVE_TASK_STACK          8192     /* HTTP + 一帧 JPEG 拷贝 + LVGL 刷新 */
+#define LIVE_TASK_PRIORITY       2        /* 低于 sampler(5)/uploader(4)/task_poll(3) */
 
 /* Device identity / server URL come from Kconfig (see Kconfig.projbuild).
  * Fallbacks keep the code compiling if the config header is stale. */
@@ -157,7 +193,34 @@
    或编辑项目根目录的 sdkconfig 后重新编译（保持占位符即可安全提交）。 */
 #define WIFI_SSID                CONFIG_WIFI_SSID
 #define WIFI_PASSWORD            CONFIG_WIFI_PASSWORD
+/* NTP 服务器同样来自 Kconfig（CONFIG_SNTP_SERVER，默认 pool.ntp.org）。
+ * 可填域名（lwIP 每次请求都会重新解析，见 sntp.c: sntp_request()）或直接填 IP
+ * （网内 DNS 坏掉时直接填 IP 也能对时）。设置方法：idf.py menuconfig →
+ * "Time (SNTP) Configuration"，或编辑本地 sdkconfig。 */
+#define SNTP_SERVER              CONFIG_SNTP_SERVER
+/* 启动阶段等待联网的上限（WiFi 关联 + DHCP 拿到地址）。超过这个时间也继续启动，
+ * 不能让 DHCP 卡住整个 app_main()——否则 SD/IMU/相机/按键/HTTP 服务全都起不来，
+ * 板子表现为「串口没有任何后续日志、网页全废」。见 wifi_init_sta() / wifi_health_check()。 */
+#define WIFI_CONNECT_TIMEOUT_MS    20000
+/* 关联连续失败超过这个次数后，把重连节奏交给 wifi_health_check()（每 5 s 一次），
+ * 只是「不再立刻重连」，永远不会放弃。 */
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5
+
+/* 静态 IP 兜底（Kconfig: "Static IP Fallback"）。
+ * 现场实测的形态：板子关联成功、但网段里 DHCP 完全不应答 → 永远没有租约 → 没有 IP
+ * → SNTP 连域名都解析不了 → LCD 永远 "-- (up …)"。DHCP 重启/重关联都救不了，
+ * 只能改用固定地址。打开后 wifi_health_check() 先给 DHCP 完整的窗口（3 次重启
+ * DHCP 客户端 + 1 次强制重关联），确认没救才停掉 DHCP 客户端套固定地址。
+ * STATIC_IP_GIVEUP_LIMIT 是「DHCP gave no lease」出现这么多次（每次约 45~60 s）之后
+ * 才放弃；它故意与开关无关地定义——wifi_health_check() 里的判断是运行期 if（不是 #if），
+ * 关掉开关时不定义就会编译不过（`STATIC_IP_FALLBACK_ENABLED && x >= …` 仍然要解析
+ * 标识符，哪怕左边是常量 0）。 */
+#define STATIC_IP_GIVEUP_LIMIT      2
+#if CONFIG_USE_STATIC_IP_FALLBACK
+#define STATIC_IP_FALLBACK_ENABLED  1
+#else
+#define STATIC_IP_FALLBACK_ENABLED  0
+#endif
 
 #define WIFI_CONNECTED_BIT       BIT0
 #define WIFI_FAIL_BIT            BIT1
@@ -165,8 +228,8 @@
 /* Accelerometer config */
 #define ACCEL_FILTER_ALPHA       0.18f
 
-/* I2C port number for legacy driver (used by qma6100p library) */
-#define QMA6100P_I2C_PORT        (i2c_port_t)CONFIG_BSP_I2C_NUM
+/* I2C：IMU 与相机传感器共用 BSP 总线（CONFIG_BSP_I2C_NUM / GPIO4-5 / 400 kHz），
+   统一走新驱动 driver/i2c_master.h；旧的 QMA6100P_I2C_PORT（legacy 驱动）已移除。 */
 
 static const char *TAG = "imu_logger";
 
@@ -228,12 +291,35 @@ static char s_status_text[UI_TEXT_LEN];
 static char s_file_path[FILE_PATH_LEN];
 static char s_time_str[64];
 
+/* 摄像头实时直播（长按 Button A 切换，见「实时直播」一节）：
+ * 状态在 UI / 按键回调 / 推流任务之间共享，故放在全局状态里；
+ * 推流任务由长按按键按需创建、结束时自删，任务句柄不外传。 */
+static volatile bool s_live_streaming = false;    /* 正在推流？ */
+static volatile uint32_t s_live_frames = 0;       /* 本次推流已成功上传的帧数 */
+static volatile int s_live_last_status = 0;       /* 最近一帧的 HTTP 状态（0 = 网络层失败） */
+
 /* WiFi event group */
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
 
-/* Accelerometer handle */
-static qma6100p_handle_t s_accel = NULL;
+/* WiFi 状态必须分成两层来跟踪：
+ *   s_wifi_link_up  = L2 已关联 AP
+ *   s_wifi_connected= L3 已拿到 IP（DHCP 成功）
+ * 只用 s_wifi_connected 会漏掉「关联成功但 DHCP 一直没发下地址」这种故障：
+ * 那种情况下 GOT_IP 和 DISCONNECTED 两个事件都不来，旧实现用 portMAX_DELAY
+ * 死等就再也醒不过来。详细分析见 docs/wifi_network_troubleshooting.md。 */
+static esp_netif_t *s_sta_netif;            /* 保留句柄：DHCP 卡住时重启客户端 */
+static volatile bool s_wifi_link_up;        /* 已关联 AP（L2） */
+static volatile int64_t s_link_up_us;       /* 本次关联的时刻，用于判断 DHCP 是否卡住 */
+static int s_dhcp_restart_count;            /* 同一条链路下已重启 DHCP 客户端的次数 */
+static int s_dhcp_giveup_count;             /* 已判定「DHCP 没发租约」并强制重关联的次数 */
+static bool s_static_ip_armed;              /* DHCP 已判定没救：改用固定地址（Kconfig 开关） */
+#if STATIC_IP_FALLBACK_ENABLED
+static bool s_static_ip_warned;             /* Kconfig 里的静态地址非法时只报错一次 */
+#endif
+
+/* Accelerometer handle (new I2C master driver, shared BSP bus) */
+static i2c_master_dev_handle_t s_accel = NULL;
 
 /* Accelerometer low-pass filter state (reset per capture session) */
 static float s_filter_x = 0, s_filter_y = 0, s_filter_z = 0;
@@ -385,6 +471,10 @@ static FILE *s_fall_data_file = NULL;                /* Current group data file 
 
 /* Forward declaration */
 static void refresh_ui(void);
+/* 摄像头实时直播（长按 Button A 切换）：实现在「实时直播」一节，
+ * 按键回调放在 Button 一节，因此这里先声明。 */
+static void live_streaming_toggle(void);
+static void button_a_long_press_cb(void *arg, void *data);
 
 /* ================================================================
  *  Utility
@@ -409,6 +499,12 @@ static void refresh_ui(void)
     bool freq_valid = false;
     float measured_freq = 0.0f;
 
+    /* 网络 / 对时状态：现场诊断用（以前 LCD 上完全没有联网信息，只能接串口） */
+    bool wifi_link = false;
+    bool time_synced = false;
+    bool have_ip = false;
+    char net_buf[24];
+
     /* Do not touch LVGL objects before they are created */
     if (!s_ui_ready) {
         return;
@@ -432,6 +528,8 @@ static void refresh_ui(void)
     snprintf(time_buf, sizeof(time_buf), "%s", s_time_str);
     freq_valid = s_freq_valid;
     measured_freq = s_measured_freq_hz;
+    wifi_link = s_wifi_link_up;
+    time_synced = s_time_synced;
     
     /* Ensure s_face_name is valid before copying */
     if (s_face_name[0] != '\0') {
@@ -442,18 +540,50 @@ static void refresh_ui(void)
 
     xSemaphoreGive(s_state_mutex);
 
+    /* 网络层 token（状态行右侧）：现场不接串口也能看出卡在哪一层。
+     *   --    = 未关联 AP
+     *   assoc = 已关联但一直没有 IP（DHCP 没发租约 —— 本网段实测到的故障）
+     *   10.x  = 有 IP（DHCP 租约或静态 IP 兜底），SNTP 才有机会成功 */
+    esp_netif_ip_info_t ip_info = {0};
+    if (s_sta_netif != NULL &&
+        esp_netif_get_ip_info(s_sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+        have_ip = true;
+    }
+    if (!wifi_link) {
+        snprintf(net_buf, sizeof(net_buf), "--");
+    } else if (!have_ip) {
+        snprintf(net_buf, sizeof(net_buf), "assoc");
+    } else {
+        snprintf(net_buf, sizeof(net_buf), IPSTR, IP2STR(&ip_info.ip));
+    }
+
     if (!bsp_display_lock(0)) {
         return;
     }
 
-    /* State display */
+    /* State display：直播中显示推流帧数（长按 Button A 开关，见「实时直播」一节）；
+     * 右侧固定带网络 token，见上面 net_buf 的说明。 */
     if (s_state_label) {
-        lv_label_set_text(s_state_label, collecting ? "Collecting" : "Idle");
+        if (s_live_streaming) {
+            lv_label_set_text_fmt(s_state_label, "LIVE %" PRIu32 " fr  NET:%s",
+                                  s_live_frames, net_buf);
+        } else {
+            lv_label_set_text_fmt(s_state_label, "%s  NET:%s",
+                                  collecting ? "Collecting" : "Idle", net_buf);
+        }
     }
     
     /* Time display */
     if (s_time_display) {
-        lv_label_set_text_fmt(s_time_display, "Time: %s", time_buf);
+        if (time_synced) {
+            /* 有日期本身就是「对时成功」的证据，不再加 token 占宽度 */
+            lv_label_set_text_fmt(s_time_display, "Time: %s", time_buf);
+        } else {
+            /* NTP:--  = 还没有 IP，SNTP 连请求都发不出去；
+             * NTP:try = 有 IP、正在退避重试（等网段的 DNS/NTP 可达） */
+            lv_label_set_text_fmt(s_time_display, "Time: %s NTP:%s",
+                                  time_buf, have_ip ? "try" : "--");
+        }
     }
     
     /* Acceleration axes - each on separate line (values in mm/s^2, integer) */
@@ -478,9 +608,11 @@ static void refresh_ui(void)
     /* Frequency display */
     if (s_mode_label) {
         if (freq_valid) {
-            int32_t freq_d1 = (int32_t)(measured_freq * 10);  /* Hz * 10 for integer display (0.1 Hz precision) */
-            lv_label_set_text_fmt(s_mode_label, "Freq: %" PRId32 " Hz (Target: %d Hz)", 
-                                  freq_d1, TARGET_SAMPLE_FREQ_HZ);
+            int32_t freq_d1 = (int32_t)(measured_freq * 10);  /* Hz * 10 → 整数存储，0.1 Hz 精度 */
+            /* 只印 "Freq: 100.6 Hz"：240 px 宽的屏上 "(Target: 100 Hz)" 会被切掉，
+             * 而「是否达标」由底部状态栏的 100Hz:OK/ERR 负责说明。 */
+            lv_label_set_text_fmt(s_mode_label, "Freq: %" PRId32 ".%" PRId32 " Hz",
+                                  freq_d1 / 10, freq_d1 % 10);
         } else {
             lv_label_set_text(s_mode_label, collecting ? "Mode: RUN" : "Mode: STOP");
         }
@@ -519,7 +651,15 @@ static void refresh_ui(void)
             } else if (s_stand_protocol_active) {
                 snprintf(status_buf, sizeof(status_buf), "%s", s_stand_display);
             } else {
-                snprintf(status_buf, sizeof(status_buf), "IDLE");
+                /* 没有协议在跑时，这一行显示最后一条 set_status_locked() 状态
+                 * （"WiFi: waiting for IP" / "Time synced" / "SD card ready" …）。
+                 * 这些文本以前只写不读：LCD 上看不到任何联网/启动信息，现场只能靠
+                 * 串口判断。没有状态文本时退回 "IDLE"。 */
+                /* 这里只拷前 63 字节：s_status_text 比这一行宽（UI_TEXT_LEN），
+                 * 用 "%s" 会被 -Werror=format-truncation 拦下。状态行本来就只有
+                 * 一行的宽度，截断是预期行为。 */
+                snprintf(status_buf, sizeof(status_buf), "%.63s",
+                         s_status_text[0] ? s_status_text : "IDLE");
             }
             xSemaphoreGive(s_state_mutex);
         } else {
@@ -536,9 +676,13 @@ static void refresh_ui(void)
     } else {
         freq_status = "100Hz:--";
     }
-    lv_label_set_text_fmt(s_status_bar, "A:Stop  B(2s):Mode  SD:%s  %s",
-                          sd_ready ? "OK" : "---",
-                          freq_status);
+    /* 长按 Button A = 实时直播开关，状态打在状态栏上（不看 Web 页也能确认）。
+     * 240 px 宽只放得下诊断信息（SD / 采样频率 / 直播）；旧的
+     * "A:Stop A2s:Live:… B2s:Mode SD:…" 比一屏还长，后半截永远看不到，
+     * 而按键提示在 docs / 板面丝印上已有说明。 */
+    lv_label_set_text_fmt(s_status_bar, "SD:%s %s Live:%s",
+                          sd_ready ? "OK" : "---", freq_status,
+                          s_live_streaming ? "ON" : "OFF");
 
     bsp_display_unlock();
 }
@@ -563,59 +707,65 @@ static void create_ui(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_color(scr, lv_color_hex(0xE6E6E6), 0);
 
+    /* 10 行内容必须全部落在 240x240 的屏内（BSP: esp32_s3_eye）。
+     * 旧坐标最后两行在 y=230 / y=255：y=255 的底部状态栏整行在屏外、
+     * y=230 的协议行只剩半行 —— 现场「LCD 状态栏看不到」的根因就在坐标，
+     * 不在状态文本。现在按 22 px 行距重排，最底一行 y=210（底边 226）。 */
+
     /* Title */
     s_title_label = lv_label_create(scr);
     lv_label_set_text(s_title_label, "IMU Time Logger");
     lv_obj_set_style_text_color(s_title_label, lv_color_hex(0x6EE7FF), 0);
-    lv_obj_align(s_title_label, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_align(s_title_label, LV_ALIGN_TOP_LEFT, 10, 6);
 
-    /* State */
+    /* State (+ NET token, filled in by refresh_ui) */
     s_state_label = lv_label_create(scr);
-    lv_obj_align(s_state_label, LV_ALIGN_TOP_LEFT, 10, 40);
+    lv_obj_align(s_state_label, LV_ALIGN_TOP_LEFT, 10, 28);
 
-    /* Time */
+    /* Time (+ NTP token while unsynced) */
     s_time_display = lv_label_create(scr);
-    lv_obj_align(s_time_display, LV_ALIGN_TOP_LEFT, 10, 65);
+    lv_obj_align(s_time_display, LV_ALIGN_TOP_LEFT, 10, 50);
 
     /* Acceleration axes - each on separate line */
     s_accel_x_label = lv_label_create(scr);
     lv_label_set_text(s_accel_x_label, "Accel X: 0.000 m/s²");
-    lv_obj_align(s_accel_x_label, LV_ALIGN_TOP_LEFT, 10, 100);
+    lv_obj_align(s_accel_x_label, LV_ALIGN_TOP_LEFT, 10, 75);
 
     s_accel_y_label = lv_label_create(scr);
     lv_label_set_text(s_accel_y_label, "Accel Y: 0.000 m/s²");
-    lv_obj_align(s_accel_y_label, LV_ALIGN_TOP_LEFT, 10, 125);
+    lv_obj_align(s_accel_y_label, LV_ALIGN_TOP_LEFT, 10, 97);
 
     s_accel_z_label = lv_label_create(scr);
     lv_label_set_text(s_accel_z_label, "Accel Z: 0.000 m/s²");
-    lv_obj_align(s_accel_z_label, LV_ALIGN_TOP_LEFT, 10, 150);
+    lv_obj_align(s_accel_z_label, LV_ALIGN_TOP_LEFT, 10, 119);
 
     /* Samples and mode */
     s_samples_label = lv_label_create(scr);
-    lv_obj_align(s_samples_label, LV_ALIGN_TOP_LEFT, 10, 185);
+    lv_obj_align(s_samples_label, LV_ALIGN_TOP_LEFT, 10, 144);
 
     s_mode_label = lv_label_create(scr);
-    lv_obj_align(s_mode_label, LV_ALIGN_TOP_LEFT, 140, 185);
+    lv_obj_align(s_mode_label, LV_ALIGN_TOP_LEFT, 140, 144);
 
     /* Face display for calibration */
     s_face_label = lv_label_create(scr);
     lv_label_set_text(s_face_label, "Face: IDLE");
-    lv_obj_align(s_face_label, LV_ALIGN_TOP_LEFT, 10, 210);
+    lv_obj_align(s_face_label, LV_ALIGN_TOP_LEFT, 10, 166);
 
     /* Acceleration magnitude display for calibration verification */
     s_accel_mag_label = lv_label_create(scr);
     lv_label_set_text(s_accel_mag_label, "Mag: --.- m/s^2");
-    lv_obj_align(s_accel_mag_label, LV_ALIGN_TOP_LEFT, 140, 210);
+    lv_obj_align(s_accel_mag_label, LV_ALIGN_TOP_LEFT, 140, 166);
 
-    /* Stand/Stairs protocol progress display */
+    /* Stand/Stairs protocol progress display
+     * (idle → last set_status_locked() message, see refresh_ui) */
     s_stand_label_ui = lv_label_create(scr);
-    lv_label_set_text(s_stand_label_ui, "Mode: IDLE");
+    lv_label_set_text(s_stand_label_ui, "IDLE");
     lv_obj_set_style_text_color(s_stand_label_ui, lv_color_hex(0xFFD700), 0);
-    lv_obj_align(s_stand_label_ui, LV_ALIGN_TOP_LEFT, 10, 230);
+    lv_obj_align(s_stand_label_ui, LV_ALIGN_TOP_LEFT, 10, 188);
 
     /* Status bar at bottom */
     s_status_bar = lv_label_create(scr);
-    lv_obj_align(s_status_bar, LV_ALIGN_TOP_LEFT, 10, 255);
+    lv_obj_align(s_status_bar, LV_ALIGN_TOP_LEFT, 10, 210);
 
     bsp_display_unlock();
 
@@ -630,8 +780,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        /* L2 关联成功，接下来等 DHCP 分配地址。这里把「关联」单独记下来，
+         * wifi_health_check() 才能发现「关联上了却一直拿不到 IP」。 */
+        s_wifi_link_up = true;
+        s_link_up_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "WiFi associated (waiting for DHCP lease)");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         /* Update WiFi status immediately so UI reflects disconnect */
+        s_wifi_link_up = false;
+        s_link_up_us = 0;
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             s_wifi_connected = false;
             set_status_locked("WiFi disconnected");
@@ -640,20 +799,42 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         /* Do NOT call refresh_ui() here — this runs in the esp_event task (stack ~4KB),
          * while lv_label_set_text_fmt() needs much more stack. The sampler_task
          * (runs every 10ms) will pick up the state change automatically. */
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+        s_retry_num++;
+        if (s_retry_num <= EXAMPLE_ESP_MAXIMUM_RETRY) {
+            /* 前几次立刻重连：恢复得快，和 IDF 例程一致 */
             esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying WiFi connection... (%d/%d)", s_retry_num, EXAMPLE_ESP_MAXIMUM_RETRY);
+            ESP_LOGI(TAG, "Retrying WiFi connection... (%d/%d) reason=%d",
+                     s_retry_num, EXAMPLE_ESP_MAXIMUM_RETRY, disc ? disc->reason : -1);
         } else {
+            /* 超过上限也绝不放弃：这里只降噪 + 解除启动阶段的等待，
+             * 之后由 sampler_task 里的 wifi_health_check() 每 5 s 继续重连。
+             * （旧实现在这里直接停手，一次几秒的抖动就变成永久离线，只能重启板子。） */
+            if (s_retry_num == EXAMPLE_ESP_MAXIMUM_RETRY + 1 || (s_retry_num % 10) == 0) {
+                ESP_LOGW(TAG, "WiFi still down after %d attempts (reason=%d) - background retry every 5 s",
+                         s_retry_num, disc ? disc->reason : -1);
+            }
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-        ESP_LOGI(TAG, "WiFi disconnected");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        s_dhcp_restart_count = 0;
+        s_dhcp_giveup_count = 0;
+        /* 关键修复：GOT_IP 之后必须把联网标志恢复回来。旧实现只在 wifi_init_sta()
+         * 里置过一次 true，于是任何一次断连（哪怕几秒后重连成功）都会让周期上传、
+         * 网页任务轮询、直播推流永久停摆，而日志却显示 WiFi 已经连上。 */
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            s_wifi_connected = true;
+            s_wifi_link_up = true;
+            set_status_locked("WiFi connected");
+            xSemaphoreGive(s_state_mutex);
+        }
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         log_heap("after wifi got ip");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        s_wifi_connected = false;
+        ESP_LOGW(TAG, "WiFi lost IP (DHCP lease lost) - waiting for a new lease");
     }
 }
 
@@ -662,7 +843,8 @@ static void wifi_init_sta(void)
     s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    /* 保存句柄：DHCP 卡住时要靠它重启 DHCP 客户端（见 wifi_health_check()） */
+    s_sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -673,6 +855,12 @@ static void wifi_init_sta(void)
                                                         NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL, NULL));
+    /* 租约丢失（路由器换 IP / DHCP 过期）也要反映到状态里，否则板子会一直
+     * 以为自己在网，上传却全部超时。 */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_LOST_IP,
                                                         &wifi_event_handler,
                                                         NULL, NULL));
 
@@ -687,11 +875,21 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* 关掉 modem sleep：本项目是持续取样 + 周期上传 + 500 ms 推流，
+     * 省电没有意义；而默认的 WIFI_PS_MIN_MODEM 会让 RTT 抖动到 200 ms 以上
+     * （同网段另一块 ESP32 实测 ping 225~256 ms），正在推流的连接更容易超时。 */
+    esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "WiFi power save: WIFI_PS_NONE (%s)", esp_err_to_name(ps_ret));
+
     ESP_LOGI(TAG, "Connecting to WiFi: %s", WIFI_SSID);
 
+    /* 有上限的等待：如果 DHCP 一直不发地址，也必须让 SD/IMU/相机/按键/HTTP 服务
+     * 和各个任务继续启动（板子至少离线可用），联网由 wifi_health_check() 在后台救。
+     * 旧实现在这里用 portMAX_DELAY 死等，于是「关联成功但拿不到 IP」直接把整个
+     * app_main() 卡死，现场表现就是串口再也没有日志、网页和相机完全没反应。 */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE, pdFALSE, portMAX_DELAY);
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected: %s", WIFI_SSID);
@@ -701,129 +899,321 @@ static void wifi_init_sta(void)
             xSemaphoreGive(s_state_mutex);
         }
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "WiFi failed: %s", WIFI_SSID);
+        ESP_LOGE(TAG, "WiFi failed: %s (background retry keeps running)", WIFI_SSID);
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            s_wifi_connected = false;
+            set_status_locked("WiFi failed - retrying");
+            xSemaphoreGive(s_state_mutex);
+        }
+    } else {
+        /* 超时：实测最常见的形态是「已经关联上、但 DHCP 一直没发租约」 */
+        esp_netif_ip_info_t ip_info = {0};
+        if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip_info) == ESP_OK) {
+            ESP_LOGW(TAG, "WiFi: no IP after %d s (link_up=%d ip=" IPSTR
+                          ") - booting offline, DHCP recovery runs in background",
+                     WIFI_CONNECT_TIMEOUT_MS / 1000, (int)s_wifi_link_up, IP2STR(&ip_info.ip));
+        } else {
+            ESP_LOGW(TAG, "WiFi: no IP after %d s (link_up=%d) - booting offline, "
+                          "DHCP recovery runs in background",
+                     WIFI_CONNECT_TIMEOUT_MS / 1000, (int)s_wifi_link_up);
+        }
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            s_wifi_connected = false;
+            set_status_locked("WiFi: waiting for IP");
+            xSemaphoreGive(s_state_mutex);
+        }
     }
 
     refresh_ui();
+}
+
+/* ================================================================
+ *  SNTP 对时（自动重试、非阻塞）
+ *
+ *  旧实现的三个问题（现场表现就是 LCD 的 Time: 永远停在 1970 / SNTP FAILED）：
+ *   1) 只在 app_main() 开机时同步一次。开机瞬间还没拿到 IP（DHCP 慢/没网）就会
+ *      失败，之后网络恢复也再不同步，只能重启 —— 而重启还是同样的顺序，永远失败。
+ *   2) 失败前死等 30×2 s：离线开机时整个启动流程被卡 60 s（SD/IMU/相机/HTTP
+ *      全部晚起），wifi_health_check() 又在 sampler_task 里，而 sampler_task 是
+ *      最后一个被创建的任务 → 自愈也被一起推迟。
+ *   3) 失败后把 s_time_str 写成固定的 "SNTP FAILED" 就再也不更新：现场无法区分
+ *      「板子还在跑、只是没对上时间」和「板子卡死了」。
+ *
+ *  现在：initialize_sntp() 只设时区 + 建任务后立刻返回；sntp_sync_task 在后台
+ *  「有 IP 才尝试 → 等 10 s → 失败就退避重试（5 s 翻倍，上限 60 s，永不放弃）
+ *   → 成功就刷新 LCD 时间并每 30 s 复查」。重试用 esp_netif_sntp_start()，它内部
+ *  是 sntp_stop() + sntp_init()，即真正重新解析域名并发一次新请求（否则
+ *  sntp_init() 在 PCB 已存在时会直接返回，不会再发请求）。
+ * ================================================================ */
+
+/* epoch 小于此值即视为「没同步」：未同步时 time() 是从 1970 起算的上电时长，
+ * 量级只有几十~几万秒。1600000000 = 2020-09-13，远小于任何真实的当前时间。 */
+#define SNTP_MIN_VALID_EPOCH_S   1600000000
+
+#define SNTP_SYNC_ATTEMPT_MS     10000    /* 单次尝试最多等 10 s */
+#define SNTP_RETRY_MIN_MS        5000     /* 首次失败后 5 s 重试 */
+#define SNTP_RETRY_MAX_MS        60000    /* 退避上限 60 s（一直重试，不放弃） */
+#define SNTP_RESYNC_CHECK_MS     30000    /* 已同步后的复查周期 */
+#define SNTP_TASK_STACK          4096
+#define SNTP_TASK_PRIO           4
+
+/* 把「当前时间」格式化成 LCD 「Time:」字段用的字符串：
+ *   已同步 → "2026-09-23 10:19:59"（北京时间，时区由 initialize_sntp() 设定）
+ *   未同步 → "-- (up 00:03:12)"（自启动以来的运行时间）
+ * 未同步时不写死一句话：字段每秒都在动，现场一眼就能判断「板子是活的、只是没
+ * 对上时间」，同时 uptime 也能直接看出期间有没有掉电重启。 */
+static void format_time_str(char *out, size_t out_len)
+{
+    time_t now = time(NULL);
+    if (now >= SNTP_MIN_VALID_EPOCH_S) {
+        struct tm timeinfo;
+        if (localtime_r(&now, &timeinfo) != NULL) {
+            strftime(out, out_len, "%Y-%m-%d %H:%M:%S", &timeinfo);
+            return;
+        }
+    }
+    uint64_t up_s = (uint64_t)(esp_timer_get_time() / 1000000);
+    snprintf(out, out_len, "-- (up %02u:%02u:%02u)",
+             (unsigned)(up_s / 3600), (unsigned)((up_s / 60) % 60),
+             (unsigned)(up_s % 60));
+}
+
+/* 刷新 s_time_str / s_time_synced（LCD 时间字段的唯一数据源，见 refresh_ui()）。
+ * 由采样循环每 1 s 调用一次 + SNTP 任务同步成功时调用；只在值变化时才写。 */
+static void refresh_time_str(void)
+{
+    char buf[64];
+    format_time_str(buf, sizeof(buf));
+    bool synced = (time(NULL) >= SNTP_MIN_VALID_EPOCH_S);
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+    if (strcmp(buf, s_time_str) != 0) {
+        snprintf(s_time_str, sizeof(s_time_str), "%s", buf);
+    }
+    s_time_synced = synced;
+    xSemaphoreGive(s_state_mutex);
 }
 
 static void time_sync_notification_cb(struct timeval *tv)
 {
-    ESP_LOGI(TAG, "SNTP time synchronized!");
+    /* 在 tcpip 线程里被回调：只打日志（系统时间已由 lwIP 设好，
+     * LCD/状态由 sntp_sync_task 负责刷新）。把同步到的时刻打进日志，
+     * 现场用串口就能确认板子时间对不对，不必去看网页。 */
+    char buf[64] = {0};
+    struct tm timeinfo;
+    time_t sec = tv ? (time_t)tv->tv_sec : time(NULL);
+    if (localtime_r(&sec, &timeinfo) != NULL) {
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    }
+    ESP_LOGI(TAG, "SNTP time synchronized: %s (UTC+8)", buf);
 }
 
+/* SNTP 同步任务：永不放弃地重试，成功后持续刷新 LCD 时间。
+ * 只在「有 IP」时发请求（没有 IP 时 DNS/NTP 都不可达，重试只是白费力气）。 */
+static void sntp_sync_task(void *arg)
+{
+    (void)arg;
+
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(SNTP_SERVER);
+    config.start = false;      /* 首次请求等本任务确认「有 IP」之后再发 */
+    config.sync_cb = time_sync_notification_cb;
+
+    bool inited = false;
+    int retry_ms = SNTP_RETRY_MIN_MS;
+
+    ESP_LOGI(TAG, "SNTP task started: server=%s, retry %d ms -> %d ms",
+             SNTP_SERVER, SNTP_RETRY_MIN_MS, SNTP_RETRY_MAX_MS);
+
+    while (true) {
+        /* 已同步：lwIP 会按 SNTP_UPDATE_DELAY(1 h) 自动再同步，这里只把时间刷到
+         * LCD 上，并低频复查（掉电/时钟被改时能及时发现并回到重试分支）。 */
+        if (time(NULL) >= SNTP_MIN_VALID_EPOCH_S) {
+            bool was_synced = false;
+            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                was_synced = s_time_synced;
+                xSemaphoreGive(s_state_mutex);
+            }
+            refresh_time_str();
+            if (!was_synced) {
+                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    set_status_locked("Time synced");
+                    xSemaphoreGive(s_state_mutex);
+                }
+                refresh_ui();      /* 同步成功：立刻把正确时间画到 LCD 上 */
+            }
+            retry_ms = SNTP_RETRY_MIN_MS;
+            vTaskDelay(pdMS_TO_TICKS(SNTP_RESYNC_CHECK_MS));
+            continue;
+        }
+
+        /* 未同步：先等 Wi-Fi 拿到 IP（DHCP 成功），否则 SNTP 连域名都解析不了 */
+        if (!s_wifi_connected || !s_wifi_link_up) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (!inited) {
+            esp_err_t err = esp_netif_sntp_init(&config);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "esp_netif_sntp_init failed: %s - retry in %d ms",
+                         esp_err_to_name(err), SNTP_RETRY_MIN_MS);
+                vTaskDelay(pdMS_TO_TICKS(SNTP_RETRY_MIN_MS));
+                continue;
+            }
+            inited = true;
+        } else {
+            /* 显式重启客户端 = sntp_stop() + sntp_init()：立刻重新解析域名并发出
+             * 一次真正的新请求（lwIP 自己的重试节奏是 15 s 且不可观测）。 */
+            esp_netif_sntp_start();
+        }
+
+        esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(SNTP_SYNC_ATTEMPT_MS));
+        if (err == ESP_OK || time(NULL) >= SNTP_MIN_VALID_EPOCH_S) {
+            continue;   /* 下一轮循环开头统一刷新 LCD / 状态文本 */
+        }
+
+        ESP_LOGW(TAG, "SNTP no sync yet (%s) - next try in %d ms (link_up=%d ip=%d)",
+                 esp_err_to_name(err), retry_ms, (int)s_wifi_link_up,
+                 (int)s_wifi_connected);
+        vTaskDelay(pdMS_TO_TICKS(retry_ms));
+        retry_ms = (retry_ms * 2 > SNTP_RETRY_MAX_MS) ? SNTP_RETRY_MAX_MS : retry_ms * 2;
+    }
+}
+
+/* 只做「设时区 + 起后台对时任务」，不阻塞。
+ * 旧实现（死等 30×2 s + 只尝试一次）是「板子开机后 LCD 时间永远不对」的直接原因：
+ * 离线/慢 DHCP 开机时它既浪费 60 s 启动时间、又注定失败且不再重试。 */
 static void initialize_sntp(void)
 {
-    ESP_LOGI(TAG, "Initializing SNTP...");
+    /* 时区必须早于任何时间格式化：POSIX 的 TZ 符号与直觉相反，CST-8 = UTC+8 */
+    setenv("TZ", "CST-8", 1);
+    tzset();
 
+    /* 先把 LCD 的 Time 字段填上（未同步时是 uptime），保证开机就有内容 */
+    refresh_time_str();
     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        set_status_locked("Syncing time via SNTP...");
+        set_status_locked("Syncing time (SNTP)");
         xSemaphoreGive(s_state_mutex);
     }
     refresh_ui();
 
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    config.sync_cb = time_sync_notification_cb;
-    esp_netif_sntp_init(&config);
-    esp_netif_sntp_start();
-
-    time_t now = 0;
-    struct tm timeinfo = {0};
-    int retry = 0;
-    const int retry_count = 30;
-    while (esp_netif_sntp_sync_wait(2000 / portTICK_PERIOD_MS) == ESP_ERR_TIMEOUT && ++retry < retry_count) {
-        ESP_LOGI(TAG, "Waiting for time sync... (%d/%d)", retry, retry_count);
-        /* Update UI periodically so user sees progress */
-        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            set_status_locked("SNTP waiting... (%d/%d)", retry, retry_count);
-            xSemaphoreGive(s_state_mutex);
-        }
-        refresh_ui();
-    }
-
-    /* Set timezone to Beijing (UTC+8) */
-    setenv("TZ", "CST-8", 1);
-    tzset();
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    char strftime_buf[64];
-    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    ESP_LOGI(TAG, "Current time: %s", strftime_buf);
-
-    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        if (retry < retry_count) {
-            /* SNTP succeeded */
-            s_time_synced = true;
-            snprintf(s_time_str, sizeof(s_time_str), "%s", strftime_buf);
-            set_status_locked("Time synced");
-        } else {
-            /* SNTP failed after all retries */
-            s_time_synced = false;
-            snprintf(s_time_str, sizeof(s_time_str), "SNTP FAILED");
-            set_status_locked("SNTP timeout - time may be wrong");
-            ESP_LOGW(TAG, "SNTP time sync failed after %d retries", retry_count);
-        }
-        xSemaphoreGive(s_state_mutex);
-    }
+    ESP_LOGI(TAG, "Initializing SNTP (non-blocking): server=%s, first request waits for an IP",
+             SNTP_SERVER);
+    xTaskCreate(sntp_sync_task, "sntp_sync", SNTP_TASK_STACK, NULL, SNTP_TASK_PRIO, NULL);
 }
 
 /* ================================================================
- *  QMA6100P Accelerometer (from display_rotation)
+ *  QMA6100P Accelerometer (on the shared BSP I2C bus)
+ *
+ *  这里不再使用 espressif/qma6100p 组件：它基于 LEGACY I2C 驱动
+ *  (driver/i2c.h)，而相机 SCCB 需要 driver/i2c_master.h，两者不能共存——
+ *  esp-idf 的 legacy 驱动构造器 check_i2c_driver_conflict() 一旦发现新驱动
+ *  被链接进镜像就会在启动时 abort()。所以 QMA6100P 改为直接用 i2c_master
+ *  挂到 BSP 总线上（CONFIG_BSP_I2C_NUM=1, GPIO4/5, 400 kHz），与相机共用
+ *  同一条总线（IMU 0x12/0x13 + 传感器 0x30，互不干扰）。
+ *
+ *  寄存器序列/量纲与 qma6100p 组件 1:1 对齐，保证改造前后读数一致：
+ *    WHO_AM_I(0x00) == 0x90 → PWR_MGMT_1(0x11) |= BIT7 唤醒
+ *    → ACCEL_CONFIG(0x0F) 低 4 位 = 0b0001（±2g）
+ *    读数：XOUT_H(0x01) 起 6 字节小端；raw = int16 / 4；raw / 4096 → 单位 g
+ *  采样器随后乘 GRAVITY_ACCEL(9.80665) 转 m/s² 再上报。
  * ================================================================ */
 /* I2C pins from BSP config */
 #define ACCEL_I2C_SDA             BSP_I2C_SDA    /* GPIO_NUM_4 */
 #define ACCEL_I2C_SCL             BSP_I2C_SCL    /* GPIO_NUM_5 */
 #define ACCEL_I2C_FREQ_HZ         400000
 
+#define QMA6100P_REG_WHO_AM_I     0x00u
+#define QMA6100P_REG_ACCEL_XOUT_H 0x01u
+#define QMA6100P_REG_ACCEL_CONFIG 0x0Fu
+#define QMA6100P_REG_PWR_MGMT_1   0x11u
+#define QMA6100P_WHO_AM_I_EXPECT  0x90u
+#define QMA6100P_ACCEL_FS_2G      0x01u
+#define QMA6100P_ACCEL_LSB_PER_G  4096.0f   /* ±2g：raw/4 之后每 g 的 LSB 数 */
+#define ACCEL_I2C_TIMEOUT_MS      100
+
+/* 单寄存器写（寄存器地址 + 数据，一次传输） */
+static esp_err_t accel_write_reg(uint8_t reg, uint8_t value)
+{
+    const uint8_t payload[2] = { reg, value };
+    return i2c_master_transmit(s_accel, payload, sizeof(payload),
+                               ACCEL_I2C_TIMEOUT_MS);
+}
+
+/* 从 reg 起连续读 len 字节（写地址 + 重复起始 + 读，i2c_master 内部完成） */
+static esp_err_t accel_read_regs(uint8_t reg, uint8_t *out, size_t len)
+{
+    return i2c_master_transmit_receive(s_accel, &reg, 1, out, len,
+                                       ACCEL_I2C_TIMEOUT_MS);
+}
+
 static esp_err_t app_accel_init(void)
 {
-    /* IMPORTANT: The qma6100p library uses the LEGACY I2C driver (#include "driver/i2c.h"),
-     * NOT the new I2C master driver (i2c_master_bus / i2c_new_master_bus).
-     * BSP's bsp_i2c_init() initializes the new driver, which is incompatible.
-     * Therefore we must install the legacy I2C driver on the same port manually. */
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = ACCEL_I2C_SDA,
-        .scl_io_num = ACCEL_I2C_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = ACCEL_I2C_FREQ_HZ,
-    };
-    esp_err_t ret = i2c_param_config(QMA6100P_I2C_PORT, &i2c_conf);
+    /* BSP 总线，与相机 SCCB 共用：bsp_i2c_init() 幂等（已初始化时直接返回
+     * ESP_OK），所以放在 bsp_camera_start() 之前调用是安全的。 */
+    esp_err_t ret = bsp_i2c_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_param_config failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    ret = i2c_driver_install(QMA6100P_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_driver_install failed: %s", esp_err_to_name(ret));
-        return ret;
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        ESP_LOGE(TAG, "BSP I2C bus handle is NULL");
+        return ESP_FAIL;
     }
 
-    const uint8_t probe_addrs[] = {QMA6100P_I2C_ADDRESS, QMA6100P_I2C_ADDRESS_1};
+    /* AD0 拉低 → 0x12，拉高 → 0x13（保持与旧代码相同的探测顺序） */
+    const uint8_t probe_addrs[] = { 0x12, 0x13 };
 
     for (size_t i = 0; i < sizeof(probe_addrs); i++) {
-        qma6100p_handle_t probe = qma6100p_create(QMA6100P_I2C_PORT, probe_addrs[i]);
-        if (probe == NULL) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address  = probe_addrs[i],
+            .scl_speed_hz    = ACCEL_I2C_FREQ_HZ,
+        };
+        i2c_master_dev_handle_t dev = NULL;
+        ret = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "i2c_master_bus_add_device(0x%02X) failed: %s",
+                     probe_addrs[i], esp_err_to_name(ret));
             continue;
         }
 
+        s_accel = dev;     /* 下面的读写辅助函数需要一个有效句柄 */
         uint8_t device_id = 0;
-        esp_err_t ret = qma6100p_get_deviceid(probe, &device_id);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Detected QMA6100P at 0x%02X, ID 0x%02X",
-                     probe_addrs[i], device_id);
-            ret = qma6100p_wake_up(probe);
-            if (ret == ESP_OK) {
-                ret = qma6100p_config(probe, ACCE_FS_2G);
-            }
-            if (ret == ESP_OK) {
-                s_accel = probe;
-                return ESP_OK;
-            }
+        if (accel_read_regs(QMA6100P_REG_WHO_AM_I, &device_id, 1) != ESP_OK
+            || device_id != QMA6100P_WHO_AM_I_EXPECT) {
+            i2c_master_bus_rm_device(dev);
+            s_accel = NULL;
+            continue;
         }
-        qma6100p_delete(probe);
+        ESP_LOGI(TAG, "Detected QMA6100P at 0x%02X, ID 0x%02X (i2c_master driver)",
+                 probe_addrs[i], device_id);
+
+        /* 唤醒（PWR_MGMT_1 BIT7）后选 ±2g，与旧库 qma6100p_wake_up()/config() 一致 */
+        uint8_t pwr = 0;
+        if (accel_read_regs(QMA6100P_REG_PWR_MGMT_1, &pwr, 1) != ESP_OK
+            || accel_write_reg(QMA6100P_REG_PWR_MGMT_1, (uint8_t)(pwr | 0x80)) != ESP_OK) {
+            ESP_LOGE(TAG, "QMA6100P wake up failed");
+            i2c_master_bus_rm_device(dev);
+            s_accel = NULL;
+            continue;
+        }
+        uint8_t cfg = 0;
+        if (accel_read_regs(QMA6100P_REG_ACCEL_CONFIG, &cfg, 1) != ESP_OK
+            || accel_write_reg(QMA6100P_REG_ACCEL_CONFIG,
+                               (uint8_t)((cfg & 0xF0) | QMA6100P_ACCEL_FS_2G)) != ESP_OK) {
+            ESP_LOGE(TAG, "QMA6100P range config failed");
+            i2c_master_bus_rm_device(dev);
+            s_accel = NULL;
+            continue;
+        }
+        ESP_LOGI(TAG, "QMA6100P ready: +-2g, %u LSB/g (raw/4 -> /%.0f)",
+                 (unsigned)(QMA6100P_ACCEL_LSB_PER_G * 4.0f),
+                 (double)QMA6100P_ACCEL_LSB_PER_G);
+        return ESP_OK;
     }
 
     ESP_LOGW(TAG, "No QMA6100P accelerometer found");
@@ -836,22 +1226,31 @@ static esp_err_t app_accel_read(float *out_x, float *out_y, float *out_z)
         return ESP_ERR_INVALID_ARG;
     }
 
-    qma6100p_acce_value_t acce = {0};
-    esp_err_t ret = qma6100p_get_acce(s_accel, &acce);
+    /* 6 字节小端：XOUT_H/L, YOUT_H/L, ZOUT_H/L。
+     * 与 qma6100p_get_acce() 完全同量纲：raw = int16 / 4（整数除法），
+     * value = raw / 4096 → 单位 g（±2g）。 */
+    uint8_t data[6] = {0};
+    esp_err_t ret = accel_read_regs(QMA6100P_REG_ACCEL_XOUT_H, data, sizeof(data));
     if (ret != ESP_OK) {
         return ret;
     }
+    float acce_x = (float)((int16_t)((data[1] << 8) | data[0]) / 4)
+                   / QMA6100P_ACCEL_LSB_PER_G;
+    float acce_y = (float)((int16_t)((data[3] << 8) | data[2]) / 4)
+                   / QMA6100P_ACCEL_LSB_PER_G;
+    float acce_z = (float)((int16_t)((data[5] << 8) | data[4]) / 4)
+                   / QMA6100P_ACCEL_LSB_PER_G;
 
     /* Simple low-pass filter (state reset when starting a new capture session) */
     if (!s_filter_init) {
-        s_filter_x = acce.acce_x;
-        s_filter_y = acce.acce_y;
-        s_filter_z = acce.acce_z;
+        s_filter_x = acce_x;
+        s_filter_y = acce_y;
+        s_filter_z = acce_z;
         s_filter_init = true;
     } else {
-        s_filter_x += ACCEL_FILTER_ALPHA * (acce.acce_x - s_filter_x);
-        s_filter_y += ACCEL_FILTER_ALPHA * (acce.acce_y - s_filter_y);
-        s_filter_z += ACCEL_FILTER_ALPHA * (acce.acce_z - s_filter_z);
+        s_filter_x += ACCEL_FILTER_ALPHA * (acce_x - s_filter_x);
+        s_filter_y += ACCEL_FILTER_ALPHA * (acce_y - s_filter_y);
+        s_filter_z += ACCEL_FILTER_ALPHA * (acce_z - s_filter_z);
     }
 
     *out_x = s_filter_x;
@@ -860,6 +1259,239 @@ static esp_err_t app_accel_read(float *out_x, float *out_y, float *out_z)
     return ESP_OK;
 }
 
+/* ================================================================
+ *  Camera — on-demand single JPEG frame (esp_video, DVP + V4L2)
+ *
+ *  相机与 IMU 共用 BSP I2C 总线：bsp_camera_start() 内部就是
+ *  bsp_i2c_init() + esp_video_init()（DVP + SCCB），因此 IMU 必须先改走
+ *  i2c_master（见上一节），两者才能共存于同一个固件。
+ *
+ *  运行路径（每次拍照都重新 open/close 设备，只在开机时初始化一次硬件）：
+ *    open(BSP_CAMERA_DEVICE) → VIDIOC_G_FMT 确认当前是 JPEG
+ *    → VIDIOC_S_FMT（宽高必须与传感器当前格式完全一致，DVP 设备会校验）
+ *    → REQBUFS / QUERYBUF / mmap / QBUF → STREAMON → DQBUF 取一帧
+ *    → STREAMOFF / munmap / close；JPEG 立即拷到堆（PSRAM）再由 http 上传。
+ *  帧缓冲由 esp_video 在 PSRAM 上按 640x480x8bit ≈ 300 KB/缓冲 分配，
+ *  相机不占用采样器，也不影响周期上报。
+ * ================================================================ */
+static bool s_camera_ready = false;
+/* 相机串行化：/dev/video0 是独占设备，实时直播的取帧与按需单帧拍照必须排队，
+ * 否则两次 open→STREAMON 会互相踩（直播循环里只在「取帧」期间持锁，不含 HTTP 上传）。 */
+static SemaphoreHandle_t s_camera_mutex = NULL;
+
+typedef struct {
+    uint8_t *data;      /* JPEG 帧的堆（PSRAM）副本，归本结构所有 */
+    size_t   len;
+    uint32_t width;
+    uint32_t height;
+} jpeg_frame_t;
+
+static void jpeg_frame_free(jpeg_frame_t *frame)
+{
+    if (!frame) {
+        return;
+    }
+    if (frame->data) {
+        heap_caps_free(frame->data);
+    }
+    memset(frame, 0, sizeof(*frame));
+}
+
+/* 初始化相机（开机一次）。失败不 abort：没有相机时 IMU/上传照常工作，
+ * camera 任务会得到明确的 fail 回执而不是无限等待。 */
+static esp_err_t app_camera_init(void)
+{
+    if (!s_camera_mutex) {
+        s_camera_mutex = xSemaphoreCreateMutex();
+        if (!s_camera_mutex) {
+            ESP_LOGE(TAG, "camera mutex create failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    bsp_camera_cfg_t cfg = { 0 };
+    esp_err_t ret = bsp_camera_start(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "bsp_camera_start failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    s_camera_ready = true;
+    ESP_LOGI(TAG, "Camera ready: %s (OV2640 DVP, JPEG)", BSP_CAMERA_DEVICE);
+    return ESP_OK;
+}
+
+/* 拍一帧 JPEG。成功时 out->data 由调用方用 jpeg_frame_free() 释放。 */
+static esp_err_t app_camera_capture_jpeg(jpeg_frame_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s_camera_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    /* 相机独占：与实时直播串行化。直播循环只在取帧期间持锁（不含 HTTP 上传），
+     * 所以单帧拍照最多等一帧的时间；反过来直播最多等一次单帧拍照（含 3 s DQBUF 上限）。 */
+    bool locked = false;
+    if (s_camera_mutex) {
+        if (xSemaphoreTake(s_camera_mutex,
+                           pdMS_TO_TICKS(CAMERA_LOCK_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGW(TAG, "[photo] camera busy (live streaming?), capture skipped");
+            return ESP_ERR_TIMEOUT;
+        }
+        locked = true;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    bool streaming = false;
+    uint8_t *map[CAMERA_BUFFER_COUNT] = { 0 };
+    size_t map_len[CAMERA_BUFFER_COUNT] = { 0 };
+    struct v4l2_format format;
+    int fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "[photo] open(%s) failed: errno=%d", BSP_CAMERA_DEVICE, errno);
+        goto cleanup;      /* 统一从 cleanup 退出，保证相机锁一定归还 */
+    }
+
+    /* 1. 读当前格式：默认格式由 Kconfig 决定（本项目选 OV2640 DVP JPEG 640x480）。
+     *    DVP 设备要求 S_FMT 的宽高与传感器当前格式完全一致，所以先读再写回。 */
+    memset(&format, 0, sizeof(format));
+    format.type = type;
+    if (ioctl(fd, VIDIOC_G_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "[photo] VIDIOC_G_FMT failed: errno=%d", errno);
+        goto cleanup;
+    }
+    if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG) {
+        ESP_LOGE(TAG, "[photo] sensor format 0x%08" PRIx32 " is not JPEG - enable"
+                      " CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS",
+                 (uint32_t)format.fmt.pix.pixelformat);
+        goto cleanup;
+    }
+    out->width = format.fmt.pix.width;
+    out->height = format.fmt.pix.height;
+
+    memset(&format, 0, sizeof(format));
+    format.type = type;
+    format.fmt.pix.width = out->width;
+    format.fmt.pix.height = out->height;
+    format.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+    if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "[photo] VIDIOC_S_FMT(%" PRIu32 "x%" PRIu32
+                      " JPEG) failed: errno=%d", out->width, out->height, errno);
+        goto cleanup;
+    }
+
+    /* 2. mmap 缓冲并入队前先把单帧等待上限设成 3 s：传感器不出图时
+     *    DQBUF 不能永久阻塞（否则拍照任务会把整个 task_poll 卡死）。
+     *    该 ioctl 是 esp_video 私有扩展，老版本不支持时只告警、用驱动默认值。 */
+    struct timeval dqbuf_timeout = {
+        .tv_sec  = CAMERA_DQBUF_TIMEOUT_MS / 1000,
+        .tv_usec = (CAMERA_DQBUF_TIMEOUT_MS % 1000) * 1000,
+    };
+    if (ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &dqbuf_timeout) != 0) {
+        ESP_LOGW(TAG, "[photo] VIDIOC_S_DQBUF_TIMEOUT unsupported (errno=%d),"
+                      " using driver default", errno);
+    }
+
+    /* 3. mmap 缓冲并入队 */
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count  = CAMERA_BUFFER_COUNT;
+    req.type   = type;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "[photo] VIDIOC_REQBUFS failed: errno=%d", errno);
+        goto cleanup;
+    }
+    for (int i = 0; i < CAMERA_BUFFER_COUNT; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = type;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[photo] VIDIOC_QUERYBUF(%d) failed: errno=%d", i, errno);
+            goto cleanup;
+        }
+        map[i] = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, buf.m.offset);
+        if (map[i] == MAP_FAILED) {
+            map[i] = NULL;
+            ESP_LOGE(TAG, "[photo] mmap(%d) failed: errno=%d", i, errno);
+            goto cleanup;
+        }
+        map_len[i] = buf.length;
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[photo] VIDIOC_QBUF(%d) failed: errno=%d", i, errno);
+            goto cleanup;
+        }
+    }
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "[photo] VIDIOC_STREAMON failed: errno=%d", errno);
+        goto cleanup;
+    }
+    streaming = true;
+
+    /* 3. 取一帧：坏帧（没有 V4L2_BUF_FLAG_DONE）丢回队列重取，最多跳 CAMERA_FRAME_SKIP_MAX 帧 */
+    for (int attempt = 0; attempt <= CAMERA_FRAME_SKIP_MAX; attempt++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = type;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[photo] VIDIOC_DQBUF failed: errno=%d", errno);
+            goto cleanup;
+        }
+        bool good = ((buf.flags & V4L2_BUF_FLAG_DONE) != 0) && buf.bytesused > 0
+                    && buf.index < CAMERA_BUFFER_COUNT;
+        if (good) {
+            /* 必须立刻拷贝：缓冲一旦回到队列，esp_video 就会复用它 */
+            uint8_t *copy = heap_caps_malloc(buf.bytesused,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!copy) {
+                copy = heap_caps_malloc(buf.bytesused, MALLOC_CAP_8BIT);
+            }
+            if (!copy) {
+                ESP_LOGE(TAG, "[photo] no heap for %" PRIu32 " B JPEG frame",
+                         (uint32_t)buf.bytesused);
+                goto cleanup;
+            }
+            memcpy(copy, map[buf.index], buf.bytesused);
+            out->data = copy;
+            out->len = buf.bytesused;
+            ret = ESP_OK;
+            break;
+        }
+        ESP_LOGW(TAG, "[photo] dropping bad frame flags=0x%08" PRIx32 " used=%" PRIu32,
+                 (uint32_t)buf.flags, (uint32_t)buf.bytesused);
+        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[photo] VIDIOC_QBUF(recycle) failed: errno=%d", errno);
+            goto cleanup;
+        }
+    }
+
+cleanup:
+    if (streaming && ioctl(fd, VIDIOC_STREAMOFF, &type) != 0) {
+        ESP_LOGW(TAG, "[photo] VIDIOC_STREAMOFF failed: errno=%d", errno);
+    }
+    for (int i = 0; i < CAMERA_BUFFER_COUNT; i++) {
+        if (map[i]) {
+            munmap(map[i], map_len[i]);
+        }
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (ret != ESP_OK) {
+        jpeg_frame_free(out);
+    }
+    if (locked) {
+        xSemaphoreGive(s_camera_mutex);   /* 相机交还：直播循环 / 下一次拍照继续用 */
+    }
+    return ret;
+}
 /* ================================================================
  *  6-Face Calibration Mode
  * ================================================================ */
@@ -1937,12 +2569,24 @@ static void init_buttons(void)
     ESP_ERROR_CHECK(bsp_iot_button_create(s_buttons, &button_count, BSP_BUTTON_NUM));
     ESP_LOGI(TAG, "Initialized %d buttons, using BSP_BUTTON_1 + BSP_BUTTON_2", button_count);
 
-    /* Button A: single click → start/stop normal collection */
+    /* Button A: single click → start/stop normal collection
+     *           long press (2s) → toggle camera live streaming (Board → Web 实时画面) */
     ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[START_BUTTON_INDEX],
                                            BUTTON_SINGLE_CLICK,
                                            NULL,
                                            button_a_single_click_cb,
                                            NULL));
+
+    button_event_args_t a_long_press_args = {
+        .long_press.press_time = 2000,  /* 2 second long press */
+    };
+    ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[START_BUTTON_INDEX],
+                                           BUTTON_LONG_PRESS_START,
+                                           &a_long_press_args,
+                                           button_a_long_press_cb,
+                                           NULL));
+    ESP_LOGI(TAG, "Button A registered: single click = start/stop logging,"
+                  " long press (2s) = camera live streaming");
 
     /* Button B: single click → start/stop 6-face calibration
  *             long press (2s) → toggle stand/stairs/bend/jump/fall protocol */
@@ -2663,6 +3307,303 @@ static bool task_post_applied(const char *request_id, int64_t paused_until_epoch
     return http_post_text(url, body);
 }
 
+/* POST 一帧 JPEG 到 /api/v1/photos（流式发送，不再把整帧拷进 http 发送缓冲）。
+ * 成功 = HTTP 2xx：服务端在同一事务里存图并把 camera 任务置 completed。
+ * status_out 回传 HTTP 状态码（0 = 网络层失败，没拿到状态码）。 */
+static bool photo_post_frame(const jpeg_frame_t *frame, const char *request_id,
+                             uint64_t ts_ms, int *status_out)
+{
+    char path[224];
+    char url[288];
+    char resp[PHOTO_RESP_BUF_LEN];
+    http_buf_t hb = { .buf = resp, .len = 0, .cap = sizeof(resp) };
+    int status = 0;
+
+    if (status_out) {
+        *status_out = 0;
+    }
+    if (!frame || !frame->data || frame->len == 0 || !request_id) {
+        return false;
+    }
+    memset(resp, 0, sizeof(resp));
+
+    snprintf(path, sizeof(path),
+             PHOTO_API_PATH "?device_id=%s&request_id=%s&ts_ms=%" PRIu64
+             "&w=%" PRIu32 "&h=%" PRIu32,
+             CONFIG_SENSOR_DEVICE_ID, request_id, ts_ms,
+             frame->width, frame->height);
+    if (!server_api_url(url, sizeof(url), path)) {
+        ESP_LOGW(TAG, "[photo] cannot derive API base from '%s'",
+                 CONFIG_SENSOR_SERVER_URL);
+        return false;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = PHOTO_HTTP_TIMEOUT_MS,
+        .event_handler = http_collect_event_handler,
+        .user_data = &hb,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+
+    bool ok = false;
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+    task_http_common(client);        /* 可选 Bearer token，与其它接口一致 */
+    /* write_len >= 0 → 用 Content-Length 定长发送（避免分块编码） */
+    if (esp_http_client_open(client, (int)frame->len) == ESP_OK) {
+        int written = esp_http_client_write(client, (const char *)frame->data,
+                                            (int)frame->len);
+        if (written == (int)frame->len) {
+            esp_http_client_fetch_headers(client);
+            status = esp_http_client_get_status_code(client);
+            ok = (status >= 200 && status < 300);
+            if (!ok) {
+                esp_http_client_read_response(client, resp, sizeof(resp) - 1);
+                ESP_LOGW(TAG, "[photo] server rejected the frame: http=%d body=%s",
+                         status, resp[0] ? resp : "-");
+            }
+        } else {
+            ESP_LOGW(TAG, "[photo] short write %d/%u B",
+                     written, (unsigned)frame->len);
+        }
+        esp_http_client_close(client);
+    } else {
+        ESP_LOGW(TAG, "[photo] HTTP open failed: %s", url);
+    }
+    esp_http_client_cleanup(client);
+
+    if (status_out) {
+        *status_out = status;
+    }
+    return ok;
+}
+
+/* 处理 kind=camera 任务：不占用采样器，直接拍一帧 JPEG 上传。
+ * 上传成功 = 服务端在同一事务里把任务置 completed；失败走 /fail 回执，
+ * 让 Web 立刻看到原因，而不是等有效期到了才超时。 */
+static void task_handle_camera(const char *request_id, int64_t server_expires_ms)
+{
+    if (s_time_synced && server_expires_ms > 0
+        && manual_now_epoch_ms() > server_expires_ms) {
+        task_post_fail(request_id, "task expired before capture");
+        return;
+    }
+
+    /* ack 是尽力而为：即便 ack 失败也要继续拍，服务端不靠 ack 收尾 */
+    if (!task_post_ack(request_id)) {
+        ESP_LOGW(TAG, "[photo] ack failed for %s (capture continues)", request_id);
+    }
+
+    if (!s_camera_ready) {
+        task_post_fail(request_id, "camera not initialized on device");
+        return;
+    }
+
+    jpeg_frame_t frame = { 0 };
+    if (app_camera_capture_jpeg(&frame) != ESP_OK) {
+        task_post_fail(request_id, "camera capture failed");
+        return;
+    }
+    ESP_LOGI(TAG, "[photo] captured %u B %" PRIu32 "x%" PRIu32 " for %s",
+             (unsigned)frame.len, frame.width, frame.height, request_id);
+
+    const uint64_t ts_ms = (uint64_t)manual_now_epoch_ms();
+    int status = 0;
+    bool ok = photo_post_frame(&frame, request_id, ts_ms, &status);
+    ESP_LOGI(TAG, "[photo] upload %s ts=%" PRIu64 " bytes=%u http=%d",
+             ok ? "OK" : "FAIL", ts_ms, (unsigned)frame.len, status);
+    jpeg_frame_free(&frame);
+
+    if (!ok && (status == 0 || status >= 500)) {
+        /* 5xx / 网络错误：服务端不一定知道这次拍照的下场，由板端补一条 fail。
+         * 4xx 则相反——服务端已经判定这张照片不合法并把任务置 failed（或根本不
+         * 认识这个 request_id），再发 /fail 只会互相覆盖，所以只记日志。 */
+        task_post_fail(request_id, "photo upload failed");
+    }
+    log_heap("task: photo done");
+}
+
+/* ================================================================
+ *  摄像头实时直播（长按 Button A 开关 → POST /api/v1/live）
+ *
+ *  与「按需单帧拍照」的区别：直播是连续流，没有 request_id、不做任务收尾，
+ *  服务端只在内存里保留该设备的最新一帧；丢一帧不需要重传（下一帧 500 ms 后到）。
+ *  与相机的关系：两者共用 /dev/video0，靠 s_camera_mutex 串行
+ *  （见 app_camera_capture_jpeg）。不占用采样器、不暂停周期上报。
+ * ================================================================ */
+
+/* POST 一帧 JPEG 到 /api/v1/live（流式发送，Content-Length 定长）。
+ * 成功 = HTTP 2xx；status_out 回传状态码（0 = 网络层失败，没拿到状态码）。 */
+static bool live_post_frame(const jpeg_frame_t *frame, uint64_t ts_ms, int *status_out)
+{
+    char path[224];
+    char url[288];
+    char resp[PHOTO_RESP_BUF_LEN];
+    http_buf_t hb = { .buf = resp, .len = 0, .cap = sizeof(resp) };
+    int status = 0;
+
+    if (status_out) {
+        *status_out = 0;
+    }
+    if (!frame || !frame->data || frame->len == 0) {
+        return false;
+    }
+    memset(resp, 0, sizeof(resp));
+
+    snprintf(path, sizeof(path),
+             LIVE_API_PATH "?device_id=%s&ts_ms=%" PRIu64 "&w=%" PRIu32 "&h=%" PRIu32,
+             CONFIG_SENSOR_DEVICE_ID, ts_ms, frame->width, frame->height);
+    if (!server_api_url(url, sizeof(url), path)) {
+        ESP_LOGW(TAG, "[live] cannot derive API base from '%s'",
+                 CONFIG_SENSOR_SERVER_URL);
+        return false;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = LIVE_HTTP_TIMEOUT_MS,
+        .event_handler = http_collect_event_handler,
+        .user_data = &hb,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+
+    bool ok = false;
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+    task_http_common(client);        /* 可选 Bearer token，与其它接口一致 */
+    /* write_len >= 0 → 用 Content-Length 定长发送（避免分块编码） */
+    if (esp_http_client_open(client, (int)frame->len) == ESP_OK) {
+        int written = esp_http_client_write(client, (const char *)frame->data,
+                                            (int)frame->len);
+        if (written == (int)frame->len) {
+            esp_http_client_fetch_headers(client);
+            status = esp_http_client_get_status_code(client);
+            ok = (status >= 200 && status < 300);
+            if (!ok) {
+                esp_http_client_read_response(client, resp, sizeof(resp) - 1);
+                ESP_LOGW(TAG, "[live] server rejected the frame: http=%d body=%s",
+                         status, resp[0] ? resp : "-");
+            }
+        } else {
+            ESP_LOGW(TAG, "[live] short write %d/%u B",
+                     written, (unsigned)frame->len);
+        }
+        esp_http_client_close(client);
+    } else {
+        ESP_LOGW(TAG, "[live] HTTP open failed: %s", url);
+    }
+    esp_http_client_cleanup(client);
+
+    if (status_out) {
+        *status_out = status;
+    }
+    return ok;
+}
+
+/* 推流任务：循环「拍一帧 → 上传」，直到 s_live_streaming 被长按清零、WiFi 掉线
+ * 或连续失败达到上限。结束时自己 vTaskDelete(NULL)：按键回调只负责置位/清零，
+ * 绝不做 vTaskDelete，避免与「任务正在删自己」的竞态。 */
+static void live_stream_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "[live] streaming started (%d ms/frame, POST %s)",
+             LIVE_FRAME_INTERVAL_MS, LIVE_API_PATH);
+    s_live_frames = 0;
+    s_live_last_status = 0;
+    refresh_ui();
+
+    int fail_streak = 0;
+    while (s_live_streaming) {
+        if (!s_wifi_connected) {
+            ESP_LOGW(TAG, "[live] stopped: WiFi disconnected");
+            break;
+        }
+
+        jpeg_frame_t frame = { 0 };
+        esp_err_t ret = app_camera_capture_jpeg(&frame);
+        if (ret != ESP_OK) {
+            /* 相机忙（按需拍照正在用）也走这里，下一轮自然重试 */
+            fail_streak++;
+            ESP_LOGW(TAG, "[live] capture failed: %s (streak=%d)",
+                     esp_err_to_name(ret), fail_streak);
+        } else {
+            const unsigned flen = (unsigned)frame.len;
+            int status = 0;
+            bool ok = live_post_frame(&frame, (uint64_t)manual_now_epoch_ms(), &status);
+            s_live_last_status = status;
+            jpeg_frame_free(&frame);
+            if (ok) {
+                fail_streak = 0;
+                s_live_frames++;
+                ESP_LOGI(TAG, "[live] frame %" PRIu32 " sent (%u B, http=%d)",
+                         s_live_frames, flen, status);
+            } else {
+                fail_streak++;
+                ESP_LOGW(TAG, "[live] upload failed: http=%d (streak=%d)",
+                         status, fail_streak);
+            }
+        }
+
+        if (fail_streak >= LIVE_FAIL_LIMIT) {
+            ESP_LOGW(TAG, "[live] stopped after %d consecutive failures", fail_streak);
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(LIVE_FRAME_INTERVAL_MS));
+        refresh_ui();        /* LCD 的帧数 / 状态栏随推流实时更新 */
+    }
+
+    s_live_streaming = false;
+    ESP_LOGI(TAG, "[live] streaming stopped (%" PRIu32 " frames sent, last http=%d)",
+             s_live_frames, s_live_last_status);
+    log_heap("live: task done");
+    refresh_ui();
+    vTaskDelete(NULL);
+}
+
+/* 长按 Button A（2 s）→ 切换直播。按键回调只做「置位 + 建任务」/「清零」这类轻活；
+ * LCD 刷新交给 live_stream_task 的起止点，按键上下文不碰 LVGL。 */
+static void live_streaming_toggle(void)
+{
+    if (s_live_streaming) {
+        s_live_streaming = false;    /* 任务在下一轮循环检查时收尾（≤ 一次上传的时间） */
+        ESP_LOGI(TAG, "[live] stop requested (long press Button A)");
+        return;
+    }
+
+    if (!s_camera_ready) {
+        ESP_LOGW(TAG, "[live] camera not initialized - cannot stream");
+        return;
+    }
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "[live] WiFi not connected - cannot stream");
+        return;
+    }
+
+    s_live_streaming = true;
+    if (xTaskCreate(live_stream_task, "live_task", LIVE_TASK_STACK, NULL,
+                    LIVE_TASK_PRIORITY, NULL) != pdPASS) {
+        s_live_streaming = false;    /* 任务没起来就回到「未推流」，避免状态骗人 */
+        ESP_LOGE(TAG, "[live] task create failed (heap?)");
+        return;
+    }
+    ESP_LOGI(TAG, "[live] streaming enabled: long press Button A again to stop");
+}
+
+static void button_a_long_press_cb(void *arg, void *data)
+{
+    (void)arg;
+    (void)data;
+    live_streaming_toggle();
+}
+
 /* Retry the applied receipt of the last control task (bounded: a receipt older
  * than a couple of polls is no longer useful, the server task has timed out and
  * a newer control decision must win). Runs in task_poll_task. */
@@ -2802,6 +3743,17 @@ static void task_handle_next_response(const char *resp)
         return;
     }
 
+    /* 拍照任务（kind=camera）：不采数据、不占用采样器，拍一帧 JPEG 直接上传，
+     * 所以必须在下面的 sample_count / sample_rate_hz 校验之前分流。 */
+    if (cJSON_IsString(kind) && kind->valuestring
+        && strcmp(kind->valuestring, "camera") == 0) {
+        int64_t cam_expires_ms = cJSON_IsNumber(exp)
+                                     ? expires_to_epoch_ms(exp->valuedouble) : 0;
+        cJSON_Delete(root);
+        task_handle_camera(request_id, cam_expires_ms);
+        return;
+    }
+
     if (!cJSON_IsNumber(cnt) || !cJSON_IsNumber(rate)) {
         cJSON_Delete(root);
         return;         /* capture task without a usable spec: ignore */
@@ -2916,6 +3868,176 @@ static void uploader_task(void *arg)
 /* ================================================================
  *  Sampler Task — reads IMU + SNTP time → writes CSV
  * ================================================================ */
+/* ------------------------------------------------------------------
+ * WiFi 健康检查 / 自愈（由 sampler_task 每 5 s 调一次）
+ *
+ * 覆盖三种现场真实故障：
+ *  1) 完全掉线（没有 L2）：每 5 s 重新 esp_wifi_connect()，永不放弃。
+ *     旧实现重试 5 次后就不再重连，一次抖动 = 永久离线，只能断电重启。
+ *  2) 已关联但一直拿不到 IP：15 s 还没租约就重启 DHCP 客户端（最多 3 次），
+ *     再不行就断开重连、重走一遍 DHCPDISCOVER。
+ *     这是本板实测到的故障：串口日志停在 "AP's beacon interval"，
+ *     既没有 Got IP 也没有断连事件，DHCP 静默失败。
+ *     LWIP 在 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=y 时会先 ARP 探测拿到的地址，
+ *     只要局域网里有设备/陈旧 ARP 应答该地址，客户端就丢弃租约并无限重来，
+ *     所以 sdkconfig 里同时关掉了这个 ARP 检查（详见
+ *     docs/wifi_network_troubleshooting.md）。
+ *  3) 拿到租约又被路由器收回（IP_EVENT_STA_LOST_IP）：状态会回到未联网，
+ *     这里同样按 (2) 处理。
+ *  4) 整个网段没有 DHCP 服务在应答（现场实测：10.1.41.0/24 三种客户端 MAC
+ *     全部 8 s 零回应）：DHCP 重启/重关联都注定失败。Kconfig 打开
+ *     "Static IP Fallback" 后，这里在确认 DHCP 无救时改用固定地址，
+ *     让板子至少能联网对时（细节见 apply_static_ip_fallback()）。
+ *
+ * 必须放在任务上下文里调用：重启 DHCP / 重新关联都会走 tcpip 线程，
+ * 在 esp_event 回调里做会阻塞事件循环。
+ * ------------------------------------------------------------------ */
+
+/* 静态 IP 兜底：停掉 DHCP 客户端、套上 Kconfig 里的固定地址。
+ * 只有在 s_static_ip_armed（已判定 DHCP 没救）时才会被调用。
+ * 返回 true = 板子现在有 IP（联网状态已经补好）。
+ *
+ * 事件路径不需要重复实现：esp_netif_set_ip_info() 在 netif 已 up、DHCP 客户端
+ * 已停止时会自己 post IP_EVENT_STA_GOT_IP（IDF 5.4
+ * components/esp_netif/lwip/esp_netif_lwip.c:1919-1936），于是
+ * wifi_event_handler() 会把 s_wifi_connected / 状态文本 / 事件位一并恢复。
+ * 但事件是异步的，所以这里立刻把 s_wifi_connected 与计数补上，否则 5 s 后的
+ * 下一轮 wifi_health_check() 会以为仍然没有 IP 而强制重新关联，把刚套好的地址
+ * 又拆掉。
+ *
+ * DNS 必须显式设置：DHCP 死了也就没有 DNS 服务器，不设的话 SNTP 依然解析不了
+ * CONFIG_SNTP_SERVER（除非那里直接填 IP）。 */
+static bool apply_static_ip_fallback(void)
+{
+#if STATIC_IP_FALLBACK_ENABLED
+    if (s_sta_netif == NULL || !s_wifi_link_up) {
+        return false;
+    }
+
+    /* 已经有地址（正常租约，或上一次兜底套上的、链路抖动后被 lwIP 清掉的）
+     * 就不要再 set 一次，set 会重新 post 一次 GOT_IP。 */
+    esp_netif_ip_info_t cur = {0};
+    if (esp_netif_get_ip_info(s_sta_netif, &cur) == ESP_OK && cur.ip.addr != 0) {
+        return true;
+    }
+
+    esp_netif_ip_info_t ip = {0};
+    esp_netif_dns_info_t dns = {0};
+    if (esp_netif_str_to_ip4(CONFIG_STATIC_IP_ADDR, &ip.ip) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_STATIC_IP_NETMASK, &ip.netmask) != ESP_OK ||
+        esp_netif_str_to_ip4(CONFIG_STATIC_IP_GATEWAY, &ip.gw) != ESP_OK ||
+        ip.ip.addr == 0) {
+        if (!s_static_ip_warned) {
+            s_static_ip_warned = true;
+            ESP_LOGE(TAG, "Static IP fallback: invalid Kconfig values \"%s\" / \"%s\" gw \"%s\" "
+                          "- static fallback disabled for this boot",
+                     CONFIG_STATIC_IP_ADDR, CONFIG_STATIC_IP_NETMASK, CONFIG_STATIC_IP_GATEWAY);
+        }
+        s_static_ip_armed = false;   /* 配置错了就别每 5 s 再试一遍 */
+        return false;
+    }
+
+    esp_netif_dhcpc_stop(s_sta_netif);     /* set_ip_info() 要求 DHCP 客户端已停止 */
+    esp_err_t ret = esp_netif_set_ip_info(s_sta_netif, &ip);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Static IP fallback: esp_netif_set_ip_info failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    if (esp_netif_str_to_ip4(CONFIG_STATIC_IP_DNS, &dns.ip.u_addr.ip4) == ESP_OK) {
+        /* IDF 5.4 的 esp_netif_dns_info_t 只有一个 ip 成员（esp_ip_addr_t），
+         * DNS 角色（MAIN/BACKUP）是 set_dns_info() 的参数；但 esp_ip_addr_t 的
+         * type 要自己标成 IPv4 —— esp_netif_str_to_ip4() 只写地址本身。 */
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        ret = esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Static IP fallback: set DNS failed: %s - SNTP needs an IP in "
+                          "CONFIG_SNTP_SERVER", esp_err_to_name(ret));
+        }
+    } else if (!s_static_ip_warned) {
+        s_static_ip_warned = true;
+        ESP_LOGW(TAG, "Static IP fallback: invalid DNS \"%s\" - relying on CONFIG_SNTP_SERVER "
+                      "being a literal IP", CONFIG_STATIC_IP_DNS);
+    }
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        s_wifi_connected = true;
+        set_status_locked("WiFi connected (static IP)");
+        xSemaphoreGive(s_state_mutex);
+    }
+    s_dhcp_restart_count = 0;
+    s_dhcp_giveup_count = 0;
+    s_link_up_us = 0;
+
+    ESP_LOGW(TAG, "Static IP fallback applied: " IPSTR "/" IPSTR " gw " IPSTR " dns %s "
+                  "(no DHCP server on this subnet - set the same values in the server's "
+                  "docs/wifi_network_troubleshooting.md checklist)",
+             IP2STR(&ip.ip), IP2STR(&ip.netmask), IP2STR(&ip.gw), CONFIG_STATIC_IP_DNS);
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void wifi_health_check(void)
+{
+    if (s_wifi_connected) {
+        s_dhcp_restart_count = 0;
+        s_dhcp_giveup_count = 0;
+        s_link_up_us = 0;
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+
+    if (!s_wifi_link_up) {
+        ESP_LOGW(TAG, "WiFi offline - reconnecting (never gives up)");
+        esp_wifi_connect();
+        return;
+    }
+
+    /* 已进入静态 IP 模式：链路重连后 lwIP 会清掉地址（DHCP 客户端又是停着的，
+     * 不会自己回来），这里直接把地址补回去。 */
+    if (s_static_ip_armed && apply_static_ip_fallback()) {
+        return;
+    }
+
+    /* 已关联：给 DHCP 一个窗口，超时先重启客户端 */
+    if (s_link_up_us == 0) {
+        s_link_up_us = now_us;
+        return;
+    }
+    if (now_us - s_link_up_us < 15000000) {
+        return;
+    }
+
+    if (s_sta_netif && s_dhcp_restart_count < 3) {
+        s_dhcp_restart_count++;
+        ESP_LOGW(TAG, "No IP 15 s after association - restarting DHCP client (%d/3)",
+                 s_dhcp_restart_count);
+        esp_netif_dhcpc_stop(s_sta_netif);
+        esp_err_t ret = esp_netif_dhcpc_start(s_sta_netif);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "dhcpc restart failed: %s", esp_err_to_name(ret));
+        }
+        s_link_up_us = now_us;   /* 再给 15 s */
+    } else {
+        s_dhcp_giveup_count++;
+        /* Kconfig 打开静态 IP 兜底时，确认 DHCP 没救（第 2 次放弃 ≈ 关联后 100 s）
+         * 就换固定地址；没打开时行为与以前完全一致。 */
+        if (STATIC_IP_FALLBACK_ENABLED && s_dhcp_giveup_count >= STATIC_IP_GIVEUP_LIMIT) {
+            s_static_ip_armed = true;
+            if (apply_static_ip_fallback()) {
+                return;
+            }
+        }
+        ESP_LOGW(TAG, "DHCP gave no lease - forcing re-association");
+        s_dhcp_restart_count = 0;
+        s_link_up_us = now_us;
+        esp_wifi_disconnect();   /* -> STA_DISCONNECTED 事件里立刻重连 */
+    }
+}
+
 static void sampler_task(void *arg)
 {
     (void)arg;
@@ -2942,6 +4064,24 @@ static void sampler_task(void *arg)
         if (heap_now_us - s_last_heap_log_us >= 2000000) {
             s_last_heap_log_us = heap_now_us;
             log_heap(s_collecting ? "sampler(collecting)" : "sampler(idle)");
+        }
+
+        /* LCD「Time:」每秒刷新一次（同样在状态互斥锁之外，不拉长采样临界区）：
+         * 已同步写北京时间，未同步写 uptime —— 无论联不联网，这一行都在动，
+         * 所以「时间不对」和「板子卡死」在 LCD 上可以直接区分开。 */
+        static int64_t s_last_time_ui_us;
+        if (heap_now_us - s_last_time_ui_us >= 1000000) {
+            s_last_time_ui_us = heap_now_us;
+            refresh_time_str();
+            refresh_ui();
+        }
+
+        /* WiFi 自愈检查（每 5 s 一次）。必须在状态互斥锁之外：
+         * 里面可能重启 DHCP 客户端甚至重新关联，耗时不可控。 */
+        static int64_t s_last_wifi_check_us;
+        if (heap_now_us - s_last_wifi_check_us >= 5000000) {
+            s_last_wifi_check_us = heap_now_us;
+            wifi_health_check();
         }
 
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -2994,16 +4134,9 @@ static void sampler_task(void *arg)
                  * independent of FreeRTOS scheduling jitter. */
                 uint64_t timestamp_ms = s_base_timestamp_ms + (uint64_t)s_sample_count * SAMPLE_PERIOD_MS;
 
-                /* 2b. Update time string for UI display (every 100 samples) */
-                if (s_sample_count % 100 == 0) {
-                    struct timeval tv;
-                    gettimeofday(&tv, NULL);
-                    struct tm timeinfo;
-                    localtime_r(&tv.tv_sec, &timeinfo);
-                    char strftime_buf[64];
-                    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-                    snprintf(s_time_str, sizeof(s_time_str), "%s", strftime_buf);
-                }
+                /* 2b. 时间字段由采样循环每 1 s 的 refresh_time_str() 统一维护
+                 *     （未同步时显示 uptime）。这里不再做 strftime —— 10 ms 的
+                 *     采样临界区里不该出现格式化开销，也不需要重复实现一套。 */
 
                 /* 3. Convert acceleration from g to m/s² */
                 float ax_ms2 = ax * GRAVITY_ACCEL;
@@ -3670,10 +4803,13 @@ void app_main(void)
     create_ui();
     log_heap("after create_ui");
 
-    /* 3. Wi-Fi + SNTP (blocking — waits for connection + time) */
-    wifi_init_sta();         // blocks until connected or failed
+    /* 3. Wi-Fi + SNTP
+     *    wifi_init_sta()     ：最多等 WIFI_CONNECT_TIMEOUT_MS，超时就离线启动（后台自愈）
+     *    initialize_sntp()   ：不阻塞，只起后台对时任务（见「SNTP 对时」一节）——
+     *                          网络后到也能自动对上时间，不用重启板子。 */
+    wifi_init_sta();         // blocks until connected or failed (bounded)
     log_heap("after wifi_init_sta");
-    initialize_sntp();       // blocks until time synced or timeout
+    initialize_sntp();       // non-blocking: SNTP sync runs in sntp_sync_task
     log_heap("after sntp");
 
     /* 4. SD card */
@@ -3695,6 +4831,20 @@ void app_main(void)
         }
     }
 
+    /* 5b. Camera (OV2640 DVP via esp_video; JPEG frames for the Web "photo" task).
+     *     Must come after app_accel_init(): both share the BSP I2C bus, and the
+     *     IMU now owns it through the new i2c_master driver, so the SCCB init
+     *     inside bsp_camera_start() just reuses it. A failure here is not fatal:
+     *     sampling/uploading continue and camera tasks fail with a clear reason. */
+    if (app_camera_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Camera not available, photo tasks will report failure");
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            set_status_locked("No camera found");
+            xSemaphoreGive(s_state_mutex);
+        }
+    }
+    log_heap("after camera init");
+
     /* 6. Buttons */
     init_buttons();
 
@@ -3709,12 +4859,13 @@ void app_main(void)
     assert(s_upload_queue != NULL);
     xTaskCreate(uploader_task, "upload_task", 8192, NULL, 4, NULL);
 
-    /* 10. On-demand capture task polling (Web "capture once" button).
+    /* 10. On-demand task polling (Web "capture once" / "photo" buttons).
      *     The mutex is created first: task_poll_task uses it as its
-     *     "module is up" guard. */
+     *     "module is up" guard. The stack covers both the sample tasks and an
+     *     inline camera capture + JPEG upload (10 KB). */
     s_task_mutex = xSemaphoreCreateMutex();
     assert(s_task_mutex != NULL);
-    xTaskCreate(task_poll_task, "task_poll", 8192, NULL, 3, NULL);
+    xTaskCreate(task_poll_task, "task_poll", 10240, NULL, 3, NULL);
 
     /* (sizeof(upload_batch_t) + 100 samples) x UPLOAD_QUEUE_LEN is the worst-case
      * heap held by in-flight periodic batches; one on-demand capture adds
@@ -3729,6 +4880,9 @@ void app_main(void)
     log_heap("system ready");
 
     ESP_LOGI(TAG, "System ready. Button A: start/stop normal IMU logging");
+    ESP_LOGI(TAG, "Button A long press (2s): toggle camera live streaming"
+                  " (POST %s, ~%d ms/frame, Web card 摄像头实时画面)",
+             LIVE_API_PATH, LIVE_FRAME_INTERVAL_MS);
     ESP_LOGI(TAG, "Protocol toggle: Long-press Button B (2s) cycles through 5 protocols");
     ESP_LOGI(TAG, "  → Stand: 3x(prep 3s + stand 20-30s + idle 5s), CSV: stand_1/2/3.csv");
     ESP_LOGI(TAG, "  → Stairs: 3x(prep 3s + stairs 20-30s + idle 60s), CSV: stairs_1/2/3.csv");

@@ -22,4 +22,6 @@ idf_component_register(SRCS "main.c"
                         spi_flash
                         esp_system
                         hal
-                        soc)
+                        soc
+                        esp_video
+                        esp_cam_sensor)

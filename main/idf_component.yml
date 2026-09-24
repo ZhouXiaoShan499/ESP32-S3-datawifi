@@ -1,8 +1,12 @@
-description: IMU data logger with Wi-Fi + SNTP time sync + SD card logging
+description: IMU data logger with Wi-Fi + SNTP time sync + SD card logging + on-demand JPEG photo capture
 
 dependencies:
   espressif/esp32_s3_eye:
     version: "^6"
-  espressif/qma6100p:
-    version: "^1"
   idf: ">=5.4"
+
+# 注意：不再依赖 espressif/qma6100p。
+# 该组件基于 LEGACY I2C 驱动（driver/i2c.h），与相机 SCCB 所需的
+# driver/i2c_master.h 冲突：esp-idf 的 check_i2c_driver_conflict() 会在启动时
+# abort()。QMA6100P 现在由 main.c 里本地的 i2c_master 驱动（寄存器序列与旧库
+# 1:1 对齐）直接挂在 BSP 总线上，见 main.c「QMA6100P Accelerometer」一节。
