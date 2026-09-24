@@ -29,31 +29,36 @@ ESP32-S3-EYE 开发板           本地电脑 (PC)                浏览器
 ```
 data_capture_sim/                  # 仓库根目录
 ├── CMakeLists.txt                 # ESP-IDF 顶层工程入口（project: data_capture_sim）
-├── sdkconfig.defaults             # 默认 SDK 配置（目标芯片 esp32s3、单应用大分区、FATFS 长文件名）
+├── sdkconfig.defaults             # 默认 SDK 配置（目标芯片 esp32s3、单应用大分区、FATFS 长文件名、PSRAM、相机 JPEG、I2C）
 ├── .gitignore                     # 忽略 build/、sdkconfig、managed_components/、server/data/ 等
 │
 ├── main/                          # 板端固件（ESP-IDF 组件）
-│   ├── main.c                     # 主固件（约 3500 行）
-│   ├── CMakeLists.txt             # 组件注册 + 依赖声明
+│   ├── main.c                     # 主固件（约 4100 行）
+│   ├── CMakeLists.txt             # 组件注册 + 依赖声明（含 esp_video / esp_cam_sensor）
 │   ├── Kconfig.projbuild          # 菜单配置（WiFi / 设备 ID / 上传 URL）
-│   └── idf_component.yml          # 组件依赖（esp32_s3_eye、qma6100p）
+│   └── idf_component.yml          # 组件依赖（esp32_s3_eye；QMA6100P 驱动已内置在主固件里）
 │
 ├── docs/                          # 项目文档
 │   ├── crash_analysis_and_fix.md       # 崩溃分析与修复记录（LVGL 栈溢出）
 │   ├── psram_upload_fix.md             # 上传链路失效分析与修复（PSRAM 未启用）
 │   ├── manual_capture_task.md          # 按需采集任务（Web 触发、request_id 贯穿、三维视图）
 │   ├── manual_capture_task_acceptance.md # 验收手册：自检脚本 + 真机验收 + 逐条观测点/边界
-│   └── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
+│   ├── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
+│   ├── realtime_photo_capture.md       # 实时拍照（camera 任务 + JPEG 落盘 + 画廊/删除）
+│   └── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
-    ├── main.py                    # FastAPI 服务（约 1200 行：接收 + 存储 + 查询 + 任务接口）
+    ├── main.py                    # FastAPI 服务（约 1900 行：接收 + 存储 + 查询 + 任务 + 照片接口）
     ├── requirements.txt           # 依赖（fastapi、uvicorn、httpx）
     ├── test_receive.py            # 本地联调自测脚本（含按需采集任务全流程）
+    ├── test_photos.py             # 拍照链路自测脚本（临时库 + 临时照片目录）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检脚本
     ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
+    ├── e2e_live_check.py          # 摄像头直播自检（HTTP + 可选无头页面断言）
+    ├── photos/                    # 照片落盘目录（运行时生成，已 gitignore）
     └── static/                    # 实时监控页面（静态资源）
-        ├── index.html             # 页面结构 + 样式（含任务卡片与三维视图画布）
-        └── app.js                 # 轮询 + 渲染 + 任务跟踪 + Canvas 2D 三维姿态视图
+        ├── index.html             # 页面结构 + 样式（含任务卡片、拍照画廊与三维视图画布）
+        └── app.js                 # 轮询 + 渲染 + 任务跟踪 + 照片画廊 + Canvas 2D 三维姿态视图
 ```
 
 ### 2.1 根目录
@@ -68,25 +73,27 @@ data_capture_sim/                  # 仓库根目录
 
 | 文件 | 说明 |
 |------|------|
-| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。另含 **任务链路**：`task_poll_task` 每 3s 轮询 `/api/v1/tasks/next`；`kind=capture` 由 `sampler_task` 按任务节拍采一批数据（期间暂停周期上报）并带 `request_id` 回传；`kind=pause/resume`（Web「暂停周期 / 恢复周期」）由 `task_apply_control()` 切换周期上报闸门（双时钟惰性到点恢复）并 `POST /applied` 确认生效。 |
+| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。另含 **任务链路**：`task_poll_task` 每 3s 轮询 `/api/v1/tasks/next`；`kind=capture` 由 `sampler_task` 按任务节拍采一批数据（期间暂停周期上报）并带 `request_id` 回传；`kind=pause/resume`（Web「暂停周期 / 恢复周期」）由 `task_apply_control()` 切换周期上报闸门（双时钟惰性到点恢复）并 `POST /applied` 确认生效。另含 **摄像头实时直播**：长按 Button A（2 s）开关 `live_stream_task`，每 ~500 ms 拍一帧 JPEG 并 `POST /api/v1/live`（服务端只在内存里留最新一帧），与按需单帧拍照共用相机并用 `s_camera_mutex` 串行化。 |
 | `CMakeLists.txt` | 通过 `idf_component_register` 注册组件，声明 `SRCS "main.c"`，并 `REQUIRES` 大量依赖（`json`、`esp_http_client`、`esp_netif`、`esp_wifi`、`sdmmc`、`fatfs`、`esp_timer`、`esp_lcd` 等）。 |
 | `Kconfig.projbuild` | 定义 `menuconfig` 菜单：WiFi SSID/密码、设备 ID（`SENSOR_DEVICE_ID`）、上传 URL（`SENSOR_SERVER_URL`）、可选上传鉴权 Token（`SENSOR_TOKEN`）。真实值通过本地 `sdkconfig` 配置，**不入库**。 |
-| `idf_component.yml` | ESP 组件注册表依赖：`espressif/esp32_s3_eye`（BSP）、`espressif/qma6100p`（传感器驱动）、`idf >= 5.4`。 |
+| `idf_component.yml` | ESP 组件注册表依赖：`espressif/esp32_s3_eye`（BSP）、`espressif/esp_video`（相机/视频，BSP 传递依赖）、`idf >= 5.4`。 |
 
 ### 2.3 `server/` —— 服务端（FastAPI）
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、任务接口（含控制任务 `/applied` 与 `/api/v1/control`）、托管监控页面。 |
+| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、任务接口（含控制任务 `/applied` 与 `/api/v1/control`）、**摄像头直播内存接口（`/api/v1/live`）**、托管监控页面。 |
 | `requirements.txt` | Python 依赖：`fastapi`、`uvicorn[standard]`、`httpx`（自测用）。 |
 | `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败/控制任务 applied/暂停状态惰性归零），43 项断言。 |
+| `test_photos.py` | 拍照链路自测（临时库 + 临时照片目录）：JPEG 上传校验/落盘/取图/列表/404+410/删除/camera 任务收尾/幂等，16 项断言。 |
 | `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等，以及 pause/resume 的 `/applied` 收尾与 `/devices` 暂停标注），14 项断言。 |
-| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（6 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、参数表单带板端上限且任务真用该参数、任务卡片 `upload_id` 与时间戳、任务历史倒序、manual/periodic 对照区、无回执提示出现与消失、控制卡片「停止中/上报中」与控制任务渲染），64 项断言；未装浏览器时打印 SKIP。 |
+| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（6 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、参数表单带板端上限且任务真用该参数、任务卡片 `upload_id` 与时间戳、任务历史倒序、manual/periodic 对照区、无回执提示出现与消失、控制卡片「停止中/上报中」与控制任务渲染），81 项断言；未装浏览器时打印 SKIP。 |
+| `e2e_live_check.py` | 摄像头直播自检（临时库 + 真实 uvicorn，`SENSOR_LIVE_TIMEOUT_S=1`）：推帧 201/单调 `seq`、状态 `active/尺寸/帧龄`、`/live/frame` 原样取回、只保留最新一帧、错误路径（400/413/404）、**不落盘不入库**（`photos` 总数 0 + 照片目录为空）、超时后 `active=false` 但仍可取最后一帧；有 Edge/Chrome 时再 dump 两次 DOM，断言实时卡片 `<img>`、「推流中 · 640×480」徽章与超时后的「已停止（保留最后一帧）」，28 项断言。 |
 | `e2e_device_check.py` | 真机（上板）脚本化验收：起真实服务（默认 `0.0.0.0:8000`），等板端周期上报出现后跑「建任务 → 领取 → ack → 采集窗口内周期上报为 0 → completed + upload_id → 周期恢复 → 历史可见」+「暂停周期（板端 applied → device_control 停止中 → 观察窗内 0 新周期批次 → 暂停中手动采集仍可用）→ 恢复周期」28 项断言；板端不在场时打印 `[SKIP]` 并以 0 退出。 |
-| `static/index.html` | 监控页面结构（设备下拉、**采集参数表单**、**暂停时长 + 暂停周期/恢复周期按钮**、数据卡片、样本表、波形画布、任务卡片（含无回执提示）、**周期上报控制卡片**、**手动/周期对照表**、**任务历史表**、三维视图画布）。 |
-| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图 / 暂停状态）、`createTask(kind)` 统一建任务入口（采集 / 暂停 / 恢复）、状态跟踪（时间戳 / upload_id / 无回执推断）、控制卡片渲染、对照区与任务历史渲染、Canvas 2D 手写正交投影渲染。 |
+| `static/index.html` | 监控页面结构（设备下拉、**采集参数表单**、**暂停时长 + 暂停周期/恢复周期按钮**、数据卡片、样本表、波形画布、任务卡片（含无回执提示）、**周期上报控制卡片**、**手动/周期对照表**、**任务历史表**、**摄像头实时画面卡片（大图 + 徽章 + 元信息）**、拍照画廊、三维视图画布）。 |
+| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图 / 暂停状态 / **直播状态与最新一帧**）、`createTask(kind)` 统一建任务入口（采集 / 暂停 / 恢复）、状态跟踪（时间戳 / upload_id / 无回执推断）、控制卡片渲染、对照区与任务历史渲染、`refreshLive()` 按 `seq` 刷新直播 `<img>`、照片画廊渲染、Canvas 2D 手写正交投影渲染。 |
 
-#### 服务端数据库（SQLite，四张表）
+#### 服务端数据库（SQLite，五张表）
 
 | 表 | 说明 |
 |----|------|
@@ -94,6 +101,7 @@ data_capture_sim/                  # 仓库根目录
 | `samples` | 每批内的每个采样点一行，记录 `ax/ay/az` 三轴加速度与相对时间偏移。 |
 | `tasks` | 任务：`request_id`（主键，uuid4 hex）、设备、来源、单位、采样率/样本数、**类型 `kind`（`capture`/`pause`/`resume`）与暂停时长 `duration_s`**、状态、各状态时间戳、`expires_at`、关联 `upload_id` 与失败原因。 |
 | `device_control` | 周期上报暂停状态（`device_id + source` 主键）：`periodic_paused`、`paused_until`、`request_id`、`updated_at`——「是否真的暂停」的真相源，由板端 `POST /tasks/{id}/applied` 写入。 |
+| `photos` | 照片数据（`id` 主键、`device_id`、`request_id`、`ts_ms`、`received_at`、`bytes`、`width`、`height`、`ip`、`path`、`note`）：图片字节不入库，文件落在 `server/photos/<device_id>/<id>.jpg`。 |
 
 - **老库迁移**：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列。`init_db()` 在 `executescript`
   之后用 `PRAGMA table_info(...)` 判断并 `ALTER TABLE` 补 `uploads.request_id` / `uploads.trigger`
@@ -122,11 +130,18 @@ data_capture_sim/                  # 仓库根目录
 | `POST` | `/api/v1/tasks/{request_id}/fail` | 板端上报失败原因（写入 `tasks.error`）。 |
 | `POST` | `/api/v1/tasks/{request_id}/applied` | 板端回执「控制任务已生效」（仅 `pause`/`resume`）：置 `completed` 并写 `device_control`；`capture` 调用返回 `409 WRONG_KIND`。 |
 | `GET` | `/api/v1/control?device_id=…&source=…` | 暂停状态真相源（惰性归零后返回 `periodic_paused` / `remaining_s` / `paused_until_str` / `request_id`）。 |
+| `POST` | `/api/v1/photos?device_id=…&request_id=…` | 板端上传一帧 JPEG（body 即图片字节）：校验 SOI 魔数与 512 KiB 上限，落盘 + 写 `photos` 表，带 `request_id` 时同事务把 `kind=camera` 任务置 `completed`（同号重传幂等）。 |
+| `GET` | `/api/v1/photos?device_id=…&limit=12` | 照片列表（新的在前，`limit` 1–200），供页面画廊渲染缩略图与删除按钮。 |
+| `GET` | `/api/v1/photos/{id}` | 取一张照片的 JPEG 字节（画廊 `<img src>` 用它）；不存在 404，元数据在而文件丢失 410。 |
+| `DELETE` | `/api/v1/photos/{id}` | 删除一张照片（先删库行再删文件，返回 `file_deleted`）；重复删除 404。 |
+| `POST` | `/api/v1/live?device_id=…&ts_ms=…&w=…&h=…` | 板端直播推一帧 JPEG（body 即图片字节）：校验 `device_id` / SOI 魔数 / 512 KiB 上限，**只写内存**（不落盘、不入库、不建任务），成功 201 + 全局单调 `seq`。 |
+| `GET` | `/api/v1/live?device_id=…` | 直播状态：`active`（超过 `SENSOR_LIVE_TIMEOUT_S`，默认 5 s 无新帧即 false）/ `seq` / `age_ms` / 分辨率 / 字节数 / 时间戳 / `devices[]`；从未推流的设备返回 200 + `active=false`。 |
+| `GET` | `/api/v1/live/frame?device_id=…` | 最新一帧 JPEG（页面 `<img src>` 用它；`Cache-Control: no-store`）；从未推流 404。 |
 | `GET` | `/` | 极简 HTML 首页（内联渲染，数值不写死）。 |
 | `GET` | `/ui/` | 实时监控面板（托管 `server/static/` 下的静态文件）。 |
 
 > 鉴权范围：设备侧接口（`/api/v1/upload`、`/api/v1/tasks/next`、`/tasks/{id}/ack`、
-> `/tasks/{id}/fail`、`/tasks/{id}/applied`）在配置了 `SENSOR_TOKEN` 时要求
+> `/tasks/{id}/fail`、`/tasks/{id}/applied`、`/api/v1/live`）在配置了 `SENSOR_TOKEN` 时要求
 > `Authorization: Bearer <token>`；Web 侧查询/建任务接口与既有查询接口一样不做 Token 校验。
 
 ---
