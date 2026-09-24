@@ -15,6 +15,10 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
     控制卡片/任务卡片/历史表按控制任务渲染；模拟板端领取并 POST /applied 后，
     控制卡片转为「停止中」+ 倒计时 + request_id 可追溯；「恢复周期」（?autoresume=1）
     再把它恢复成「上报中」（第四/五/六次 dump）
+  * 实时拍照：「拍一张照片」按钮代码路径（/ui/?autophoto=1）建出 kind=camera 任务 →
+    模拟板端领取并 POST /api/v1/photos 上传一帧 JPEG → 任务 completed 且详情带 photo、
+    画廊出现缩略图/尺寸/删除按钮、任务卡片显示关联照片；DELETE 后画廊回到空态、计数归零
+    （第七/八/九次 dump）
 
 运行：python server/e2e_ui_check.py
   未找到浏览器时打印 [SKIP] 并以 0 退出；可用 EDGE_PATH 指定浏览器可执行文件。
@@ -23,10 +27,12 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 # 输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，遇到 m/s² 会编码失败
@@ -40,7 +46,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DB = os.path.join(_HERE, "data", "e2e_ui.db")
 if os.path.exists(_DB):
     os.remove(_DB)
+# 照片也写到临时目录（默认是 server/photos，正式目录不该被自检脚本写入）
+_PHOTOS = os.path.join(_HERE, "data", "e2e_ui_photos")
+if os.path.isdir(_PHOTOS):
+    shutil.rmtree(_PHOTOS, ignore_errors=True)
 os.environ["SENSOR_DB"] = _DB
+os.environ["SENSOR_PHOTO_DIR"] = _PHOTOS
 os.environ["SENSOR_HOST"] = "127.0.0.1"
 os.environ["SENSOR_PORT"] = "8012"
 
@@ -88,6 +99,29 @@ def post_json(path, body):
 def get_json(path):
     with urllib.request.urlopen(BASE + path, timeout=5) as resp:
         return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def post_jpeg(path, data):
+    """POST 原始字节：/api/v1/photos 的 body 就是 JPEG 本身（不是 JSON）。"""
+    req = urllib.request.Request(BASE + path, data=data, method="POST",
+                                 headers={"Content-Type": "image/jpeg"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def delete_json(path):
+    """DELETE 并解析 JSON（404 也解析 body，便于断言错误码）。"""
+    req = urllib.request.Request(BASE + path, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def jpeg_bytes(n, marker=0x66):
+    """最小合法 JPEG：SOI + APP0 + n 字节负载 + EOI（服务端只校验 SOI）。"""
+    return b"\xff\xd8\xff\xe0" + bytes([marker]) * n + b"\xff\xd9"
 
 
 def make_samples(n):
@@ -412,6 +446,77 @@ def main_run():
           "状态码 completed" in field(dom6, "taskStatus")
           and "不产生批次" in field(dom6, "taskUploadId"),
           "%s / %s" % (field(dom6, "taskStatus"), field(dom6, "taskUploadId")))
+
+    # 17) 实时拍照：页面建 kind=camera 任务 → 板端拍照上传 → 画廊出现缩略图与删除按钮
+    dom7 = dump_dom(browser, BASE + "/ui/?autophoto=1")
+    rid_photo = field(dom7, "taskRid")
+    check("page created a camera task", len(rid_photo) == 32 and rid_photo != rid_resume,
+          "rid=%s" % rid_photo)
+    check("camera task spec rendered", "JPEG" in field(dom7, "taskSpec"),
+          field(dom7, "taskSpec"))
+    st, body = get_json("/api/v1/tasks?device_id=%s&limit=5" % DEV)
+    cam_task = [t for t in body["tasks"] if t["request_id"] == rid_photo][0]
+    check("camera task stored with kind=camera",
+          cam_task["kind"] == "camera" and cam_task["kind_cn"] == "实时拍照"
+          and cam_task["status"] == "submitted", str(cam_task)[:160])
+
+    # 板端视角：领取 camera 任务（跳过更早的遗留任务）并上传一帧 JPEG
+    nx = None
+    for _ in range(12):
+        st, cand = get_json("/api/v1/tasks/next?device_id=" + DEV)
+        if not cand.get("found"):
+            break
+        if cand["task"]["kind"] == "camera":
+            nx = cand
+            break
+    check("board claimed the camera task",
+          nx is not None and nx["task"]["request_id"] == rid_photo, str(nx)[:140])
+
+    payload = jpeg_bytes(512, 0x77)
+    st, body = post_jpeg(
+        "/api/v1/photos?device_id=%s&request_id=%s&w=640&h=480&ts_ms=%d"
+        % (DEV, rid_photo, int(time.time() * 1000)), payload)
+    check("photo upload accepted",
+          st == 201 and body["bytes"] == len(payload) and body["idempotent"] is False,
+          str(body)[:140])
+    photo_id = body["photo_id"]
+    st, body = get_json("/api/v1/tasks/%s" % rid_photo)
+    check("camera task closed by the photo",
+          body["task"]["status"] == "completed" and body["photo"]["id"] == photo_id
+          and body["photo"]["width"] == 640, str(body["task"])[:140])
+
+    dom8 = dump_dom(browser, BASE + "/ui/")
+    grid = any_text(dom8, "photoGrid")
+    check("gallery shows the new photo",
+          ('data-photo-id="%d"' % photo_id) in grid, grid[:200])
+    check("gallery renders delete action",
+          ('title="DELETE /api/v1/photos/%d' % photo_id) in dom8,
+          "delete button title missing")
+    check("gallery renders size and dimensions",
+          "640\u00d7480" in grid and "KB" in grid, grid[:200])
+    check("photo count info rendered",
+          "共 1 张" in field(dom8, "photoInfo"), field(dom8, "photoInfo"))
+    check("photo badge shows the count", "1 张" in field(dom8, "photoBadge"),
+          field(dom8, "photoBadge"))
+    check("task card links the photo",
+          ("照片 #%d" % photo_id) in field(dom8, "taskUploadId"),
+          field(dom8, "taskUploadId"))
+
+    # 18) 删除：DELETE 后画廊回到空态、计数归零（服务端同时删库行与磁盘文件）
+    st, body = delete_json("/api/v1/photos/%d" % photo_id)
+    check("photo deleted via API",
+          st == 200 and body["deleted"] is True and body["file_deleted"] is True,
+          str(body)[:140])
+    st, body = get_json("/api/v1/photos?device_id=" + DEV)
+    check("photo list empty after delete", body["total"] == 0, str(body)[:140])
+    st, body = delete_json("/api/v1/photos/%d" % photo_id)
+    check("deleting twice returns 404", st == 404, str(body)[:120])
+    dom9 = dump_dom(browser, BASE + "/ui/")
+    check("gallery empty state rendered",
+          "还没有照片" in any_text(dom9, "photoGrid"),
+          any_text(dom9, "photoGrid")[:200])
+    check("photo info back to zero",
+          "共 0 张" in field(dom9, "photoInfo"), field(dom9, "photoInfo"))
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 
