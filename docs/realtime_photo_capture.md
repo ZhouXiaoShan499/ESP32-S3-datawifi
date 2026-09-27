@@ -237,6 +237,13 @@
 - **XCLK 固定 20 MHz**（`main.c` 的 `CAMERA_XCLK_FREQ_HZ`）：这是 OV2640 所有
   `DVP_8bit_20Minput_*` 格式表的要求（见 §三），也是板端不再用 `bsp_camera_start()` 的唯一原因。
   换其它传感器/格式表时要跟着改，否则会又回到「帧为 0 字节」的状态。
+- **相机需要 16 KiB 连续内部 DMA 内存**：`esp_cam_ctlr_dvp_cam.c` 每次 `STREAMON` 都会按
+  `CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE` 申请一块连续 `MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL`。
+  本固件内部 DRAM 只有 ~186 KiB、其中 app 自身的 `.data/.bss` 就占 ~117 KiB，所以 32 KiB
+  默认值会在负载高峰触发 ENOMEM（`VIDIOC_STREAMON failed: errno=12`）。`sdkconfig.defaults`
+  里已把 `CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE` 降到 16384，并把
+  `SPIRAM_MALLOC_ALWAYSINTERNAL` 降到 4096（让 cJSON/HTTP 等 ≥4 KiB 分配走 PSRAM），
+  上传高峰下最大连续内部块仍保持 ~29 KiB（真机连拍 3 张全部 `http=201` 验证）。
 - 照片**不参与自动清理/分页**：画廊固定取最近 12 张（`limit` 上限 200），磁盘占用需人工关注。
 - `note` 字段服务端已支持，但板端暂不上送（页面也不提供输入框），目前只有 `e2e`/第三方客户端会用到。
 - 拍照与上传在 `task_poll_task` 内同步执行，期间其它任务的下发/回执延迟 0.3–2 s。
