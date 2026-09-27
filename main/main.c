@@ -8,10 +8,11 @@
  *  - Real-sensor upload: every 1 s batches the m/s² accelerometer samples
  *    as JSON and POSTs them to a local FastAPI receiver via esp_http_client
  *  - Button A start/stop SD card CSV logging (from data_capture_sim)
- *  - Button A long press (2s): camera live streaming — captures a JPEG every
- *    ~500 ms and POSTs it to /api/v1/live, where the server keeps only the
- *    latest frame per device in memory for the Web "摄像头实时画面" card
- *    (~1-2 fps); long press again to stop.
+ *  - Button A long press (2s): cycles camera mode — Web live streaming (captures
+ *    a JPEG every ~500 ms and POSTs it to /api/v1/live, the server keeps only
+ *    the latest frame per device for the Web "摄像头实时画面" card, ~1-2 fps)
+ *    → local LCD preview (decodes each JPEG and draws it on the 240x240 screen)
+ *    → off.
  *  - LVGL real-time display (from data_capture_sim)
  *  - 6-face calibration mode: +X, -X, +Y, -Y, +Z, -Z, 10s each
  *
@@ -64,6 +65,7 @@
  * esp_cam_sensor_xclk_* 用来自己驱动相机 XCLK（见 app_camera_init()）。 */
 #include "esp_video_init.h"
 #include "esp_cam_sensor_xclk.h"
+#include "jpeg_decoder.h"      /* esp_jpeg 软解：把 JPEG 解成 RGB565（本地 LCD 预览用） */
 #include <stdlib.h>
 #include "freertos/queue.h"
 
@@ -315,6 +317,7 @@ static char s_time_str[64];
 static volatile bool s_live_streaming = false;    /* 正在推流？ */
 static volatile uint32_t s_live_frames = 0;       /* 本次推流已成功上传的帧数 */
 static volatile int s_live_last_status = 0;       /* 最近一帧的 HTTP 状态（0 = 网络层失败） */
+static volatile bool s_preview_active = false;    /* 本地 LCD 相机预览中？ */
 
 /* WiFi event group */
 static EventGroupHandle_t s_wifi_event_group;
@@ -582,7 +585,9 @@ static void refresh_ui(void)
     /* State display：直播中显示推流帧数（长按 Button A 开关，见「实时直播」一节）；
      * 右侧固定带网络 token，见上面 net_buf 的说明。 */
     if (s_state_label) {
-        if (s_live_streaming) {
+        if (s_preview_active) {
+            lv_label_set_text_fmt(s_state_label, "PREVIEW  NET:%s", net_buf);
+        } else if (s_live_streaming) {
             lv_label_set_text_fmt(s_state_label, "LIVE %" PRIu32 " fr  NET:%s",
                                   s_live_frames, net_buf);
         } else {
@@ -1585,6 +1590,150 @@ cleanup:
     }
     return ret;
 }
+/* ================================================================
+ *  Local LCD camera preview（长按 Button A 三态循环的第 3 态）
+ *
+ *  传感器始终保持 JPEG 640x480，不做运行时格式切换（esp_video 的 DVP 设备
+ *  VIDIOC_S_FMT 会拒绝尺寸/格式变化，而切格式要私有 ioctl + 传感器内部寄存器表）。
+ *  这里复用 app_camera_capture_jpeg() 拍一帧 JPEG，用 esp_jpeg 软解成 RGB565、
+ *  中心裁剪后画到 240x240 的 LVGL canvas，实现「把屏幕切成摄像头画面」。
+ * ================================================================ */
+#define CAMERA_PREVIEW_W              240
+#define CAMERA_PREVIEW_H              240
+#define CAMERA_PREVIEW_BYTES          (CAMERA_PREVIEW_W * CAMERA_PREVIEW_H * 2)  /* RGB565 */
+#define CAMERA_PREVIEW_DECODE_BYTES   (320 * 240 * 2)  /* 640x480 JPEG 1/2 缩放 = 320x240 RGB565 */
+#define CAMERA_PREVIEW_FRAME_INTERVAL_MS  50
+#define CAMERA_PREVIEW_TASK_STACK     8192
+#define CAMERA_PREVIEW_TASK_PRIORITY  2
+
+static lv_obj_t *s_preview_canvas = NULL;
+static uint8_t *s_preview_canvas_buf = NULL;   /* 240x240 RGB565，直接绑定给 canvas */
+static uint8_t *s_preview_decode_buf = NULL;   /* 320x240 RGB565，解码中间缓冲 */
+
+/* 一帧 JPEG → RGB565，中心裁剪进 240x240 的 dst。 */
+static bool camera_preview_decode(const jpeg_frame_t *frame, uint8_t *dst)
+{
+    if (!frame || !frame->data || frame->len < 16 || !dst || !s_preview_decode_buf) {
+        return false;
+    }
+    esp_jpeg_image_cfg_t cfg = {
+        .indata      = frame->data,
+        .indata_size = frame->len,
+        .out_format  = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale   = JPEG_IMAGE_SCALE_1_2,
+    };
+    esp_jpeg_image_output_t out = { 0 };
+    if (esp_jpeg_get_image_info(&cfg, &out) != ESP_OK ||
+        out.output_len > CAMERA_PREVIEW_DECODE_BYTES) {
+        return false;
+    }
+    cfg.outbuf      = s_preview_decode_buf;
+    cfg.outbuf_size = CAMERA_PREVIEW_DECODE_BYTES;
+    if (esp_jpeg_decode(&cfg, &out) != ESP_OK ||
+        out.width < CAMERA_PREVIEW_W || out.height < CAMERA_PREVIEW_H) {
+        return false;
+    }
+    /* 中心裁剪：左右各去掉 (out.width - 240)/2 列，逐行拷贝 240 个像素。 */
+    const int x_off = ((int)out.width - CAMERA_PREVIEW_W) / 2;
+    for (int y = 0; y < CAMERA_PREVIEW_H; y++) {
+        memcpy(dst + (size_t)y * CAMERA_PREVIEW_W * 2,
+               s_preview_decode_buf + ((size_t)y * out.width + x_off) * 2,
+               CAMERA_PREVIEW_W * 2);
+    }
+    return true;
+}
+
+/* 惰性创建预览 canvas + 双缓冲；只做一次，之后反复 show/hide。 */
+static void camera_preview_ui_create(void)
+{
+    if (s_preview_canvas) {
+        return;
+    }
+    if (!s_preview_canvas_buf) {
+        s_preview_canvas_buf = heap_caps_malloc(CAMERA_PREVIEW_BYTES,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_preview_decode_buf) {
+        s_preview_decode_buf = heap_caps_malloc(CAMERA_PREVIEW_DECODE_BYTES,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_preview_canvas_buf || !s_preview_decode_buf) {
+        ESP_LOGE(TAG, "[prev] no PSRAM for preview buffers");
+        return;
+    }
+    if (!bsp_display_lock(0)) {
+        return;
+    }
+    lv_obj_t *scr = lv_disp_get_scr_act(NULL);
+    s_preview_canvas = lv_canvas_create(scr);
+    lv_obj_set_size(s_preview_canvas, CAMERA_PREVIEW_W, CAMERA_PREVIEW_H);
+    lv_obj_align(s_preview_canvas, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(s_preview_canvas, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_preview_canvas, LV_OPA_COVER, 0);
+    lv_canvas_set_buffer(s_preview_canvas, s_preview_canvas_buf,
+                         CAMERA_PREVIEW_W, CAMERA_PREVIEW_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_hidden(s_preview_canvas, true);
+    bsp_display_unlock();
+}
+
+static void camera_preview_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "[prev] preview started (240x240 RGB565)");
+    while (s_preview_active) {
+        jpeg_frame_t frame = { 0 };
+        if (app_camera_capture_jpeg(&frame) == ESP_OK) {
+            if (camera_preview_decode(&frame, s_preview_canvas_buf)) {
+                if (bsp_display_lock(0)) {
+                    lv_obj_invalidate(s_preview_canvas);
+                    bsp_display_unlock();
+                }
+            }
+            jpeg_frame_free(&frame);
+        }
+        vTaskDelay(pdMS_TO_TICKS(CAMERA_PREVIEW_FRAME_INTERVAL_MS));
+    }
+    if (bsp_display_lock(0)) {
+        if (s_preview_canvas) {
+            lv_obj_set_hidden(s_preview_canvas, true);
+        }
+        bsp_display_unlock();
+    }
+    s_preview_active = false;
+    refresh_ui();
+    log_heap("preview: task done");
+    ESP_LOGI(TAG, "[prev] preview stopped");
+    vTaskDelete(NULL);
+}
+
+static bool camera_preview_start(void)
+{
+    if (s_preview_active) {
+        return true;
+    }
+    if (!s_camera_ready) {
+        ESP_LOGW(TAG, "[prev] camera not initialized - cannot preview");
+        return false;
+    }
+    camera_preview_ui_create();
+    if (!s_preview_canvas || !s_preview_canvas_buf || !s_preview_decode_buf) {
+        return false;
+    }
+    if (bsp_display_lock(0)) {
+        lv_obj_set_hidden(s_preview_canvas, false);
+        bsp_display_unlock();
+    }
+    s_preview_active = true;
+    if (xTaskCreate(camera_preview_task, "preview_task", CAMERA_PREVIEW_TASK_STACK,
+                    NULL, CAMERA_PREVIEW_TASK_PRIORITY, NULL) != pdPASS) {
+        s_preview_active = false;
+        ESP_LOGE(TAG, "[prev] task create failed (heap?)");
+        return false;
+    }
+    refresh_ui();
+    return true;
+}
+
 /* ================================================================
  *  6-Face Calibration Mode
  * ================================================================ */
@@ -2663,7 +2812,7 @@ static void init_buttons(void)
     ESP_LOGI(TAG, "Initialized %d buttons, using BSP_BUTTON_1 + BSP_BUTTON_2", button_count);
 
     /* Button A: single click → start/stop normal collection
-     *           long press (2s) → toggle camera live streaming (Board → Web 实时画面) */
+     *           long press (2s) → 三态循环：关 → Web 直播 → 本地 LCD 预览 */
     ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[START_BUTTON_INDEX],
                                            BUTTON_SINGLE_CLICK,
                                            NULL,
@@ -2679,7 +2828,7 @@ static void init_buttons(void)
                                            button_a_long_press_cb,
                                            NULL));
     ESP_LOGI(TAG, "Button A registered: single click = start/stop logging,"
-                  " long press (2s) = camera live streaming");
+                  " long press (2s) = Web live -> local preview -> off");
 
     /* Button B: single click → start/stop 6-face calibration
  *             long press (2s) → toggle stand/stairs/bend/jump/fall protocol */
@@ -3690,11 +3839,28 @@ static void live_streaming_toggle(void)
     ESP_LOGI(TAG, "[live] streaming enabled: long press Button A again to stop");
 }
 
+/* 长按 Button A 三态循环：关 → Web 直播 → 本地 LCD 预览 → 关。 */
+static void camera_mode_toggle(void)
+{
+    if (s_preview_active) {
+        s_preview_active = false;    /* 预览 → 关（预览任务下一轮自行收尾 UI） */
+        ESP_LOGI(TAG, "[prev] stop requested (long press Button A)");
+        return;
+    }
+    if (s_live_streaming) {
+        s_live_streaming = false;    /* Web 直播 → 本地预览（直播任务下一轮收尾） */
+        ESP_LOGI(TAG, "[live] stop requested, switching to local preview");
+        camera_preview_start();
+        return;
+    }
+    live_streaming_toggle();         /* 关 → Web 直播 */
+}
+
 static void button_a_long_press_cb(void *arg, void *data)
 {
     (void)arg;
     (void)data;
-    live_streaming_toggle();
+    camera_mode_toggle();
 }
 
 /* Retry the applied receipt of the last control task (bounded: a receipt older

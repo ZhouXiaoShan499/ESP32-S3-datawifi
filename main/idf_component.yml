@@ -3,6 +3,8 @@ description: IMU data logger with Wi-Fi + SNTP time sync + SD card logging + on-
 dependencies:
   espressif/esp32_s3_eye:
     version: "^6"
+  espressif/esp_jpeg:
+    version: "^1.0.0"
   idf: ">=5.4"
 
 # 注意：不再依赖 espressif/qma6100p。

@@ -24,4 +24,5 @@ idf_component_register(SRCS "main.c"
                         hal
                         soc
                         esp_video
-                        esp_cam_sensor)
+                        esp_cam_sensor
+                        esp_jpeg)
