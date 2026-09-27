@@ -96,6 +96,7 @@ const $ = {
   autoRotate: el('autoRotate'),
   resetView: el('resetView'),
   photoBtn: el('photoBtn'),
+  previewBtn: el('previewBtn'),
   photoBadge: el('photoBadge'),
   photoInfo: el('photoInfo'),
   photoStatus: el('photoStatus'),
@@ -587,6 +588,7 @@ const TASK_LIMITS = {
 const TASK_KIND = {
   capture: { text: '按需采集', short: 'capture', spec: (t) => (t.sample_count ?? '—') + ' 点 @ ' + (t.sample_rate_hz ?? '—') + ' Hz' },
   camera: { text: '实时拍照', short: 'camera', spec: () => '拍一帧 640×480 JPEG 并上传（不采样本）' },
+  preview: { text: '本地预览', short: 'preview', spec: () => '切换板端 240×240 LCD 相机预览（开/关）' },
   pause: { text: '暂停周期', short: 'pause', spec: (t) => '暂停 ' + (t.duration_s ?? TASK_LIMITS.pauseDefault) + ' s（到期自动恢复）' },
   resume: { text: '恢复周期', short: 'resume', spec: () => '立即恢复周期上报' },
 };
@@ -969,7 +971,8 @@ async function createTask(kind, extra) {
   }
 
   const buttons = kind === 'capture' ? [$.captureBtn]
-                : (kind === 'camera' ? [$.photoBtn] : [$.pauseBtn, $.resumeBtn]);
+                : (kind === 'camera' ? [$.photoBtn]
+                : (kind === 'preview' ? [$.previewBtn] : [$.pauseBtn, $.resumeBtn]));
   for (const b of buttons) if (b) b.disabled = true;
   try {
     const data = await apiPost('/api/v1/tasks', body);
@@ -1188,6 +1191,25 @@ async function capturePhoto() {
   return task;
 }
 
+/** 点击「切换本地预览」：建 kind=preview 任务（toggle），板端 applied 后即生效 */
+async function togglePreview() {
+  if (!state.current) {
+    renderStatus('⚠ 请先选择设备：下拉来自 /api/v1/devices，板端至少上传过一次才会出现', 'error');
+    return null;
+  }
+  if ($.photoStatus) $.photoStatus.textContent = '已下发本地预览切换任务，等待板端领取…';
+  const task = await createTask('preview');
+  if (!task) {
+    if ($.photoStatus) $.photoStatus.textContent = '—';
+    return null;
+  }
+  if ($.photoStatus) {
+    $.photoStatus.textContent = '任务 ' + shortRid(task.request_id) +
+      ' 已下发（板端 ≤3 s 轮询领取，切换 LCD 预览）';
+  }
+  return task;
+}
+
 /** 画廊：拉该设备最近 PHOTO_LIMIT 张照片并渲染（失败只在卡片内提示，不影响主面板） */
 async function refreshGallery() {
   const grid = $.photoGrid;
@@ -1300,6 +1322,7 @@ $.captureBtn.addEventListener('click', () => captureOnce());
 $.pauseBtn.addEventListener('click', () => pausePeriodic());
 $.resumeBtn.addEventListener('click', () => resumePeriodic());
 $.photoBtn.addEventListener('click', () => capturePhoto());
+$.previewBtn.addEventListener('click', () => togglePreview());
 
 // 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
@@ -1312,6 +1335,7 @@ $.captureBtn.disabled = false;
 $.pauseBtn.disabled = false;
 $.resumeBtn.disabled = false;
 $.photoBtn.disabled = false;
+$.previewBtn.disabled = false;
 syncFormFromUrl();       // 先让 ?samples=/&rate=/&timeout=/&source=/&pause= 覆盖表单初值
 refreshSidePanels();
 
