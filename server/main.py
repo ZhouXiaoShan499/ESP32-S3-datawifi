@@ -127,14 +127,18 @@ TASK_KIND_CAPTURE = "capture"
 TASK_KIND_CAMERA = "camera"
 TASK_KIND_PAUSE = "pause"
 TASK_KIND_RESUME = "resume"
-TASK_KINDS = (TASK_KIND_CAPTURE, TASK_KIND_CAMERA, TASK_KIND_PAUSE, TASK_KIND_RESUME)
+TASK_KIND_PREVIEW = "preview"
+TASK_KINDS = (TASK_KIND_CAPTURE, TASK_KIND_CAMERA, TASK_KIND_PAUSE, TASK_KIND_RESUME, TASK_KIND_PREVIEW)
 TASK_KIND_CN = {
     TASK_KIND_CAPTURE: "按需采集",
     TASK_KIND_CAMERA: "实时拍照",
     TASK_KIND_PAUSE: "暂停周期上报",
     TASK_KIND_RESUME: "恢复周期上报",
+    TASK_KIND_PREVIEW: "本地预览",
 }
-TASK_CONTROL_KINDS = (TASK_KIND_PAUSE, TASK_KIND_RESUME)
+# preview 也走「控制类」收尾（板端 /applied），但不产生 device_control 状态：
+# 它只切换板端 LCD 预览开关，不影响 periodic_paused。
+TASK_CONTROL_KINDS = (TASK_KIND_PAUSE, TASK_KIND_RESUME, TASK_KIND_PREVIEW)
 
 # 暂停时长（秒）：到点板端自愈恢复、服务端惰性归零，忘点「恢复周期」也不会永久哑掉。
 PAUSE_DEFAULT_S = 120
@@ -1583,7 +1587,9 @@ async def create_task(request: Request):
 
         now = time.time()
         superseded = 0
-        if is_control:
+        # 互斥只对 pause/resume 这对「方向相反」的控制任务生效；preview 是独立
+        # 开关，不取代任何其它控制任务，也不该被它们取代。
+        if kind in (TASK_KIND_PAUSE, TASK_KIND_RESUME):
             other = (TASK_KIND_RESUME if kind == TASK_KIND_PAUSE
                      else TASK_KIND_PAUSE)
             cur = conn.execute(
@@ -1856,7 +1862,7 @@ async def fail_task(request_id: str, request: Request):
 
 @app.post("/api/v1/tasks/{request_id}/applied")
 async def applied_task(request_id: str, request: Request):
-    """板端确认「控制任务已生效」（仅 pause / resume）。
+    """板端确认「控制任务已生效」（pause / resume / preview）。
 
     控制任务不产生观测数据，所以无法像采集任务那样靠带 request_id 的上传收尾，
     改由板端在真的切换了周期上报开关之后调用本接口。服务端在同一事务里：
@@ -1940,7 +1946,8 @@ async def applied_task(request_id: str, request: Request):
         ).fetchone()
         stale = newer is not None
 
-        if not stale and not replay:
+        # preview 只切换 LCD 预览开关，不写 periodic_paused（也不该翻掉暂停状态）
+        if kind in (TASK_KIND_PAUSE, TASK_KIND_RESUME) and not stale and not replay:
             if kind == TASK_KIND_PAUSE:
                 duration = float(task["duration_s"] or PAUSE_DEFAULT_S)
                 until = now + duration
