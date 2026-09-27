@@ -241,7 +241,26 @@ def browser_checks(browser):
     with urllib.request.urlopen(req, timeout=10) as resp:
         check("seed 周期上报", resp.status == 201)
 
-    # 推一帧新鲜的，页面首轮 poll 才能看到 active=true
+    # 页面首轮 poll 必须看到 active=true。但本脚本把 LIVE_TIMEOUT_S 压到 1 s，
+    # 而"启动无头浏览器 → 加载页面 → 首轮轮询"这一段本身就要 1 s 以上，
+    # 所以**只推一帧必然过期**（这条断言以前是碰运气过的，机器一慢就红）。
+    # 改成后台线程按 0.4 s 持续推帧，等本段浏览器断言做完再停；
+    # 后面"超时判定"那段仍然靠真正停推来触发 active=false，断言强度不变。
+    stop_push = threading.Event()
+
+    def keep_pushing():
+        while not stop_push.is_set():
+            try:
+                post_frame(DEV, jpeg_bytes(3000, 0x33),
+                           ts_ms=int(time.time() * 1000))
+            except Exception:
+                pass        # 服务端在重启窗口内时忽略，下一轮补上
+            stop_push.wait(0.4)
+
+    pusher = threading.Thread(target=keep_pushing, daemon=True)
+    pusher.start()
+
+    # 先单独推一帧并断言接收成功，再开浏览器（这条同时确认推帧路径本身可用）
     frame = jpeg_bytes(3000, 0x33)
     st, _, raw = post_frame(DEV, frame, ts_ms=int(time.time() * 1000))
     check("页面断言前重新推帧", st == 201, raw.decode("utf-8")[:120])
@@ -259,6 +278,8 @@ def browser_checks(browser):
           "seq" in meta and "640×480" in meta and "s 前" in meta, meta[:160])
     off = tag_of(dom, "span", "liveOff")
     check("占位提示已隐藏", "hidden" in off, off[:80])
+
+    stop_push.set()         # 停推：下面开始验证"无新帧 → 已停止"
 
     # 等过阈值再 dump：active=false → 徽章变「已停止（保留最后一帧）」，画面不消失
     time.sleep(main.LIVE_TIMEOUT_S + 0.6)

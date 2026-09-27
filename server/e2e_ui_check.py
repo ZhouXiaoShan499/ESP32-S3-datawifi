@@ -34,6 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 # 输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，遇到 m/s² 会编码失败
 for _stream in (sys.stdout, sys.stderr):
@@ -517,6 +518,42 @@ def main_run():
           any_text(dom9, "photoGrid")[:200])
     check("photo info back to zero",
           "共 0 张" in field(dom9, "photoInfo"), field(dom9, "photoInfo"))
+
+    # 19) 闭环事件（板端按键触发 → 远端显示）：用 HTTP 模拟板端按下触发键，
+    #     页面应立刻出现「待处理」的卡片与流水行；再模拟板端回应，卡片转「已回应」。
+    #     这一次 dump 之前先把事件造出来，保证页面读到的就是它。
+    ev_rid = uuid.uuid4().hex
+    st, body = post_json("/api/v1/events/trigger", {
+        "device_id": DEV, "source": "qma6100p", "kind": "alert",
+        "request_id": ev_rid, "ts_ms": int(time.time() * 1000),
+    })
+    check("board trigger accepted", st == 201 and body["event"]["status"] == "pending",
+          str(body)[:160])
+
+    dom10 = dump_dom(browser, BASE + "/ui/")
+    check("event card shows the request_id",
+          ev_rid in field(dom10, "eventRid"), field(dom10, "eventRid"))
+    check("event card shows 待处理状态",
+          "待处理" in field(dom10, "eventStatus"), field(dom10, "eventStatus"))
+    check("event card shows 板端触发时刻",
+          "—（板端未带时间）" not in field(dom10, "eventDeviceTs"),
+          field(dom10, "eventDeviceTs"))
+    check("event badge flags pending events",
+          "待处理" in field(dom10, "eventBadge"), field(dom10, "eventBadge"))
+    check("event history has a row",
+          ev_rid[:12] in tbody_html(dom10, "eventHistoryBody"),
+          tbody_html(dom10, "eventHistoryBody")[:200])
+
+    # 模拟板端按「回应键」（单击 = accept）：卡片应转成「已回应」
+    st, body = post_json("/api/v1/events/respond",
+                         {"request_id": ev_rid, "action": "accept", "by": "device"})
+    check("board respond accepted", st == 200 and body["event"]["status"] == "ack",
+          str(body)[:160])
+    dom11 = dump_dom(browser, BASE + "/ui/")
+    check("event card follows the board response",
+          "已回应" in field(dom11, "eventStatus"), field(dom11, "eventStatus"))
+    check("event card records who responded",
+          "板端按键" in field(dom11, "eventResponded"), field(dom11, "eventResponded"))
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 

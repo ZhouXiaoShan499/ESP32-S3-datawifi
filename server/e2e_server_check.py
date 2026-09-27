@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 # 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -203,6 +204,76 @@ def main():
         assert h["tasks_by_status"].get("completed") == 3, h["tasks_by_status"]
         assert h["tasks_by_status"].get("failed", 0) == 0, h["tasks_by_status"]
         print("[PASS] health 任务统计（含控制任务）:", h["tasks_by_status"])
+
+        # ---------------- 闭环事件（板端按键触发，真实 HTTP） ----------------
+        # 这条链路方向与 tasks 相反：板端发起、Web 接收，所以这里模拟的
+        # "板端"顺序是 触发 → 回应，而 "Web" 负责看列表和点确认完成。
+        ev_dev = "esp32s3-eye-loop-e2e"
+        ev_rid = uuid.uuid4().hex
+
+        st, ej = request("POST", BASE + "/api/v1/events/trigger", {
+            "device_id": ev_dev, "source": "qma6100p", "kind": "alert",
+            "request_id": ev_rid, "ts_ms": int(time.time() * 1000),
+        })
+        assert st == 201 and ej["event"]["status"] == "pending", (st, ej)
+        print("[PASS] 板端触发（真实 HTTP）：201 + status=pending")
+
+        # 板端重试同一次按键（同一 request_id）→ 幂等，不产生第二条
+        st, dup = request("POST", BASE + "/api/v1/events/trigger", {
+            "device_id": ev_dev, "source": "qma6100p", "kind": "alert",
+            "request_id": ev_rid, "ts_ms": int(time.time() * 1000),
+        })
+        assert st == 200 and dup.get("idempotent") is True, (st, dup)
+        st, lj = request("GET", BASE + "/api/v1/events?device_id=" + ev_dev)
+        assert lj["count"] == 1, lj
+        print("[PASS] 板端重试幂等（真实 HTTP）：同 request_id 仍只有 1 条事件")
+
+        # 板端轮询远端状态
+        st, sj = request(
+            "GET", BASE + "/api/v1/events/status?device_id=%s&request_id=%s"
+            % (ev_dev, ev_rid))
+        assert st == 200 and sj["status"] == "pending", (st, sj)
+        print("[PASS] 板端轮询 /events/status（真实 HTTP）：status=pending")
+
+        # Web 远端显示：列表里能看到这条待处理事件
+        st, lj = request("GET", BASE + "/api/v1/events?device_id=%s&active=1" % ev_dev)
+        assert lj["pending"] == 1 and lj["events"][0]["request_id"] == ev_rid, lj
+        print("[PASS] Web 远端列表可见待处理事件（active=1）")
+
+        # 板端按「回应」→ ack
+        st, rj = request("POST", BASE + "/api/v1/events/respond",
+                         {"request_id": ev_rid, "action": "accept", "by": "device"})
+        assert st == 200 and rj["event"]["status"] == "ack", (st, rj)
+        print("[PASS] 板端回应 accept（真实 HTTP）：status=ack")
+
+        # 板端轮询到 ack —— 等价于 LCD 上从 LOOP:WAIT 走到远端已回来
+        st, sj = request(
+            "GET", BASE + "/api/v1/events/status?device_id=%s&request_id=%s"
+            % (ev_dev, ev_rid))
+        assert sj["status"] == "ack", sj
+        print("[PASS] 板端轮询到 ack（真实 HTTP）：本地可收尾")
+
+        # Web 点「确认完成」→ completed，终态不可回退
+        st, cj = request("POST", BASE + "/api/v1/events/respond",
+                         {"request_id": ev_rid, "action": "confirm", "by": "web"})
+        assert st == 200 and cj["event"]["status"] == "completed", (st, cj)
+        st, cj2 = request("POST", BASE + "/api/v1/events/respond",
+                          {"request_id": ev_rid, "action": "cancel", "by": "web"})
+        assert st == 409 and cj2["code"] == "CONFLICT", (st, cj2)
+        print("[PASS] Web 确认完成 → completed，且终态不可回退（409）")
+
+        # 未知 request_id：轮询 200/found=false；响应 404
+        st, uj = request("GET", BASE + "/api/v1/events/status?device_id=%s&request_id=%s"
+                                % (ev_dev, uuid.uuid4().hex))
+        assert st == 200 and uj["found"] is False, (st, uj)
+        st, uj2 = request("POST", BASE + "/api/v1/events/respond",
+                          {"request_id": uuid.uuid4().hex, "action": "accept"})
+        assert st == 404, (st, uj2)
+        print("[PASS] 未知 request_id：轮询 200/found=false，响应 404")
+
+        st, h = request("GET", BASE + "/api/v1/health")
+        assert h["total_events"] == 1 and h["events_by_status"].get("completed") == 1, h
+        print("[PASS] health 事件统计:", h["events_by_status"])
 
         print("\nE2E ALL CHECKS PASSED")
     finally:
