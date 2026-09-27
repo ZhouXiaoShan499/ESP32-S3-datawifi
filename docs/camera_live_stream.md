@@ -1,8 +1,11 @@
-# 摄像头实时直播（长按 Button A → 板端推帧 → Web 实时画面）
+# 摄像头实时直播 + 本地 LCD 预览（长按 Button A 三态切换）
 
-> 对应 Web 监控页「摄像头实时画面」卡片 + 板端 **长按 Button A（2 s）** 开关。
-> 目标：在**不打断 IMU 采样、不暂停周期上报、不刷爆数据库/磁盘**的前提下，
-> 把板端相机画面连续推到页面，得到 ~1-2 fps 的实时画面；再长按一次停止。
+> 对应 Web 监控页「摄像头实时画面」卡片 + 板端 **长按 Button A（2 s）** 三态切换：
+> **关 → Web 直播 → 本地 LCD 预览 → 关**。
+> - **Web 直播**：把板端相机画面连续推到页面，得到 ~1-2 fps 的实时画面；
+> - **本地 LCD 预览**：板端把每帧 JPEG 软解成 RGB565，直接画在 240×240 屏上。
+>
+> 两者都在**不打断 IMU 采样、不暂停周期上报、不刷爆数据库/磁盘**的前提下进行。
 > 相关代码：`main/main.c`（板端）、`server/main.py`（服务端）、`server/static/*`（页面）、
 > `server/e2e_live_check.py`（自检）。
 
@@ -31,14 +34,14 @@
 
 | 环节 | 实现 | 关键点 |
 |------|------|--------|
-| 开关 | `button_a_long_press_cb()` → `live_streaming_toggle()` | **Button A 单击行为不变**（启停采集），长按（2 s）才切换直播；长按不会额外触发单击（见 `iot_button` 状态机） |
+| 开关 | `button_a_long_press_cb()` → `camera_mode_toggle()` | **Button A 单击行为不变**（启停采集）；长按（2 s）在「关 → Web 直播 → 本地预览」之间循环，长按不会额外触发单击（见 `iot_button` 状态机） |
 | 拍摄 | `app_camera_capture_jpeg()`：`G_FMT/S_FMT → REQBUFS/QUERYBUF/mmap/QBUF → STREAMON → DQBUF → STREAMOFF` | 与按需拍照同一函数，复用既有 V4L2 路径 |
 | 串行化 | `s_camera_mutex`（`CAMERA_LOCK_TIMEOUT_MS` = 5 s） | `/dev/video0` 独占：直播取帧与单帧拍照排队，避免两次 `STREAMON` 互踩 |
 | 上传 | `live_post_frame()`：`esp_http_client_open(len)` + `write` | `Content-Length` 定长发送；**没有 request_id、没有任务收尾** |
 | 服务端 | `upload_live_frame()` → `_live_frames[device_id]` | 只保留最新一帧；`_live_lock` 保护；上限 `LIVE_MAX_FRAME_BYTES` = 512 KiB |
 | 状态 | `live_status()`：`active = now - received_at <= LIVE_TIMEOUT_S`（默认 5 s） | 超时即判定「已停止推流」，页面显示徽章而不是报错 |
 | 展示 | `refreshLive()` + `renderLiveOff()` + `<img id="liveImg">` | seq 变化才换 `src`（附 `&seq=&t=`），`Cache-Control: no-store` |
-| 停止 | 再长按一次 / WiFi 掉线 / 连续失败 5 次 | 任务自己 `vTaskDelete(NULL)`，按键回调只置标志，不做 `vTaskDelete` |
+| 停止 | 再长按一次（进下一态）/ WiFi 掉线 / 连续失败 5 次 | 任务自己 `vTaskDelete(NULL)`，按键回调只置标志，不做 `vTaskDelete` |
 
 ---
 
@@ -78,6 +81,23 @@ LCD 状态：状态栏显示 `… Live:ON/OFF`（240 px 宽的屏只留诊断信
 
 任务优先级刻意最低（2 < `task_poll` 3 < `uploader` 4 < `sampler` 5）：
 直播是「锦上添花」的负载，网络突然变慢时先让位给采样与上传。
+
+### 本地 LCD 预览（三态循环的第 3 态）
+
+- 触发：长按 Button A 依次 `关 → Web 直播 → 本地预览 → 关`（`camera_mode_toggle()`）。
+- 实现：**传感器保持 JPEG 640×480，不做运行时格式切换**——esp_video 的 DVP 设备
+  `VIDIOC_S_FMT` 会拒绝尺寸/格式变化，切换格式要私有 `VIDIOC_S_SENSOR_FMT` ioctl +
+  传感器内部寄存器表，故不采用。预览复用 `app_camera_capture_jpeg()` 拍一帧 JPEG，
+  用 `espressif/esp_jpeg` 软解到 RGB565（`JPEG_IMAGE_SCALE_1_2` → 320×240），中心裁剪
+  成 240×240 后写进 LVGL `lv_canvas` 直接上屏。
+- 符号：`CAMERA_PREVIEW_*`、`s_preview_active`、`camera_preview_decode()`、
+  `camera_preview_task()`、`camera_preview_start()`。帧缓冲都在 PSRAM
+  （`240×240×2` + `320×240×2` ≈ 263 KiB）。
+- 串行化：预览与拍照/直播共用 `s_camera_mutex`，每帧只持锁到 `DQBUF` 完成即还，
+  按需拍照任务在预览期间最多等一帧，不会被饿死。
+- 依赖：`main/idf_component.yml` 新增 `espressif/esp_jpeg`（软件 JPEG 解码；ESP32-S3
+  没有硬件 JPEG 编解码器）。
+- LCD 状态：预览期间第一行状态显示 `PREVIEW  NET:<ip>`。
 
 ---
 
@@ -142,6 +162,8 @@ python server/e2e_live_check.py
 ## 七、已知限制
 
 - 帧率受「一次 V4L2 采集 + 一帧 HTTP 上传」限制，实测约 1-2 fps；不是视频编码流。
+- 本地 LCD 预览是「软解 JPEG」：640×480 解到 1/2 再中心裁剪，单帧解码约几十 ms，
+  实测约 5-10 fps；预览会占用更多 CPU（优先级 2，仍低于采样/上传）。
 - 服务端内存里每台设备常驻一帧（≤ 512 KiB/设备），多设备长时间运行不会增长，但
   重启服务端需等板端下一帧才会恢复画面。
 - 直播期间 LCD 每帧刷新状态（2 Hz），比原来的刷新频率略高；若担心影响界面观感，
