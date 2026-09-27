@@ -6,6 +6,17 @@ REM newest install that has actually been used with this project. Ordering
 REM matters because build/ is configured for one specific IDF version.
 cd /d "%~dp0"
 
+REM Clear MSYSTEM before calling ESP-IDF's export.bat. Git Bash / MSYS2 exports
+REM MSYSTEM, and export.bat starts with a guard that aborts when it is set:
+REM   if defined MSYSTEM (echo This .bat file is for Windows CMD.EXE shell only.)
+REM Symptom when it triggers: BUILD_EXIT=9009 plus "idf.py is not recognized".
+REM The quoted assignment form is required -- writing  set MSYSTEM= & foo  would
+REM leave the space before the separator as the value, so MSYSTEM stays defined
+REM and the guard still fires.
+set "MSYSTEM="
+set "MSYSTEM_PREFIX="
+set "MINGW_PREFIX="
+
 set "IDF_EXPORT="
 if defined IDF_PATH if exist "%IDF_PATH%\export.bat" set "IDF_EXPORT=%IDF_PATH%\export.bat"
 if not defined IDF_EXPORT if exist "C:\esp\v5.5.4\esp-idf\export.bat" set "IDF_EXPORT=C:\esp\v5.5.4\esp-idf\export.bat"
