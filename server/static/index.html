@@ -194,6 +194,42 @@
   <span id="lastPoll">—</span>
 </section>
 
+<section id="eventCard" class="card">
+  <h2>闭环事件（板端按键触发）<span id="eventBadge" class="badge off">无事件</span></h2>
+  <div class="grid">
+    <div class="kv"><span class="k">最新 request_id</span><span class="v" id="eventRid">—</span></div>
+    <div class="kv"><span class="k">事件状态</span><span class="v" id="eventStatus">—</span></div>
+    <div class="kv"><span class="k">来源设备 / 类型</span><span class="v" id="eventSource">—</span></div>
+    <div class="kv"><span class="k">板端触发时刻</span><span class="v" id="eventDeviceTs">—</span></div>
+    <div class="kv"><span class="k">服务端接收时刻</span><span class="v" id="eventCreated">—</span></div>
+    <div class="kv"><span class="k">最近响应</span><span class="v" id="eventResponded">—</span></div>
+    <div class="kv"><span class="k">有效期剩余</span><span class="v" id="eventTtl">—</span></div>
+  </div>
+  <div class="photo-controls" style="margin-top:10px">
+    <button id="eventAcceptBtn" type="button" disabled>回应（accept）</button>
+    <button id="eventCancelBtn" type="button" disabled>取消（cancel）</button>
+    <button id="eventConfirmBtn" type="button" disabled>确认完成（confirm）</button>
+    <span id="eventStatusLine"></span>
+  </div>
+  <p class="hint">
+    方向与「按需采集任务」相反：这一条是<b>板端发起、Web 接收</b>。板端按
+    <code>BSP_BUTTON_3</code> 触发（灯闪 2 下、LCD 显示 <code>LOOP:TRIG</code>）→ 本卡片立刻出现
+    「待处理」；板端按 <code>BSP_BUTTON_4</code> 单击回应（闪 1 下）/ 长按 2 s 取消（闪 4 下）；
+    本页点「确认完成」后板端轮询到终态，灯闪 3 下并显示 <code>LOOP:DONE</code>，闭环结束。<br>
+    接口：板端 <code>POST /api/v1/events/trigger</code>、
+    <code>POST /api/v1/events/respond</code>、
+    <code>GET /api/v1/events/status</code>；本页读 <code>GET /api/v1/events</code>。
+    <b>request_id 由板端生成</b>，所以本地反馈不等网络，重试也只会命中同一条事件。
+  </p>
+  <table>
+    <caption>最近 8 条事件流水（<code>/api/v1/events?limit=8</code>，按触发时间倒序）</caption>
+    <thead>
+      <tr><th>触发时间</th><th>request_id</th><th>设备</th><th>状态</th><th>响应</th><th>响应方</th><th>收口时间</th></tr>
+    </thead>
+    <tbody id="eventHistoryBody"><tr><td colspan="7">—</td></tr></tbody>
+  </table>
+</section>
+
 <section id="taskCard" class="card">
   <h2>按需采集任务（手动触发）<span id="taskBadge" class="badge off">空闲</span></h2>
   <div class="grid">

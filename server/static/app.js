@@ -37,6 +37,14 @@ const PHOTO_LIMIT = 12;
    拖慢 800 ms 的主轮询（板端实际约 1-2 fps）。 */
 const LIVE_POLL_MIN_MS = 500;
 
+/* 闭环事件（板端按键触发）：这些常量必须和上面的常量放在一起。
+   注意 poll() 在本文件靠前的位置（约 570 行）就被立刻调用了一次，而事件相关的
+   函数体在后面——const 有暂时性死区，如果把这些常量留在后面的小节里，
+   首轮 poll() 里的 refreshEvents() 会直接抛 "Cannot access before initialization"。 */
+const EVENT_LIMIT = 8;
+const EVENT_ACTION_CN = { accept: '回应', cancel: '取消', confirm: '确认完成' };
+const EVENT_BY_CN = { device: '板端按键', web: '网页' };
+
 const el = (id) => document.getElementById(id);
 const $ = {
   deviceSel: el('deviceSel'),
@@ -107,9 +115,23 @@ const $ = {
   liveImg: el('liveImg'),
   liveOff: el('liveOff'),
   liveTimeoutS: el('liveTimeoutS'),
+  eventBadge: el('eventBadge'),
+  eventRid: el('eventRid'),
+  eventStatus: el('eventStatus'),
+  eventSource: el('eventSource'),
+  eventDeviceTs: el('eventDeviceTs'),
+  eventCreated: el('eventCreated'),
+  eventResponded: el('eventResponded'),
+  eventTtl: el('eventTtl'),
+  eventAcceptBtn: el('eventAcceptBtn'),
+  eventCancelBtn: el('eventCancelBtn'),
+  eventConfirmBtn: el('eventConfirmBtn'),
+  eventStatusLine: el('eventStatusLine'),
+  eventHistoryBody: el('eventHistoryBody'),
 };
 
-const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '' };
+const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '',
+                eventRid: '' };
 
 /* ------------------------------------------------------------------ *
  * 工具
@@ -474,6 +496,11 @@ async function poll() {
     // 3') 摄像头实时画面：每轮都试一次（内部有 500 ms 最小间隔 + busy 保护），
     //     不 await —— 图片/状态请求再慢也不该拖住 800 ms 的主轮询和数据面板。
     refreshLive();
+
+    // 3'') 闭环事件：板端按键触发的事件要"立刻"在页面上看到，
+    //      所以放在主轮询里（不 await 会漏掉首轮的卡片渲染，这里 await 一次
+    //      轻量 JSON；侧栏/历史仍走节流，避免每 800 ms 重画表格）。
+    await refreshEvents(false);
 
     if (!ids.length) {
       showNoData(false);
@@ -872,6 +899,7 @@ function refreshSidePanels() {
   refreshLatestTask();
   refreshControl();
   refreshGallery();
+  refreshEvents(true);    // 闭环事件：详细卡片每轮已刷新，这里补齐流水表
 }
 
 /** URL 参数（?source=&samples=&rate=&timeout=&pause=）覆盖表单初值，便于自动化构造任务参数 */
@@ -1151,6 +1179,152 @@ async function refreshLive() {
   } finally {
     LIVE.busy = false;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ *  闭环事件（板端按键触发 → 本地反馈 → 远端显示 → 回应/取消）
+ *
+ *  方向与页面上其它卡片相反：**板端发起、Web 接收**。
+ *    板端按触发键 → POST /api/v1/events/trigger（request_id 由板端生成）
+ *    → 本卡片从 GET /api/v1/events 读到它，显示「待处理」
+ *    → 本页点「回应 / 取消 / 确认完成」走 POST /api/v1/events/respond
+ *    → 板端每 1 s 轮询 GET /api/v1/events/status，看到终态就闪灯 + 显示 DONE
+ *  刻意不做 Web 端「下发触发」按钮：触发只能来自板子上的物理按键，
+ *  否则「本地反馈先于网络」这条设计（trigger 前灯已闪）就无从验证。
+ * ------------------------------------------------------------------ */
+
+/** 板端触发时刻：优先用板端 NTP 时间戳（epoch ms），缺失时退回服务端接收时间 */
+function fmtEventDeviceTs(ev) {
+  if (!ev || !ev.device_ts_ms) return '—（板端未带时间）';
+  return fmtTsMs(ev.device_ts_ms);
+}
+
+/** 禁用/启用三个响应按钮（终态事件不允许再响应） */
+function setEventButtons(enabled) {
+  const can = !!enabled;
+  for (const b of [$.eventAcceptBtn, $.eventCancelBtn, $.eventConfirmBtn]) {
+    if (b) b.disabled = !can;
+  }
+}
+
+function renderEventDetail(ev) {
+  if (!ev) {
+    $.eventRid.textContent = '—';
+    $.eventStatus.textContent = '暂无事件（板端按触发键后会出现在这里）';
+    $.eventSource.textContent = '—';
+    $.eventDeviceTs.textContent = '—';
+    $.eventCreated.textContent = '—';
+    $.eventResponded.textContent = '—';
+    $.eventTtl.textContent = '—';
+    setEventButtons(false);
+    state.eventRid = '';
+    return;
+  }
+
+  state.eventRid = ev.request_id;
+  $.eventRid.textContent = ev.request_id;
+  $.eventStatus.textContent = ev.status_cn + '（' + ev.status + '）'
+    + (ev.terminal ? ' · 已终结' : '');
+  $.eventSource.textContent = ev.device_id + ' / ' + ev.kind;
+  $.eventDeviceTs.textContent = fmtEventDeviceTs(ev);
+  $.eventCreated.textContent = ev.created_at_str || fmtTsMs(ev.created_at * 1000);
+  $.eventResponded.textContent = ev.responded_at_str
+    ? (EVENT_ACTION_CN[ev.response] || ev.response || '—')
+      + ' · ' + (EVENT_BY_CN[ev.responded_by] || ev.responded_by || '—')
+      + ' · ' + ev.responded_at_str
+    : '—（尚无响应）';
+  $.eventTtl.textContent = ev.terminal
+    ? '已结束'
+    : (ev.ttl_left_s > 0 ? ev.ttl_left_s.toFixed(0) + ' s 后过期' : '已过期');
+
+  // 终态事件没有可响应动作；待处理/已回应才能点
+  setEventButtons(!ev.terminal);
+}
+
+function renderEventHistory(list) {
+  if (!$.eventHistoryBody) return;
+  if (!list.length) {
+    $.eventHistoryBody.innerHTML =
+      '<tr><td colspan="7">—（该设备还没有闭环事件）</td></tr>';
+    return;
+  }
+  $.eventHistoryBody.innerHTML = '';
+  for (const ev of list) {
+    const tr = document.createElement('tr');
+    const cells = [
+      ev.created_at_str || '—',
+      ev.request_id.slice(0, 12) + '…',
+      ev.device_id,
+      ev.status_cn,
+      EVENT_ACTION_CN[ev.response] || ev.response || '—',
+      EVENT_BY_CN[ev.responded_by] || ev.responded_by || '—',
+      ev.closed_at_str || '—',
+    ];
+    for (const c of cells) {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.appendChild(td);
+    }
+    $.eventHistoryBody.appendChild(tr);
+  }
+}
+
+/** 拉取闭环事件：刷新卡片 + 流水表。静默失败，不影响主面板。 */
+async function refreshEvents(withHistory) {
+  if (!state.current) return;
+  try {
+    const data = await apiGet('/api/v1/events?device_id=' +
+                              encodeURIComponent(state.current) +
+                              '&limit=' + EVENT_LIMIT);
+    const list = (data && data.events) || [];
+    renderEventDetail(list[0] || null);
+    /* 流水表只在节流轮次（或响应动作后）重画：它和"待处理"提示不同，
+     * 不需要 800 ms 刷新一次，避免每轮都重建 8 行 DOM。 */
+    if (withHistory) {
+      renderEventHistory(list);
+    }
+
+    const pending = (data && data.pending) || 0;
+    const cls = pending > 0 ? 'err' : (list.length ? 'ok' : 'off');
+    const txt = pending > 0 ? pending + ' 条待处理'
+                            : (list.length ? '最近 ' + list.length + ' 条' : '无事件');
+    /* 不能复用 renderBadge()：它把 id 写死成 stateBadge（数据卡片专用），
+     * 这里必须用自己的 id，否则下一轮 el('eventBadge') 会拿到 null。 */
+    $.eventBadge.outerHTML = '<span id="eventBadge" class="badge ' + cls + '">'
+                             + txt + '</span>';
+    $.eventBadge = el('eventBadge');
+  } catch (e) {
+    if (withHistory) {
+      $.eventStatusLine.textContent = '—（事件查询失败：' + e.message + '）';
+    }
+  }
+}
+
+/** 对当前事件发送响应动作 */
+async function respondEvent(action) {
+  const rid = state.eventRid;
+  if (!rid) return;
+  if (action === 'cancel' &&
+      !window.confirm('确认取消闭环事件 ' + rid.slice(0, 12) + '… ？')) {
+    return;
+  }
+  setEventButtons(false);
+  try {
+    await apiPost('/api/v1/events/respond',
+                  { request_id: rid, action: action, by: 'web' });
+    $.eventStatusLine.textContent = '已发送「' + (EVENT_ACTION_CN[action] || action)
+      + '」：' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    await refreshEvents(true);
+  } catch (e) {
+    $.eventStatusLine.textContent = '⚠ 响应失败：' + e.message;
+    setEventButtons(true);
+  }
+}
+
+if ($.eventAcceptBtn) {
+  $.eventAcceptBtn.addEventListener('click', () => respondEvent('accept'));
+  $.eventCancelBtn.addEventListener('click', () => respondEvent('cancel'));
+  $.eventConfirmBtn.addEventListener('click', () => respondEvent('confirm'));
 }
 
 /* ------------------------------------------------------------------ *
