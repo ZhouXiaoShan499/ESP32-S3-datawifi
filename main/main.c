@@ -56,6 +56,8 @@
 #include "sdmmc_cmd.h"
 /* Shared BSP I2C bus (IMU + camera SCCB) - the NEW driver, never driver/i2c.h */
 #include "driver/i2c_master.h"
+/* 闭环事件用板载绿色 LED（GPIO3）；必须开漏，见「闭环事件 config」中的说明 */
+#include "driver/gpio.h"
 /* esp_video V4L2 user-space API: /dev/videoX ioctl + structs */
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
@@ -108,6 +110,83 @@
 #define TASK_APPLIED_RETRY_MAX   2        /* applied 回执重试次数（每 3 s 一轮询） */
 #define TASK_HTTP_TIMEOUT_MS     5000
 #define TASK_RESP_BUF_LEN        2048     /* /tasks/next 响应缓冲 */
+
+/* ================================================================
+ *  闭环事件（loop event）config
+ *
+ *  「板端触发 → 本地反馈 → 远端显示 → 回应/取消」的完整闭环，方向与
+ *  tasks 相反：**板端发起、Web 接收**。复用既有能力，不新增协议栈：
+ *    - HTTP  ：复用 http_get_text() / http_post_text()（同一 TASK_HTTP_TIMEOUT_MS）
+ *    - 鉴权  ：复用 task_http_common()（SENSOR_TOKEN 非空时自动带 Bearer）
+ *    - 编号  ：request_id 由**板端生成**（板端必须先把灯闪了、屏幕改了，
+ *              不能等服务端发号），服务端按主键去重，同一次按键重试只算一条。
+ *
+ *  板端状态机（全部改动都在 s_state_mutex 保护下）：
+ *
+ *     LOOP_IDLE ──按 B3 触发──▶ LOOP_TRIGGERED ──轮询到远端终态──▶ LOOP_COMPLETED
+ *                    │                                              ▲   │
+ *                    └──按 B4 回应/取消──▶ LOOP_WAITING_ACK ─────────┘   │
+ *                                                                        │
+ *                                           停留 LOOP_DONE_DWELL_MS 后 ─┘ 回到 IDLE
+ *
+ *  「远端已回来」的判据（故意不对 ack 自激，详见 loop_task 注释）：
+ *    TRIGGERED   ：status ∈ {ack, cancelled, completed, expired} 都算远端有动作
+ *    WAITING_ACK ：只有 {cancelled, completed, expired} 算；ack 是板端自己造成的
+ * ================================================================ */
+#define LOOP_API_PATH_TRIGGER    "/api/v1/events/trigger"
+#define LOOP_API_PATH_RESPOND    "/api/v1/events/respond"
+#define LOOP_API_PATH_STATUS     "/api/v1/events/status"
+
+#define LOOP_POLL_INTERVAL_MS    1000     /* 闭环状态轮询间隔 */
+#define LOOP_TASK_STACK          5120     /* cJSON + 1 次 HTTP（HTTP 自带缓冲） */
+#define LOOP_TASK_PRIO           3        /* 与 task_poll 同级，低于 uploader(4) */
+#define LOOP_RESP_BUF_LEN        1024     /* /events/status 响应缓冲 */
+#define LOOP_REQUEST_ID_LEN      40       /* 32 hex + '\0'，与服务端 uuid4().hex 对齐 */
+#define LOOP_STATUS_TEXT_LEN     32
+#define LOOP_DONE_DWELL_MS       3000     /* COMPLETED 后停留多久再回 IDLE */
+#define LOOP_LOCAL_TIMEOUT_MS    60000    /* 网络不通时的本地兜底：超时回 IDLE，
+                                           * 免得板子永远卡在 TRIGGERED */
+
+/* LED：板载绿色 LED 挂在 GPIO3（BSP_LED_1_IO）。
+ * ⚠ 乐鑫官方硬件手册明确要求 **GPIO3 必须配成开漏输出**（GPIO_MODE_OUTPUT_OD）：
+ *   "GPIO3 must be set up in open-drain mode. Pulling GPIO3 up may burn the LED."
+ *   所以这里**不能用** bsp_led_indicator_create()/bsp_led_set()——那条路径走的是
+ *   led_indicator_gpio，内部是 GPIO_MODE_OUTPUT（推挽），正是官方警告要避免的配置。
+ *
+ * 开漏下"线被释放(level=1)"与"被拉低(level=0)"哪个是亮，取决于板子 LED 的接法。
+ * 默认按"释放=亮"（电源指示灯常态点亮、拉低即熄灭的接法）；
+ * 若上板实测相反，把 LOOP_LED_ON_LEVEL 改成 0 即可，无需改其它代码。 */
+#define LOOP_LED_GPIO            BSP_LED_1_IO
+#define LOOP_LED_ON_LEVEL        1
+/* 一组闪烁结束后灯是否保持常亮。
+ *   0（默认）= 灯平时是灭的，"闪 N 下"就是亮 N 下 —— 反馈最直观；
+ *   1        = 灯平时常亮（当电源指示灯用），"闪 N 下"表现为短暂熄灭 N 次。
+ * 板载绿灯出厂是电源指示灯（通电即亮），若希望维持这个观感就把这里改成 1。 */
+#define LOOP_LED_REST_ON         0
+
+/* 闪烁次数（本地反馈的"语言"）：数字越小越"日常"，出错/取消用最多的次数区分。
+ *   触发成功        → 2 下
+ *   已回应（已上报）→ 1 下
+ *   远端确认完成    → 3 下
+ *   取消 / 过期     → 4 下
+ *   上报失败        → 6 下（明显区别于所有正常路径） */
+#define LOOP_BLINK_TRIGGER       2
+#define LOOP_BLINK_RESPOND       1
+#define LOOP_BLINK_DONE          3
+#define LOOP_BLINK_CANCEL        4
+#define LOOP_BLINK_FAIL          6
+#define LOOP_BLINK_ON_MS         80
+#define LOOP_BLINK_OFF_MS        120
+#define LOOP_BLINK_GAP_MS        350      /* 两次"一组闪烁"之间 */
+#define LOOP_BLINK_QUEUE_LEN     1        /* 用 xQueueOverwrite：永不阻塞、永不满 */
+
+/* 闭环按键：BSP_BUTTON_1/2 已归 Button A/B，这里用未占用的 BSP_BUTTON_3/4。
+ * 注意 ESP32-S3-EYE 的 BUTTON_1..4 是**同一个 ADC 通道上的电阻梯按键**
+ * （bsp_button.c: ADC_CHANNEL_0，靠电压档位区分），不是独立 GPIO——
+ * 但 iot_button 已把它们封装成 4 个独立设备，回调注册方式与 GPIO 按键一致。 */
+#define LOOP_TRIGGER_BUTTON      BSP_BUTTON_3
+#define LOOP_RESPOND_BUTTON      BSP_BUTTON_4
+#define LOOP_RESPOND_LONG_MS     2000     /* 长按 = 取消（与 Button A/B 的单击/长按惯例一致） */
 
 /* 实时拍照任务（kind=camera）config。
  * Web 点「拍一张照片」→ 建 camera 任务 → 本板拍一帧 JPEG → POST /api/v1/photos，
@@ -319,6 +398,32 @@ static volatile uint32_t s_live_frames = 0;       /* 本次推流已成功上传
 static volatile int s_live_last_status = 0;       /* 最近一帧的 HTTP 状态（0 = 网络层失败） */
 static volatile bool s_preview_active = false;    /* 本地 LCD 相机预览中？ */
 
+/* ================================================================
+ *  闭环事件状态（见上方「闭环事件 config」与 loop_task 一节）
+ *
+ *  所有读写都在 s_state_mutex 保护下（按键回调、loop_task、refresh_ui
+ *  三方都会碰），与其它全局状态同一把锁，避免 refresh_ui 读到半更新的文本。
+ * ================================================================ */
+typedef enum {
+    LOOP_IDLE = 0,        /* 空闲：没有进行中的闭环 */
+    LOOP_TRIGGERED,       /* 已按触发键，等远端处理 */
+    LOOP_WAITING_ACK,     /* 已按回应/取消键，等远端收口 */
+    LOOP_COMPLETED,       /* 远端已回来：本地闪灯 + 显示 DONE，停留后回 IDLE */
+} loop_state_t;
+
+static volatile loop_state_t s_loop_state = LOOP_IDLE;
+static char     s_loop_status_text[LOOP_STATUS_TEXT_LEN] = "LOOP:IDLE";
+static char     s_loop_request_id[LOOP_REQUEST_ID_LEN] = "";
+/* 按键回调只置标志，真正的 HTTP 由 loop_task 发（按键回调栈很小，严禁阻塞） */
+static volatile bool s_loop_need_trigger = false;
+static volatile bool s_loop_need_respond = false;
+static volatile bool s_loop_need_cancel  = false;
+/* 本地兜底截止时刻：网络不通时不至于永远卡在 TRIGGERED/WAITING_ACK */
+static volatile int64_t s_loop_deadline_ms = 0;
+/* 进入 COMPLETED 的时刻，用于 DONE 文本停留后再回 IDLE */
+static volatile int64_t s_loop_done_at_ms = 0;
+static QueueHandle_t s_led_blink_queue = NULL;    /* 元素 uint8_t：还要闪几下 */
+
 /* WiFi event group */
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num;
@@ -496,6 +601,12 @@ static void refresh_ui(void);
  * 按键回调放在 Button 一节，因此这里先声明。 */
 static void live_streaming_toggle(void);
 static void button_a_long_press_cb(void *arg, void *data);
+/* 闭环事件（详见「闭环事件」一节）：按键回调交给 init_buttons() 注册，
+ * 但实现放在 HTTP 辅助函数之后（那里才有 http_post_text），故先声明。 */
+static void loop_module_init(void);
+static void loop_trigger_button_cb(void *arg, void *data);
+static void loop_respond_button_cb(void *arg, void *data);
+static void loop_respond_long_press_cb(void *arg, void *data);
 
 /* ================================================================
  *  Utility
@@ -673,6 +784,13 @@ static void refresh_ui(void)
                 snprintf(status_buf, sizeof(status_buf), "%s", s_stairs_display);
             } else if (s_stand_protocol_active) {
                 snprintf(status_buf, sizeof(status_buf), "%s", s_stand_display);
+            } else if (s_loop_state != LOOP_IDLE && s_loop_status_text[0]) {
+                /* 闭环事件进行中：这一行让给闭环状态（LOOP:TRIG / WAIT / DONE…）。
+                 * 优先于 s_status_text，是因为闭环状态是"用户刚刚按了按键"的直接
+                 * 反馈，必须立刻看得见；而 s_status_text 多是启动期的联网/对时信息，
+                 * 晚一点再看也不影响。注意：5 种动作协议运行时这一行归协议显示，
+                 * 闭环文本会被盖住（见 docs/loop_trigger_callback.md 的边界说明）。 */
+                snprintf(status_buf, sizeof(status_buf), "%s", s_loop_status_text);
             } else {
                 /* 没有协议在跑时，这一行显示最后一条 set_status_locked() 状态
                  * （"WiFi: waiting for IP" / "Time synced" / "SD card ready" …）。
@@ -2853,6 +2971,41 @@ static void init_buttons(void)
     } else {
         ESP_LOGW(TAG, "Only 1 button found — Button B unavailable");
     }
+
+    /* Button C / D：闭环事件（触发 → 本地反馈 → 远端显示 → 回应/取消）。
+     * ESP32-S3-EYE 的 BUTTON_1..4 是同一个 ADC 电阻梯上的 4 档（bsp_button.c），
+     * BUTTON_5 是 GPIO0 的 BOOT 键；1/2 已归 A/B，这里用 3/4，互不冲突。
+     * 回调只置标志 + 闪灯 + 改屏，HTTP 交给 loop_task——回调运行在 iot_button
+     * 的任务上下文里，栈很小，既不能 vTaskDelay 也不能发请求。 */
+    if (button_count > (int)LOOP_RESPOND_BUTTON) {
+        ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[LOOP_TRIGGER_BUTTON],
+                                               BUTTON_SINGLE_CLICK,
+                                               NULL,
+                                               loop_trigger_button_cb,
+                                               NULL));
+
+        ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[LOOP_RESPOND_BUTTON],
+                                               BUTTON_SINGLE_CLICK,
+                                               NULL,
+                                               loop_respond_button_cb,
+                                               NULL));
+
+        button_event_args_t respond_long_args = {
+            .long_press.press_time = LOOP_RESPOND_LONG_MS,
+        };
+        ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[LOOP_RESPOND_BUTTON],
+                                               BUTTON_LONG_PRESS_START,
+                                               &respond_long_args,
+                                               loop_respond_long_press_cb,
+                                               NULL));
+        ESP_LOGI(TAG, "Loop buttons registered: BSP_BUTTON_%d = trigger,"
+                      " BSP_BUTTON_%d = respond (click) / cancel (long %d ms)",
+                 (int)LOOP_TRIGGER_BUTTON + 1, (int)LOOP_RESPOND_BUTTON + 1,
+                 LOOP_RESPOND_LONG_MS);
+    } else {
+        ESP_LOGW(TAG, "Only %d buttons found — loop trigger/respond unavailable",
+                 button_count);
+    }
 }
 
 static void init_sdcard(void)
@@ -4141,6 +4294,460 @@ static void task_poll_task(void *arg)
     }
 }
 
+/* ================================================================
+ *  闭环事件（loop event）—— 触发 / 本地反馈 / 远端显示 / 回应·取消
+ *
+ *  与 task_poll_task 的分工刻意分开，互不干扰：
+ *    task_poll_task ：服务端 → 板端（领取 Web 下发的采集/拍照/控制任务）
+ *    loop_task      ：板端 → 服务端（本板发起的闭环事件，反向）
+ *  之所以不把闭环轮询塞进 task_poll_task：那里的每一次 HTTP 最长阻塞
+ *  TASK_HTTP_TIMEOUT_MS(5 s)，而 task_poll_task 每 3 s 就要领一次任务——
+ *  网络差时多塞两个请求会把它拖垮，直接连累「采集一次」「拍一张照片」。
+ *  独立任务 + 独立周期，闭环再慢也不影响既有链路。
+ * ================================================================ */
+
+/* ---------- 本地反馈：板载 LED（GPIO3，开漏，非阻塞） ---------- */
+
+static void loop_led_apply(bool on)
+{
+    if (LOOP_LED_GPIO < 0) {
+        return;
+    }
+    /* 开漏：level=1 是释放总线（由外部电路决定亮灭），level=0 是把线拉低。
+     * 具体哪个是"亮"由 LOOP_LED_ON_LEVEL 决定，见配置区说明。 */
+    int level = on ? LOOP_LED_ON_LEVEL : (LOOP_LED_ON_LEVEL ? 0 : 1);
+    gpio_set_level((gpio_num_t)LOOP_LED_GPIO, level);
+}
+
+/* 闪烁任务：唯一允许 vTaskDelay 的地方。按键回调只往队列里丢"还要闪几下"，
+ * 绝不在回调里等待——iot_button 的任务栈很小，阻塞会拖垮按键识别。 */
+static void loop_led_task(void *arg)
+{
+    (void)arg;
+    uint8_t times = 0;
+
+    loop_led_apply(LOOP_LED_REST_ON ? true : false);
+
+    while (true) {
+        if (xQueueReceive(s_led_blink_queue, &times, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        for (uint8_t i = 0; i < times; i++) {
+            loop_led_apply(true);
+            vTaskDelay(pdMS_TO_TICKS(LOOP_BLINK_ON_MS));
+            loop_led_apply(false);
+            vTaskDelay(pdMS_TO_TICKS(LOOP_BLINK_OFF_MS));
+        }
+        loop_led_apply(LOOP_LED_REST_ON ? true : false);
+        /* 两组反馈之间留空隙，避免连按事件时糊成一片看不出次数 */
+        vTaskDelay(pdMS_TO_TICKS(LOOP_BLINK_GAP_MS));
+    }
+}
+
+/* 请求"闪 N 下"。用 xQueueOverwrite（队列长度 1）：永不阻塞、永不失败，
+ * 连按只会保留最后一次，正是想要的行为。 */
+static void loop_led_flash(uint8_t times)
+{
+    if (s_led_blink_queue != NULL && times > 0) {
+        xQueueOverwrite(s_led_blink_queue, &times);
+    }
+}
+
+/* ---------- 闭环状态（全部在 s_state_mutex 下读写） ---------- */
+
+static const char *loop_state_name(loop_state_t st)
+{
+    switch (st) {
+    case LOOP_IDLE:        return "IDLE";
+    case LOOP_TRIGGERED:   return "TRIGGERED";
+    case LOOP_WAITING_ACK: return "WAITING_ACK";
+    case LOOP_COMPLETED:   return "COMPLETED";
+    default:               return "?";
+    }
+}
+
+/* 更新状态 + LCD 文本。req 后缀用于把 request_id 前 4 位显示出来，
+ * 便于现场比对「板子这条」和「网页那条」是不是同一个事件。 */
+static void loop_set_state(loop_state_t st, const char *prefix)
+{
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_loop_state = st;
+        if (prefix && prefix[0]) {
+            if (s_loop_request_id[0]) {
+                snprintf(s_loop_status_text, sizeof(s_loop_status_text),
+                         "%s %.4s", prefix, s_loop_request_id);
+            } else {
+                snprintf(s_loop_status_text, sizeof(s_loop_status_text),
+                         "%s", prefix);
+            }
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    refresh_ui();       /* 本地反馈要"立刻"看得见，不等下一次周期刷新 */
+    ESP_LOGI(TAG, "[loop] state=%s text=%s rid=%s",
+             loop_state_name(st), s_loop_status_text, s_loop_request_id);
+}
+
+/* 读取当前状态 / request_id 的快照（在锁内拷出来，避免用到半更新的字符串）。
+ * rid_out 允许传 NULL，表示"只要状态，不要编号"（按键回调里判断用）。 */
+static loop_state_t loop_snapshot(char *rid_out, size_t rid_len)
+{
+    loop_state_t st = LOOP_IDLE;
+    if (rid_out != NULL && rid_len > 0) {
+        rid_out[0] = '\0';
+    }
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        st = s_loop_state;
+        if (rid_out != NULL && rid_len > 0) {
+            snprintf(rid_out, rid_len, "%s", s_loop_request_id);
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    return st;
+}
+
+/* 板端生成闭环编号：128 bit 随机数 → 32 个十六进制字符。
+ * 必须板端生成（不能等服务端发号）：按键按下时灯就已经闪了、屏幕就改了，
+ * 本地反馈不能依赖网络往返；服务端以 request_id 为主键，重试天然幂等。 */
+static void loop_make_request_id(char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "%08" PRIx32,
+             esp_random(), esp_random(), esp_random(), esp_random());
+}
+
+/* ---------- 按键回调：只置标志 + 本地反馈，绝不阻塞 ---------- */
+
+static void loop_trigger_button_cb(void *arg, void *data)
+{
+    (void)arg; (void)data;
+
+    loop_state_t st = loop_snapshot(NULL, 0);
+    if (st == LOOP_TRIGGERED || st == LOOP_WAITING_ACK) {
+        ESP_LOGI(TAG, "[loop] trigger ignored: already in %s", loop_state_name(st));
+        return;
+    }
+
+    char rid[LOOP_REQUEST_ID_LEN];
+    loop_make_request_id(rid, sizeof(rid));
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        snprintf(s_loop_request_id, sizeof(s_loop_request_id), "%s", rid);
+        s_loop_need_trigger = true;
+        s_loop_need_respond = false;
+        s_loop_need_cancel = false;
+        xSemaphoreGive(s_state_mutex);
+    }
+
+    /* 本地反馈先走：不等 HTTP。灯闪 2 下 + 屏幕立刻变 TRIG */
+    loop_led_flash(LOOP_BLINK_TRIGGER);
+    loop_set_state(LOOP_TRIGGERED, "LOOP:TRIG");
+}
+
+static void loop_respond_button_cb(void *arg, void *data)
+{
+    (void)arg; (void)data;
+
+    loop_state_t st = loop_snapshot(NULL, 0);
+    if (st != LOOP_TRIGGERED && st != LOOP_WAITING_ACK) {
+        ESP_LOGI(TAG, "[loop] respond ignored: nothing to respond to (state=%s)",
+                 loop_state_name(st));
+        return;
+    }
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_loop_need_respond = true;
+        xSemaphoreGive(s_state_mutex);
+    }
+    /* 灯闪 1 下 + 屏幕变 WAIT：表示"我这边已经回应了，等远端收口" */
+    loop_led_flash(LOOP_BLINK_RESPOND);
+    loop_set_state(LOOP_WAITING_ACK, "LOOP:WAIT");
+}
+
+static void loop_respond_long_press_cb(void *arg, void *data)
+{
+    (void)arg; (void)data;
+
+    loop_state_t st = loop_snapshot(NULL, 0);
+    if (st != LOOP_TRIGGERED && st != LOOP_WAITING_ACK) {
+        ESP_LOGI(TAG, "[loop] cancel ignored: nothing to cancel (state=%s)",
+                 loop_state_name(st));
+        return;
+    }
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_loop_need_cancel = true;
+        s_loop_need_respond = false;
+        xSemaphoreGive(s_state_mutex);
+    }
+    /* 取消用 4 下，与"回应 1 下 / 完成 3 下"一眼可区分 */
+    loop_led_flash(LOOP_BLINK_CANCEL);
+    loop_set_state(LOOP_WAITING_ACK, "LOOP:CANCEL");
+}
+
+/* ---------- 网络侧：触发上报 / 回应上报 / 轮询远端状态 ---------- */
+
+static bool loop_post_trigger(const char *rid)
+{
+    char url[192];
+    if (!server_api_url(url, sizeof(url), LOOP_API_PATH_TRIGGER)) {
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "device_id", CONFIG_SENSOR_DEVICE_ID);
+    cJSON_AddStringToObject(root, "source", UPLOAD_SOURCE);
+    cJSON_AddStringToObject(root, "kind", "alert");
+    cJSON_AddStringToObject(root, "request_id", rid);
+    cJSON_AddNumberToObject(root, "ts_ms", (double)(time(NULL) * 1000LL));
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) {
+        log_heap("loop: trigger print failed");
+        return false;
+    }
+
+    bool ok = http_post_text(url, body);
+    free(body);
+    ESP_LOGI(TAG, "[loop] trigger %s -> %s", ok ? "OK" : "FAIL", rid);
+    return ok;
+}
+
+static bool loop_post_respond(const char *rid, const char *action)
+{
+    char url[192];
+    if (!server_api_url(url, sizeof(url), LOOP_API_PATH_RESPOND)) {
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "request_id", rid);
+    cJSON_AddStringToObject(root, "action", action);
+    cJSON_AddStringToObject(root, "by", "device");
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) {
+        return false;
+    }
+
+    bool ok = http_post_text(url, body);
+    free(body);
+    ESP_LOGI(TAG, "[loop] respond %s (%s) -> %s", action, rid, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+/* 轮询远端状态。返回远端状态字符串（静态字符串，无网/解析失败时返回 NULL）。 */
+static const char *loop_fetch_remote_status(const char *rid)
+{
+    static const char *names[] = {"pending", "ack", "cancelled", "completed", "expired"};
+    char base[192];
+    char url[320];
+    char resp[LOOP_RESP_BUF_LEN];
+
+    if (!server_api_url(base, sizeof(base), LOOP_API_PATH_STATUS)) {
+        return NULL;
+    }
+    snprintf(url, sizeof(url), "%s?device_id=%s&request_id=%s",
+             base, CONFIG_SENSOR_DEVICE_ID, rid);
+
+    if (!http_get_text(url, resp, sizeof(resp))) {
+        return NULL;
+    }
+
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) {
+        ESP_LOGW(TAG, "[loop] status JSON parse failed");
+        return NULL;
+    }
+
+    const char *found = NULL;
+    cJSON *j_found = cJSON_GetObjectItem(root, "found");
+    if (cJSON_IsBool(j_found) && !cJSON_IsTrue(j_found)) {
+        cJSON_Delete(root);
+        return NULL;    /* 事件还没登记上：正常过渡态，不当错误 */
+    }
+
+    cJSON *j_status = cJSON_GetObjectItem(root, "status");
+    if (cJSON_IsString(j_status) && j_status->valuestring) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (strcmp(names[i], j_status->valuestring) == 0) {
+                found = names[i];
+                break;
+            }
+        }
+        if (found == NULL) {
+            ESP_LOGW(TAG, "[loop] unknown remote status '%s'", j_status->valuestring);
+        }
+    }
+    cJSON_Delete(root);     /* 必须在 return 之前释放：这里只用静态字符串，安全 */
+    return found;
+}
+
+/* 闭环主循环：1 s 一跳，只做三件事——发触发、发回应/取消、轮询远端。 */
+static void loop_task(void *arg)
+{
+    (void)arg;
+    char rid[LOOP_REQUEST_ID_LEN];
+    const char *remote;
+
+    ESP_LOGI(TAG, "[loop] task started: poll %d ms, trigger=BSP_BUTTON_%d,"
+                  " respond/cancel(long %dms)=BSP_BUTTON_%d",
+             LOOP_POLL_INTERVAL_MS,
+             (int)LOOP_TRIGGER_BUTTON + 1, LOOP_RESPOND_LONG_MS,
+             (int)LOOP_RESPOND_BUTTON + 1);
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(LOOP_POLL_INTERVAL_MS));
+
+        /* 1) 把按键置下的标志变成真正的 HTTP 请求（按键回调里不能发请求） */
+        bool do_trigger = false, do_respond = false, do_cancel = false;
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            do_trigger = s_loop_need_trigger;
+            do_respond = s_loop_need_respond;
+            do_cancel  = s_loop_need_cancel;
+            s_loop_need_trigger = false;
+            s_loop_need_respond = false;
+            s_loop_need_cancel  = false;
+            xSemaphoreGive(s_state_mutex);
+        }
+
+        if (!s_wifi_connected) {
+            /* 离线：标志已经清了，但本地反馈（灯/屏）早于网络发生，
+             * 这里只提示失败，不让状态机永久卡住。 */
+            if (do_trigger) {
+                loop_led_flash(LOOP_BLINK_FAIL);
+                loop_set_state(LOOP_COMPLETED, "LOOP:NO NET");
+                s_loop_done_at_ms = esp_timer_get_time() / 1000;
+            }
+            continue;
+        }
+
+        if (do_trigger) {
+            loop_snapshot(rid, sizeof(rid));
+            if (loop_post_trigger(rid)) {
+                s_loop_deadline_ms = esp_timer_get_time() / 1000 + LOOP_LOCAL_TIMEOUT_MS;
+            } else {
+                loop_led_flash(LOOP_BLINK_FAIL);
+                loop_set_state(LOOP_COMPLETED, "LOOP:FAIL");
+                s_loop_done_at_ms = esp_timer_get_time() / 1000;
+                continue;
+            }
+        }
+
+        if (do_respond || do_cancel) {
+            loop_snapshot(rid, sizeof(rid));
+            if (rid[0]) {
+                if (loop_post_respond(rid, do_cancel ? "cancel" : "accept")) {
+                    s_loop_deadline_ms = esp_timer_get_time() / 1000 + LOOP_LOCAL_TIMEOUT_MS;
+                } else {
+                    loop_led_flash(LOOP_BLINK_FAIL);
+                    loop_set_state(LOOP_COMPLETED, "LOOP:FAIL");
+                    s_loop_done_at_ms = esp_timer_get_time() / 1000;
+                    continue;
+                }
+            }
+        }
+
+        /* 2) 状态机推进 */
+        loop_state_t st = loop_snapshot(rid, sizeof(rid));
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        if (st == LOOP_TRIGGERED || st == LOOP_WAITING_ACK) {
+            remote = rid[0] ? loop_fetch_remote_status(rid) : NULL;
+
+            if (remote != NULL) {
+                /* "远端已回来"的判据刻意保守，避免自激：
+                 *   TRIGGERED   —— 板端还没回应，远端任何动作都是新信息；
+                 *   WAITING_ACK —— status=ack 是板端自己刚发的那次 accept 的回声，
+                 *                  不算远端收口，必须继续等 confirm/cancel。
+                 * 少了这条判断，按一下"回应"就会立刻自我完成、闭环形同虚设。 */
+                bool remote_acted = false;
+                if (st == LOOP_TRIGGERED) {
+                    remote_acted = (strcmp(remote, "pending") != 0);
+                } else {
+                    remote_acted = (strcmp(remote, "pending") != 0 &&
+                                    strcmp(remote, "ack") != 0);
+                }
+
+                if (remote_acted) {
+                    bool cancelled = (strcmp(remote, "cancelled") == 0 ||
+                                      strcmp(remote, "expired") == 0);
+                    loop_led_flash(cancelled ? LOOP_BLINK_CANCEL : LOOP_BLINK_DONE);
+                    loop_set_state(LOOP_COMPLETED,
+                                   cancelled ? "LOOP:CANCEL" : "LOOP:DONE");
+                    s_loop_done_at_ms = now_ms;
+                }
+            }
+
+            /* 本地兜底超时：远程一直没动静（或网络断了）时回 IDLE，
+             * 免得板子永远停在 TRIGGERED 再也触发不了。 */
+            if (s_loop_deadline_ms > 0 && now_ms > s_loop_deadline_ms) {
+                ESP_LOGW(TAG, "[loop] local timeout in state=%s", loop_state_name(st));
+                loop_led_flash(LOOP_BLINK_FAIL);
+                loop_set_state(LOOP_COMPLETED, "LOOP:TIMEOUT");
+                s_loop_done_at_ms = now_ms;
+                s_loop_deadline_ms = 0;
+            }
+        } else if (st == LOOP_COMPLETED) {
+            /* DONE 文本停留几秒让现场看清，然后自动回到空闲，可以再触发 */
+            if (s_loop_done_at_ms > 0 &&
+                now_ms - s_loop_done_at_ms > LOOP_DONE_DWELL_MS) {
+                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    s_loop_request_id[0] = '\0';
+                    s_loop_need_trigger = false;
+                    s_loop_need_respond = false;
+                    s_loop_need_cancel = false;
+                    xSemaphoreGive(s_state_mutex);
+                }
+                s_loop_done_at_ms = 0;
+                s_loop_deadline_ms = 0;
+                loop_set_state(LOOP_IDLE, "LOOP:IDLE");
+            }
+        }
+    }
+}
+
+/* ---------- 闭环模块初始化（LED + 任务；按键在 init_buttons 里注册） ---------- */
+
+static void loop_module_init(void)
+{
+    /* LED：必须开漏。推挽会把 GPIO3 拉高，官方手册明确警告可能烧掉板载绿灯
+     * （见「闭环事件 config」）。BSP 的 bsp_led_set() 走的是推挽，故不采用。 */
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << LOOP_LED_GPIO,
+        .mode         = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGW(TAG, "[loop] LED GPIO%d config failed - local light feedback off",
+                 (int)LOOP_LED_GPIO);
+    } else {
+        loop_led_apply(LOOP_LED_REST_ON ? true : false);
+    }
+
+    s_led_blink_queue = xQueueCreate(LOOP_BLINK_QUEUE_LEN, sizeof(uint8_t));
+    assert(s_led_blink_queue != NULL);
+    xTaskCreate(loop_led_task, "loop_led", 2560, NULL, 2, NULL);
+
+    xTaskCreate(loop_task, "loop_task", LOOP_TASK_STACK, NULL, LOOP_TASK_PRIO, NULL);
+
+    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        snprintf(s_loop_status_text, sizeof(s_loop_status_text), "LOOP:IDLE");
+        xSemaphoreGive(s_state_mutex);
+    }
+    ESP_LOGI(TAG, "[loop] module ready (LED=GPIO%d open-drain, rest=%s)",
+             (int)LOOP_LED_GPIO, LOOP_LED_REST_ON ? "on" : "off");
+}
+
 /* Uploader task: drain the queue and POST batches one at a time. */
 static void uploader_task(void *arg)
 {
@@ -5141,6 +5748,13 @@ void app_main(void)
         }
     }
     log_heap("after camera init");
+
+    /* 5c. 闭环事件模块（LED + loop_task）。
+     *     必须排在 init_buttons() 之前：按键回调会往 LED 闪烁队列里丢东西，
+     *     队列得先存在。它只依赖 s_state_mutex（步骤 0 已建）与 HTTP 辅助函数，
+     *     不碰采样器 / 上传 / 直播，是纯旁路。 */
+    loop_module_init();
+    log_heap("after loop_module_init");
 
     /* 6. Buttons */
     init_buttons();
