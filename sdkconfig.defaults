@@ -28,10 +28,20 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MEMTEST=y
-# >=16 KiB allocations prefer PSRAM (moves LVGL pool + draw buffers out).
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Everything >= 4 KiB prefers PSRAM (moves the LVGL pool, draw buffers AND the
+# cJSON upload tree / HTTP buffers out of internal RAM). The camera DVP driver
+# needs a 16 KiB *contiguous internal-DMA* block on every STREAMON (see
+# CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE below); at 16384 the upload/collecting path
+# drove the largest free internal block down to ~9.7 KiB, making photos fail
+# intermittently with "VIDIOC_STREAMON failed: errno=12". 4 KiB keeps hot small
+# allocations internal while pushing the bulk to PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # Reserve 32 KiB internal for DMA-only users: i2c links, SDMMC, esp_timer.
+# NOTE: raising this does NOT help the DVP camera. The driver wants one
+# *contiguous* internal-DMA block, and a bigger reserve actually shrank the
+# largest free internal block (29696 -> 26624), so it is deliberately kept at
+# the stock value and CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE is lowered instead.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 
 # ---- Camera: OV2640 on the DVP interface, JPEG 640x480 (esp_video) ----
@@ -48,6 +58,20 @@ CONFIG_CAMERA_OV2640_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
 # already reports JPEG 640x480 (the DVP device rejects S_FMT size mismatches).
 CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS=y
 CONFIG_CAMERA_OV2640_DVP_DEFAULT_FMT_JPEG_640X480_25FPS=y
+
+# ---- DVP DMA staging buffer: the 32 KiB default does not fit in internal RAM ----
+# esp_cam_ctlr_dvp_cam.c allocates CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE as ONE
+# contiguous MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL block on every STREAMON
+# ("no mem for CAM DVP DMA receive buffer"). This firmware only has ~186 KiB of
+# internal DRAM for dynamic allocation and the app's own .data/.bss already take
+# ~117 KiB of it, so the largest free internal block sits at ~26-29 KiB. With the
+# 32 KiB default every photo/live frame failed with "VIDIOC_STREAMON failed:
+# errno=12" (ENOMEM). 16 KiB fits with margin as long as the ALWAYSINTERNAL=4096
+# change above keeps the block from shrinking under upload load (verified: three
+# consecutive photos captured ~10.4 KiB JPEGs, all http=201). It is still 2x the
+# driver's documented minimum (range 8192..32768); for JPEG the staging buffer
+# only has to be deep enough for the DVP task to drain 8 KiB halves.
+CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE=16384
 
 # ---- I2C: one bus (BSP port 1, GPIO4/5, 400 kHz), one driver ----
 # The IMU moved to driver/i2c_master.h so it can share the bus with the camera

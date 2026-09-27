@@ -251,10 +251,12 @@ static const char *TAG = "imu_logger";
 
 /* ------------------------------------------------------------------
  * Heap diagnostics.
- * PSRAM is disabled in sdkconfig (# CONFIG_SPIRAM is not set), so every
- * allocation - LVGL pool, WiFi, SD, cJSON upload payload - competes for
- * the same internal SRAM. When it runs dry the failures surface far from
- * the cause (wifi "fail to alloc timer", i2c "command link malloc error"),
+ * PSRAM is enabled (CONFIG_SPIRAM=y): the big blocks (LVGL pool, WiFi/LWIP
+ * buffers, JPEG frames) live there, but everything below
+ * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL still competes for internal SRAM. When
+ * it runs dry the failures surface far from
+ * the cause (wifi "fail to alloc timer", i2c "command link malloc error",
+ * camera "no mem for CAM DVP DMA receive buffer"),
  * so log the real numbers instead of guessing.
  *   free      = total free heap (all capabilities)
  *   min_free  = low-water mark since boot
