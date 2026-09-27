@@ -3669,6 +3669,33 @@ static void task_handle_camera(const char *request_id, int64_t server_expires_ms
     log_heap("task: photo done");
 }
 
+/* 处理 kind=preview 任务：切换本地 LCD 相机预览开关（Web 触发；与长按 Button A
+ * 的本地预览态共用 s_preview_active）。与 pause/resume 同属控制类、不产生观测数据，
+ * 靠 /applied 收尾；但不影响周期上报，服务端 applied 只置 completed、不写 device_control。 */
+static void task_handle_preview(const char *request_id)
+{
+    /* ack 尽力而为：失败也继续切，服务端不靠 ack 收尾 */
+    if (!task_post_ack(request_id)) {
+        ESP_LOGW(TAG, "[prev] ack failed for %s (toggle continues)", request_id);
+    }
+    if (!s_camera_ready) {
+        task_post_fail(request_id, "camera not initialized on device");
+        return;
+    }
+    if (s_preview_active) {
+        s_preview_active = false;   /* 预览任务下一轮自行收尾 UI */
+        ESP_LOGI(TAG, "[prev] stop requested (Web task %s)", request_id);
+    } else if (!camera_preview_start()) {
+        task_post_fail(request_id, "camera preview failed to start");
+        return;
+    } else {
+        ESP_LOGI(TAG, "[prev] started (Web task %s)", request_id);
+    }
+    /* 0 = 不报 paused_until；服务端对 preview 直接置 completed */
+    task_post_applied(request_id, 0);
+    log_heap("task: preview done");
+}
+
 /* ================================================================
  *  摄像头实时直播（长按 Button A 开关 → POST /api/v1/live）
  *
@@ -4010,6 +4037,15 @@ static void task_handle_next_response(const char *resp)
                                      ? expires_to_epoch_ms(exp->valuedouble) : 0;
         cJSON_Delete(root);
         task_handle_camera(request_id, cam_expires_ms);
+        return;
+    }
+
+    /* 本地 LCD 预览（kind=preview）：切换开关，不采数据、不占用采样器；
+     * 与 pause/resume 一样靠 /applied 收尾，见 task_handle_preview()。 */
+    if (cJSON_IsString(kind) && kind->valuestring
+        && strcmp(kind->valuestring, "preview") == 0) {
+        cJSON_Delete(root);
+        task_handle_preview(request_id);
         return;
     }
 
