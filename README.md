@@ -45,21 +45,23 @@ data_capture_sim/
 │   ├── manual_capture_task_acceptance.md # 验收手册：3 层自检 + 真机脚本 + 逐条观测点
 │   ├── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │   ├── realtime_photo_capture.md       # 实时拍照（camera 任务 + JPEG 落盘 + 画廊/删除）设计说明
-│   └── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
+│   ├── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
+│   └── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
 │
 └── server/                        # 服务端（PC 运行，Python/FastAPI）
-    ├── main.py                    # FastAPI 服务（校验 + SQLite + 查询接口 + 任务接口 + 照片接口）
+    ├── main.py                    # FastAPI 服务（校验 + SQLite + 查询 + 任务 + 照片 + 闭环事件接口）
     ├── requirements.txt           # Python 依赖
     ├── test_receive.py            # 单元自测（临时库）
     ├── test_photos.py             # 单元自测：拍照链路（临时库 + 临时照片目录）
+    ├── test_events.py             # 单元自测：闭环事件状态机（临时库）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检
     ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
     ├── e2e_device_check.py        # 真机验收（可选，需板端在线上报；无板则 SKIP）
     ├── e2e_live_check.py          # 摄像头实时直播自检（HTTP + 可选无头浏览器）
     ├── photos/                    # 照片落盘目录（gitignore，见 docs/realtime_photo_capture.md）
     └── static/                    # 实时监控页（静态资源）
-        ├── index.html             # 页面结构 + 样式
-        └── app.js                 # 轮询 + 渲染 + 任务跟踪 + 照片画廊 + 三维姿态视图
+        ├── index.html             # 页面结构 + 样式（含闭环事件卡片）
+        └── app.js                 # 轮询 + 渲染 + 任务跟踪 + 事件卡片 + 照片画廊 + 三维姿态视图
 ```
 
 ### 数据链路
@@ -75,6 +77,9 @@ QMA6100P (100Hz)          ──WiFi──▶  FastAPI (server/main.py)  ──H
 实时拍照：板端每 3s 轮询 /tasks/next ◀── tasks 表（kind=camera） ◀──────────── 「拍一张照片」
 拍一帧 640×480 JPEG POST /api/v1/photos?request_id=…   落盘 + photos 表 + 任务收尾（同一事务）  画廊缩略图/原图/逐张删除
 摄像头直播：板端长按 Button A(2s) 开/关  ──每 ~500ms 一帧 JPEG──▶  POST /api/v1/live?device_id=…（内存态，不落盘不入库）  ◀──── 页面「摄像头实时画面」卡片
+闭环事件：按钮 C 触发（灯闪2下/屏变 TRIG）──▶ POST /api/v1/events/trigger（request_id 由板端生成）──▶ events 表  ◀──── 页面「闭环事件」卡片（待处理）
+         按钮 D 单击回应 / 长按取消        ──▶ POST /api/v1/events/respond（accept/cancel）                        ◀──── 页面点「回应/取消/确认完成」
+         板端每 1s 轮询 /events/status ◀── events 表 终态 ──▶ 灯闪3下 + LOOP:DONE ──▶ 3s 后回 IDLE
 ```
 
 > 四条上传通道互不干扰：周期上报不带 `request_id`（行为与旧版一致）；按需采集带 `request_id`
@@ -219,6 +224,9 @@ idf.py -p <串口> flash monitor
 | 短按按钮 A | 启动 / 停止普通 IMU 采集（SD 卡 CSV 落盘） |
 | 长按按钮 A（2s） | 开 / 关**摄像头实时直播**：板端每 ~500 ms 推一帧 JPEG 到 `POST /api/v1/live`，页面「摄像头实时画面」卡片显示实时画面（约 1-2 fps）；LCD 状态栏显示 `Live:ON/OFF` |
 | 长按按钮 B（2s） | 循环切换 5 种动作采集协议 |
+| **短按按钮 C（`BSP_BUTTON_3`）** | **触发闭环事件**：绿灯闪 2 下 → LCD 显示 `LOOP:TRIG <request_id前4位>` → 上报 `POST /api/v1/events/trigger`，页面「闭环事件」卡片出现「待处理」 |
+| **短按按钮 D（`BSP_BUTTON_4`）** | **回应**闭环事件（accept）：绿灯闪 1 下 → LCD 显示 `LOOP:WAIT` |
+| **长按按钮 D（2s）** | **取消**闭环事件（cancel）：绿灯闪 4 下 → LCD 显示 `LOOP:CANCEL` |
 
 **5 种动作采集协议**（长按按钮 B 切换）：
 
@@ -257,6 +265,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | **恢复周期** | 建一条 `kind=resume` 任务，提前结束暂停窗口（方向相反的控制任务不会同时排队：新的会把旧的置 `failed: superseded by newer control task`） |
 | **拍一张照片** | 建一条 `kind=camera` 任务 → 板端领取后用 esp_video/DVP 拍一帧 **640×480 JPEG** → `POST /api/v1/photos?device_id=…&request_id=…` 原样上传 → 服务端落盘 + 入库 + 同一事务把任务置 `completed`；完成后画廊立刻刷新 |
 | **摄像头实时画面** | 不是按钮，而是**板端长按按钮 A（2 s）**开启的直播：板端每 ~500 ms 推一帧 JPEG 到 `POST /api/v1/live?device_id=…&ts_ms=…&w=…&h=…`，服务端只在内存里保留该设备**最新一帧**（不落盘、不进 `photos` 表、不建任务）；本卡片按 `GET /api/v1/live` 的 `seq` 轮询 `GET /api/v1/live/frame` 刷新 `<img>`，约 **1-2 fps**；再长按一次停止 |
+| **闭环事件**（板端发起，方向相反） | **不是 Web 下发的按钮，触发只来自板子上的按钮 C**：按 C → 板端本地先闪灯/改屏 → `POST /api/v1/events/trigger`（`request_id` 由**板端生成**）→ 卡片出现「待处理」；按 D 单击回应 / 长按取消 → `POST /api/v1/events/respond`；本卡片可点「回应 / 取消 / 确认完成」→ 板端 1 s 轮询 `GET /api/v1/events/status` 读到终态即闪灯收尾。表尾列最近 8 条事件流水 |
 
 - 任务状态机：`submitted → dispatched → acked → completed`，失败为 `failed`，超期未完成变 `timeout`
   （默认有效期 60 s，页面显示剩余时间）。
@@ -291,8 +300,9 @@ label,timestamp_ms,accel_x,accel_y,accel_z
   `&samples=250&rate=50&timeout=45` 指定参数（便于无人值守验证表单参数真的传到了任务里）；
   `/ui/?autopause=1&pause=90` 触发「暂停周期」、`/ui/?autoresume=1` 触发「恢复周期」、
   `/ui/?autophoto=1` 触发「拍一张照片」，同样走的不是测试专用分支，而是按钮的事件处理函数。
-- 自检脚本：`test_receive.py`（43 项）、`test_photos.py`（16 项）、`e2e_server_check.py`（14 项）、
-  `e2e_ui_check.py`（81 项，无浏览器则 SKIP）、`e2e_live_check.py`（28 项，含无头页面断言；无浏览器则只跑 HTTP 部分）、
+- 自检脚本：`test_receive.py`（43 项）、`test_photos.py`（16 项）、`test_events.py`（23 项）、
+  `e2e_server_check.py`（23 项，含 9 项闭环事件）、
+  `e2e_ui_check.py`（90 项，含 9 项事件卡片渲染；无浏览器则 SKIP）、`e2e_live_check.py`（28 项，含无头页面断言；无浏览器则只跑 HTTP 部分）、
   `e2e_device_check.py`（真机 28 项，无板则 SKIP）。
 
 > 完整说明（接口字段、状态机、板端实现、验证场景）见 `docs/manual_capture_task.md`；
@@ -324,6 +334,10 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | `POST` | `/api/v1/live?device_id=…&ts_ms=…&w=…&h=…` | 板端推一帧直播画面（**body 即 JPEG 字节**，`Content-Type: image/jpeg`）；校验 `device_id` / SOI 魔数 / 大小上限（512 KiB），成功 201 + 全局单调 `seq`；**只写内存、不落盘不入库、不建任务** |
 | `GET` | `/api/v1/live?device_id=…` | 直播状态：`active`（超过 `SENSOR_LIVE_TIMEOUT_S`，默认 5 s，没有新帧即 `false`）/ `seq` / `age_ms` / 分辨率 / 字节数 / 时间戳 / `devices[]`；未知设备返回 200 + `active=false` |
 | `GET` | `/api/v1/live/frame?device_id=…` | 最新一帧 JPEG 字节（页面 `<img src>` 直接用；`Cache-Control: no-store`）；从未推流 404 |
+| `POST` | `/api/v1/events/trigger` | **闭环事件：板端按键触发**。body 为 JSON（`device_id`/`source`/`kind`/`request_id`/`ts_ms`）；`request_id` 由**板端生成**并作主键，同号重传返回 200 + `idempotent=true`（同一次按键只算一条事件） |
+| `POST` | `/api/v1/events/respond` | **闭环事件：回应 / 取消 / 确认完成**（板端与 Web 共用）。body `{"request_id":…,"action":"accept\|cancel\|confirm","by":"device\|web"}`；重复同动作幂等 200，终态不可回退 409，未知 id 404 |
+| `GET` | `/api/v1/events/status?device_id=…&request_id=…` | **板端轮询事件状态**。返回 `found` / 顶层 `status` / 完整 `event`；未知 `request_id` 返回 **200 + found=false**（轮询过渡态，不算错误）；不带 `request_id` 时回该设备最近一条 |
+| `GET` | `/api/v1/events?device_id=…&limit=8&active=1` | 事件列表（新的在前，`limit` 1–200），附 `pending` 计数供页面红色徽章；`active=1` 只看未终态 |
 | `GET` | `/` | 极简 HTML 首页 |
 | `GET` | `/ui/` | 实时监控面板 |
 
@@ -344,7 +358,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 }
 ```
 
-**数据库**（SQLite，五张表）：
+**数据库**（SQLite，六张表）：
 
 | 表 | 说明 |
 |----|------|
@@ -353,6 +367,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | `tasks` | 任务（`request_id` 主键、设备、`kind`（`capture`/`camera`/`pause`/`resume`）、`duration_s`、状态、状态时间戳、有效期、关联 `upload_id`、错误原因） |
 | `device_control` | 每个 `device+source` 一行的暂停状态（`periodic_paused`、`paused_until`、`request_id`、`updated_at`）——「是否真的暂停」的真相源 |
 | `photos` | 每张照片一行（`device_id`、`request_id`、`ts_ms`、`received_at`、`bytes`、`width`、`height`、`ip`、`path`、`note`）；**图片字节不入库**，只存路径，文件在 `server/photos/<device_id>/<id>.jpg` |
+| `events` | 闭环事件（板端发起）：`request_id` 主键、`device_id`、`source`、`kind`、`status`（`pending`/`ack`/`cancelled`/`completed`/`expired`）、`created_at`、`device_ts_ms`、`responded_at`/`response`/`responded_by`、`closed_at`、`expires_at`、`ip`、`note`。**与 `tasks` 分表**：`tasks` 是「服务端派发、板端执行」，把板端发起的事件塞进去会被 `/tasks/next` 领回来形成回环 |
 
 - 老库升级：`CREATE TABLE IF NOT EXISTS` 不会给已有表加列，服务端启动时用 `PRAGMA table_info`
   检查并 `ALTER TABLE` 补 `uploads.request_id` / `uploads.trigger`（再建 **部分唯一索引**
@@ -391,9 +406,31 @@ label,timestamp_ms,accel_x,accel_y,accel_z
    `server/photos/` 已随 `server/data/` 一起 gitignore。
 10. **摄像头直播占用的是"带宽"，不是磁盘**：直播帧只存在服务端内存里（每台设备一帧，
     ≤ 512 KiB），服务端重启后画面回到「未推流」，等板端下一帧即恢复；板端侧
-   **长按按钮 A（2 s）**开/关，WiFi 掉线或连续 5 帧上传失败会自动停止推流并写串口日志。
-   约 1-2 fps × 每帧几十 KB ≈ 数十 KB/s，长时间开着会持续占用 WiFi 带宽（100 Hz
-   周期上报仍然优先，直播任务的优先级最低），不用时请再长按一次关闭。
+    **长按按钮 A（2 s）**开/关，WiFi 掉线或连续 5 帧上传失败会自动停止推流并写串口日志。
+    约 1-2 fps × 每帧几十 KB ≈ 数十 KB/s，长时间开着会持续占用 WiFi 带宽（100 Hz
+    周期上报仍然优先，直播任务的优先级最低），不用时请再长按一次关闭。
+11. **板载绿灯 GPIO3 必须配成开漏输出**：闭环事件的本地灯光反馈用 GPIO3
+    （`BSP_LED_1_IO`）。乐鑫官方硬件手册明确要求
+    「GPIO3 must be set up in open-drain mode. **Pulling GPIO3 up may burn the LED.**」，
+    因此**不能**用 BSP 的 `bsp_led_indicator_create()`/`bsp_led_set()`——那条路径走
+    `led_indicator_gpio`，内部是推挽（`GPIO_MODE_OUTPUT`），正是官方警告要避免的配置；
+    本功能直接 `gpio_config()` 成 `GPIO_MODE_OUTPUT_OD`。
+    开漏下哪个电平算"亮"取决于 LED 接法，所以留了两个编译期开关：
+    `LOOP_LED_ON_LEVEL`（默认 1，**上板若亮灭相反改成 0**）与
+    `LOOP_LED_REST_ON`（默认 0=平时灭；改 1 可当电源指示灯常亮）。
+12. **闭环按键用的是 `BSP_BUTTON_3` / `BSP_BUTTON_4`**：这两颗不是独立 GPIO，
+    而是与 A/B 共用同一个 ADC 通道的电阻梯按键（详见 `docs/loop_trigger_callback.md`），
+    `iot_button` 已把它们封装成独立设备，注册方式与 GPIO 按键一致。
+    按键回调里**只置标志 + 闪灯 + 改屏**，HTTP 一律交给 `loop_task` ——
+    回调运行在 `iot_button` 的任务上下文里，栈很小，既不能 `vTaskDelay` 也不能发请求。
+13. **闭环事件与动作协议共用 LCD 那条黄色状态行**：优先级为
+    「动作协议 > 闭环状态 > `s_status_text`」。屏幕只有 240×240，状态栏已贴底，
+    硬塞第四行会被裁掉，因此协议运行时闭环文本会被临时盖住（协议结束即恢复）。
+14. **事件状态的所有读路径都要先做惰性过期**：`pending`/`ack` 超 TTL 后的 `expired`
+    不是后台线程改的，而是**每条读取路径自己先判**（`_expire_stale_events()`）。
+    少调一处就会出现口径矛盾——实测 `/api/v1/health` 漏调时，它报「待处理 2 条」
+    而 `GET /api/v1/events` 只返回 1 条，排查时极易被误导。新增任何读 `events`
+    的接口（尤其统计类）时，务必在 `SELECT` **之前**补上这次调用。
 
 ---
 
@@ -437,13 +474,20 @@ ESP32-S3-EYE ──WiFi(局域网)──▶ 本机 PC:8000 (FastAPI + SQLite) �
 | 三维视图 | 拖拽/滚轮/双击可旋转缩放复位；向量指向与 `ax/ay/az` 数值一致（静止时贴近重力参考） |
 | 实时拍照链路 | `/ui/` 点「拍一张照片」→ 任务卡片 `kind=实时拍照` 从 `submitted` 走到 `completed`，画廊出现该照片缩略图（含尺寸/大小）；板端日志有 `[photo] captured … for <request_id>` 与 `[photo] upload OK` |
 | 照片落盘与删除 | `server/photos/<device_id>/<id>.jpg` 与 `photos` 表一一对应；点「删除」后文件与库行同时消失，再次 `GET /api/v1/photos/{id}` 返回 404 |
+| 闭环触发（按键 → 本地反馈） | 按按钮 C：绿灯闪 **2** 下、状态行变 `LOOP:TRIG xxxx`（**先于网络**发生）；串口 `[loop] state=TRIGGERED` |
+| 闭环远端显示 | 页面「闭环事件」卡片出现该 `request_id`、状态「待处理」、徽章变红；表尾流水新增一行 |
+| 闭环回应 / 取消 | 按钮 D 单击=回应（闪 1 下 → 页面「已回应」）、长按 2 s=取消（闪 4 下 → 「已取消」）；页面也能点「回应 / 取消 / 确认完成」 |
+| 闭环收口 | 页面点「确认完成」→ 按钮侧轮询到终态 → 绿灯闪 **3** 下、状态行 `LOOP:DONE`，3 s 后回 `LOOP:IDLE` |
+| 闭环连点不重复 | 快速按 5 次按钮 C：只有 1 条事件（`request_id` 由板端生成，服务端主键去重），串口 `trigger ignored: already in TRIGGERED` |
+| 闭环关机 / 超时 | 触发后直接断电：事件停在「待处理」，TTL（默认 300 s）后自动「已过期」；网络一直不通时板端 60 s 本地兜底 → `LOOP:TIMEOUT` |
 
 ### 自测
 
 ```bash
 python server/test_receive.py     # 单元自测（临时库）：校验/入库/查询/可选鉴权/任务全流程
 python server/test_photos.py      # 拍照链路自测（临时库 + 临时照片目录）：上传/取图/列表/删除/任务收尾
-python server/e2e_server_check.py # 真实 HTTP 端到端自检（含任务创建-领取-回传-幂等）
+python server/test_events.py      # 闭环事件自测（临时库，23 项）：状态机/幂等/终态不可回退/惰性过期/鉴权
+python server/e2e_server_check.py # 真实 HTTP 端到端自检（含任务创建-领取-回传-幂等 + 闭环事件全流程）
 python server/e2e_ui_check.py     # 界面自检（可选，需本机 Edge/Chrome；无浏览器则 SKIP 退出）
 python server/e2e_device_check.py # 真机验收（可选，需板端在线；板端不在线则 SKIP 退出）
 ```
