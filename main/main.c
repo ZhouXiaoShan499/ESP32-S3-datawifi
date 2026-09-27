@@ -59,6 +59,11 @@
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
 #include "esp_video_ioctl.h"     /* VIDIOC_S_DQBUF_TIMEOUT 等私有 ioctl */
+/* 相机初始化 API：esp_video_init() + esp_video_init_dvp_config_t
+ * （esp_video_init.h 内部已包含 esp_cam_ctlr_dvp.h 与 esp_cam_sensor_xclk.h）；
+ * esp_cam_sensor_xclk_* 用来自己驱动相机 XCLK（见 app_camera_init()）。 */
+#include "esp_video_init.h"
+#include "esp_cam_sensor_xclk.h"
 #include <stdlib.h>
 #include "freertos/queue.h"
 
@@ -112,6 +117,17 @@
 #define CAMERA_FRAME_SKIP_MAX    8        /* 跳过坏帧（V4L2_BUF_FLAG_ERROR）上限 */
 #define CAMERA_DQBUF_TIMEOUT_MS  3000     /* 单帧等待上限（VIDIOC_S_DQBUF_TIMEOUT） */
 #define CAMERA_LOCK_TIMEOUT_MS   5000     /* 等相机锁上限（直播 vs 单帧拍照串行化） */
+
+/* 相机 XCLK 频率：必须 20 MHz。
+ * BSP 的 bsp_camera_start() 把 XCLK 写死成 BSP_CAMERA_XCLK_CLOCK_MHZ(=16 MHz)，
+ * 而 OV2640 的全部 DVP 格式表都叫 "DVP_8bit_20Minput_*"（ov2640.c:
+ * `.name = "DVP_8bit_20Minput_JPEG_640x480_25fps"`, `.xclk = 20000000`）——
+ * 它们是按 20 MHz 输入校准的寄存器序列。喂 16 MHz 时传感器内部 PLL 与格式表
+ * 不匹配，JPEG 出不了完整帧（DQBUF 得到 flags=V4L2_BUF_FLAG_ERROR、bytesused=0），
+ * 「拍一张照片」和长按 Button A 的实时直播会一起失败；esp_video_init() 也会正好
+ * 打一条 "Configured xclk frequency ... the sensor output image may be unexpected"。
+ * 所以 app_camera_init() 不走 bsp_camera_start()，自己按 20 MHz 初始化。 */
+#define CAMERA_XCLK_FREQ_HZ      20000000
 
 /* 摄像头实时直播（长按 Button A 切换）config。
  * 开启后 live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」，
@@ -1152,7 +1168,7 @@ static esp_err_t accel_read_regs(uint8_t reg, uint8_t *out, size_t len)
 static esp_err_t app_accel_init(void)
 {
     /* BSP 总线，与相机 SCCB 共用：bsp_i2c_init() 幂等（已初始化时直接返回
-     * ESP_OK），所以放在 bsp_camera_start() 之前调用是安全的。 */
+     * ESP_OK），所以先于 app_camera_init() 建好这条总线是安全的。 */
     esp_err_t ret = bsp_i2c_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(ret));
@@ -1262,9 +1278,11 @@ static esp_err_t app_accel_read(float *out_x, float *out_y, float *out_z)
 /* ================================================================
  *  Camera — on-demand single JPEG frame (esp_video, DVP + V4L2)
  *
- *  相机与 IMU 共用 BSP I2C 总线：bsp_camera_start() 内部就是
- *  bsp_i2c_init() + esp_video_init()（DVP + SCCB），因此 IMU 必须先改走
- *  i2c_master（见上一节），两者才能共存于同一个固件。
+ *  相机与 IMU 共用 BSP I2C 总线：相机初始化就是 bsp_i2c_init() +
+ *  esp_video_init()（DVP + SCCB），因此 IMU 必须先改走 i2c_master
+ *  （见上一节），两者才能共存于同一个固件。
+ *  XCLK 由本文件自己起 20 MHz（见 app_camera_init()），不用 bsp_camera_start()
+ *  —— BSP 把它写死成 16 MHz，OV2640 的 JPEG 格式表会因此出不了完整帧。
  *
  *  运行路径（每次拍照都重新 open/close 设备，只在开机时初始化一次硬件）：
  *    open(BSP_CAMERA_DEVICE) → VIDIOC_G_FMT 确认当前是 JPEG
@@ -1298,7 +1316,20 @@ static void jpeg_frame_free(jpeg_frame_t *frame)
 }
 
 /* 初始化相机（开机一次）。失败不 abort：没有相机时 IMU/上传照常工作，
- * camera 任务会得到明确的 fail 回执而不是无限等待。 */
+ * camera 任务会得到明确的 fail 回执而不是无限等待。
+ *
+ * 这里刻意 **不复用 bsp_camera_start()**：它把 XCLK 固定成 BSP_CAMERA_XCLK_CLOCK_MHZ
+ * (16 MHz)，而 OV2640 的 JPEG/VGA 格式表是按 20 MHz 输入校准的
+ * （esp_cam_sensor/sensors/ov2640/ov2640.c: `.xclk = 20000000`）。16 MHz 下帧会退化成
+ * 0 字节坏帧（DQBUF flags=V4L2_BUF_FLAG_ERROR、bytesused=0），拍照与直播同时失效——
+ * 这正是 esp_video_init() 那条 "the sensor output image may be unexpected" 的真实含义。
+ * 所以要复刻 BSP 的初始化流程，只把频率换成 CAMERA_XCLK_FREQ_HZ(20 MHz)。
+ *
+ * 两处都要给到 20 MHz，因为它们共同决定引脚上的实际波形：
+ *   1) esp_cam_sensor_xclk_start()：LEDC 在 BSP_CAMERA_GPIO_XCLK(IO15) 上输出 XCLK；
+ *   2) esp_video_init()：内部按 .xclk_freq 调 esp_cam_ctlr_dvp_output_clock() 设 DVP 分频。
+ * 该分频必须整除（CAM_CLK_SRC_DEFAULT = SOC_MOD_CLK_PLL_D2 = 80 MHz）：
+ *   80 / 20 = 4 ✓   （原来的 80 / 16 = 5 也能整除，所以相机能出帧、只是帧本身是坏的）。 */
 static esp_err_t app_camera_init(void)
 {
     if (!s_camera_mutex) {
@@ -1308,14 +1339,74 @@ static esp_err_t app_camera_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    bsp_camera_cfg_t cfg = { 0 };
-    esp_err_t ret = bsp_camera_start(&cfg);
+
+    /* 相机 SCCB 与 IMU 共用这条 I2C 总线（bsp_i2c_init() 幂等，IMU 初始化时通常已建好）。 */
+    esp_err_t ret = bsp_i2c_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_camera_start failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    /* 1. XCLK：LEDC 直出 20 MHz（等价 bsp_camera.c 的写法，只改频率）。 */
+    esp_cam_sensor_xclk_handle_t xclk_handle = NULL;
+    const esp_cam_sensor_xclk_config_t xclk_config = {
+        .ledc_cfg = {
+            .timer        = LEDC_TIMER_1,
+            .clk_cfg      = LEDC_AUTO_CLK,
+            .channel      = CONFIG_BSP_CAMERA_XCLK_LEDC_CH,
+            .xclk_freq_hz = CAMERA_XCLK_FREQ_HZ,
+            .xclk_pin     = BSP_CAMERA_GPIO_XCLK,
+        },
+    };
+    ret = esp_cam_sensor_xclk_allocate(ESP_CAM_SENSOR_XCLK_LEDC, &xclk_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "xclk allocate failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = esp_cam_sensor_xclk_start(xclk_handle, &xclk_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "xclk start (%d Hz) failed: %s",
+                 CAMERA_XCLK_FREQ_HZ, esp_err_to_name(ret));
+        esp_cam_sensor_xclk_free(xclk_handle);
+        return ret;
+    }
+
+    /* 2. DVP + SCCB + 传感器：引脚全部取自 BSP 宏，只把 xclk_freq 换成 20 MHz。 */
+    const esp_video_init_dvp_config_t dvp_config = {
+        .sccb_config = {
+            .init_sccb = false,                 /* bsp_i2c_init() 已建好这条总线 */
+            .i2c_handle = bsp_i2c_get_handle(),
+            .freq = 400000,
+        },
+        .reset_pin = BSP_CAMERA_RST,            /* 板子复位脚为 NC，BSP 同 */
+        .pwdn_pin  = -1,                        /* 板子无 PWDN 脚，BSP 同 */
+        .dvp_pin = {
+            .data_width = 8,
+            .data_io = {
+                BSP_CAMERA_D0, BSP_CAMERA_D1, BSP_CAMERA_D2, BSP_CAMERA_D3,
+                BSP_CAMERA_D4, BSP_CAMERA_D5, BSP_CAMERA_D6, BSP_CAMERA_D7,
+            },
+            .vsync_io = BSP_CAMERA_VSYNC,
+            .de_io    = BSP_CAMERA_HSYNC,
+            .pclk_io  = BSP_CAMERA_PCLK,
+            .xclk_io  = BSP_CAMERA_GPIO_XCLK,
+        },
+        .xclk_freq = CAMERA_XCLK_FREQ_HZ,
+    };
+    const esp_video_init_config_t video_config = {
+        .dvp = &dvp_config,
+    };
+    ret = esp_video_init(&video_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_video_init failed: %s", esp_err_to_name(ret));
+        esp_cam_sensor_xclk_stop(xclk_handle);
+        esp_cam_sensor_xclk_free(xclk_handle);
+        return ret;
+    }
+
     s_camera_ready = true;
-    ESP_LOGI(TAG, "Camera ready: %s (OV2640 DVP, JPEG)", BSP_CAMERA_DEVICE);
+    ESP_LOGI(TAG, "Camera ready: %s (OV2640 DVP, JPEG, xclk=%d Hz)",
+             BSP_CAMERA_DEVICE, CAMERA_XCLK_FREQ_HZ);
     return ESP_OK;
 }
 
@@ -4833,9 +4924,11 @@ void app_main(void)
 
     /* 5b. Camera (OV2640 DVP via esp_video; JPEG frames for the Web "photo" task).
      *     Must come after app_accel_init(): both share the BSP I2C bus, and the
-     *     IMU now owns it through the new i2c_master driver, so the SCCB init
-     *     inside bsp_camera_start() just reuses it. A failure here is not fatal:
-     *     sampling/uploading continue and camera tasks fail with a clear reason. */
+     *     IMU now owns it through the new i2c_master driver, so app_camera_init()
+     *     just reuses that bus for SCCB. It drives the sensor XCLK itself at
+     *     20 MHz rather than calling bsp_camera_start() (fixed at 16 MHz).
+     *     A failure here is not fatal: sampling/uploading continue and camera
+     *     tasks fail with a clear reason. */
     if (app_camera_init() != ESP_OK) {
         ESP_LOGW(TAG, "Camera not available, photo tasks will report failure");
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
