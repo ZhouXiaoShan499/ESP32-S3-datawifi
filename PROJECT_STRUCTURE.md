@@ -45,7 +45,9 @@ data_capture_sim/                  # 仓库根目录
 │   ├── manual_capture_task_acceptance.md # 验收手册：自检脚本 + 真机验收 + 逐条观测点/边界
 │   ├── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │   ├── realtime_photo_capture.md       # 实时拍照（camera 任务 + JPEG 落盘 + 画廊/删除）
-│   └── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
+│   ├── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
+│   ├── wifi_network_troubleshooting.md # WiFi 关联成功却拿不到 IP：DHCP 排查与静态兜底验证
+│   └── static_ip_fallback_fix.md       # 静态 IP 兜底复盘：条件编译缺陷 + sdkconfig 回写陷阱
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
     ├── main.py                    # FastAPI 服务（约 1900 行：接收 + 存储 + 查询 + 任务 + 照片接口）
