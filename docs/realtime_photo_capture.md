@@ -92,9 +92,27 @@
 （不是 JPEG 就给出 “enable CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS” 的明确日志）
 → 用同样的宽高做 `VIDIOC_S_FMT`。
 
-> BSP 的 XCLK 固定 16 MHz，而 JPEG 640×480 格式表里期望 20 MHz。`esp_video_init()` 对此
-> **只打一条 warning**（`Configured xclk frequency ... is not equal to sensor xclk frequency`），
-> DVP 数据通路按 PCLK 采样，仍能出图；真机首次烧录时确认这条告警存在即可。
+> **XCLK 必须 20 MHz（真机已验证，2026-09-27 修正）**：BSP 的 `bsp_camera_start()` 把 XCLK
+> 固定成 `BSP_CAMERA_XCLK_CLOCK_MHZ`(16 MHz)，但 OV2640 的**全部** DVP 格式表都叫
+> `DVP_8bit_20Minput_*`（`esp_cam_sensor/sensors/ov2640/ov2640.c`：`.xclk = 20000000`），
+> 是按 20 MHz 输入校准的寄存器序列。喂 16 MHz 时传感器内部 PLL 与格式表不匹配，
+> **JPEG 帧会退化成 0 字节**：`DQBUF` 返回
+> `flags = V4L2_BUF_FLAG_MAPPED | V4L2_BUF_FLAG_ERROR`(0x41)、`bytesused = 0`
+> → `dvp_calculate_jpeg_size()` 找不到 SOI/EOI → `valid_size = 0`。
+> 于是「拍一张照片」与长按 Button A 的实时直播**同时失败**（直播连败 5 次后还会自动停）。
+>
+> 本文档此前写的「16 MHz 只打一条 warning、仍能出图」是**错的**：`esp_video_init()` 那条
+> `Configured xclk frequency ... the sensor output image may be unexpected`
+> （`esp_video_init.c:330`）描述的正是这个后果，不是无害提示。
+>
+> 因此板端 `app_camera_init()` **不再调用** `bsp_camera_start()`，而是复刻它的初始化流程、
+> 只把频率换成 20 MHz：`esp_cam_sensor_xclk_start()`（LEDC 在 `BSP_CAMERA_GPIO_XCLK`/IO15 上
+> 输出）+ `esp_video_init()` 的 `.xclk_freq`，**两处都必须是 20 MHz**——后者会被
+> `esp_video_init()` 内部拿去调 `esp_cam_ctlr_dvp_output_clock()` 设 DVP 分频
+> （`esp_video_init.c:515-520`）。该分频必须整除，而
+> `CAM_CLK_SRC_DEFAULT = SOC_MOD_CLK_PLL_D2 = 80 MHz` → `80 / 20 = 4` ✓
+> （旧值 `80 / 16 = 5` 也能整除，所以当时相机**能**出帧、只是帧本身是坏的——这也是该缺陷
+> 一开始不易看出的原因）。
 
 ---
 
@@ -195,8 +213,10 @@
 **真机验收步骤**（需要板子，自动化脚本 `e2e_device_check.py` 目前只覆盖 IMU/任务链路）：
 
 1. `idf.py build && idf.py -p COMx flash monitor`；串口应看到
-   `Detected QMA6100P at 0x12 … (i2c_master driver)`、`Camera ready: /dev/video2 (OV2640 DVP, JPEG)`、
-   `[HEAP] after camera init …`；若有 `xclk frequency … not equal` 的 warning 属预期（见 §三）。
+   `Detected QMA6100P at 0x12 … (i2c_master driver)`、
+   `Camera ready: /dev/video2 (OV2640 DVP, JPEG, xclk=20000000 Hz)`、`[HEAP] after camera init …`；
+   **不应出现** `Configured xclk frequency … is not equal to sensor xclk frequency` 的 warning
+   ——一旦出现就说明 XCLK 又不是 20 MHz 了（见 §三）。
 2. 网页 `/ui/` 点「拍一张照片」：任务卡片应在 ≤3 s 内从 `submitted` 走到 `completed`，
    串口出现 `[photo] captured … for <rid>` 与 `[photo] upload OK ts=… bytes=… http=201`。
 3. 画廊出现 1 张缩略图，尺寸显示 `640×480`；点开是清晰照片（可对照镜头前的物体）。
@@ -214,6 +234,9 @@
 - 只支持**单张按需拍摄**，没有连拍 / 定时抓拍 / 视频流（Web 也不做实时预览）。
 - 分辨率固定 640×480 JPEG（由 Kconfig 决定）；要换分辨率需同时改
   `CONFIG_CAMERA_OV2640_DVP_*` 与页面提示文字（板端不硬编码宽高，按 `VIDIOC_G_FMT` 上报实际值）。
+- **XCLK 固定 20 MHz**（`main.c` 的 `CAMERA_XCLK_FREQ_HZ`）：这是 OV2640 所有
+  `DVP_8bit_20Minput_*` 格式表的要求（见 §三），也是板端不再用 `bsp_camera_start()` 的唯一原因。
+  换其它传感器/格式表时要跟着改，否则会又回到「帧为 0 字节」的状态。
 - 照片**不参与自动清理/分页**：画廊固定取最近 12 张（`limit` 上限 200），磁盘占用需人工关注。
 - `note` 字段服务端已支持，但板端暂不上送（页面也不提供输入框），目前只有 `e2e`/第三方客户端会用到。
 - 拍照与上传在 `task_poll_task` 内同步执行，期间其它任务的下发/回执延迟 0.3–2 s。
