@@ -1,7 +1,8 @@
-# 摄像头实时直播 + 本地 LCD 预览（长按 Button A 三态切换）
+# 摄像头实时直播 + 本地 LCD 预览（长按 Button A 三态切换 + Web 触发）
 
 > 对应 Web 监控页「摄像头实时画面」卡片 + 板端 **长按 Button A（2 s）** 三态切换：
 > **关 → Web 直播 → 本地 LCD 预览 → 关**。
+> 本地预览也可用 Web 下发 **`kind=preview`** 任务单独切换（页面「切换本地预览」按钮）。
 > - **Web 直播**：把板端相机画面连续推到页面，得到 ~1-2 fps 的实时画面；
 > - **本地 LCD 预览**：板端把每帧 JPEG 软解成 RGB565，直接画在 240×240 屏上。
 >
@@ -82,17 +83,19 @@ LCD 状态：状态栏显示 `… Live:ON/OFF`（240 px 宽的屏只留诊断信
 任务优先级刻意最低（2 < `task_poll` 3 < `uploader` 4 < `sampler` 5）：
 直播是「锦上添花」的负载，网络突然变慢时先让位给采样与上传。
 
-### 本地 LCD 预览（三态循环的第 3 态）
+### 本地 LCD 预览（三态循环的第 3 态，也可由 Web `kind=preview` 触发）
 
-- 触发：长按 Button A 依次 `关 → Web 直播 → 本地预览 → 关`（`camera_mode_toggle()`）。
+- 触发：
+  - 长按 Button A 依次 `关 → Web 直播 → 本地预览 → 关`（`camera_mode_toggle()`）；
+  - Web 下发 `kind=preview` 任务单独 toggle（`task_handle_preview()` → 起/停 `s_preview_active`）。
 - 实现：**传感器保持 JPEG 640×480，不做运行时格式切换**——esp_video 的 DVP 设备
   `VIDIOC_S_FMT` 会拒绝尺寸/格式变化，切换格式要私有 `VIDIOC_S_SENSOR_FMT` ioctl +
   传感器内部寄存器表，故不采用。预览复用 `app_camera_capture_jpeg()` 拍一帧 JPEG，
   用 `espressif/esp_jpeg` 软解到 RGB565（`JPEG_IMAGE_SCALE_1_2` → 320×240），中心裁剪
   成 240×240 后写进 LVGL `lv_canvas` 直接上屏。
 - 符号：`CAMERA_PREVIEW_*`、`s_preview_active`、`camera_preview_decode()`、
-  `camera_preview_task()`、`camera_preview_start()`。帧缓冲都在 PSRAM
-  （`240×240×2` + `320×240×2` ≈ 263 KiB）。
+  `camera_preview_task()`、`camera_preview_start()`、`task_handle_preview()`。
+  帧缓冲都在 PSRAM（`240×240×2` + `320×240×2` ≈ 263 KiB）。
 - 串行化：预览与拍照/直播共用 `s_camera_mutex`，每帧只持锁到 `DQBUF` 完成即还，
   按需拍照任务在预览期间最多等一帧，不会被饿死。
 - 依赖：`main/idf_component.yml` 新增 `espressif/esp_jpeg`（软件 JPEG 解码；ESP32-S3
