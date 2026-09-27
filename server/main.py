@@ -172,6 +172,62 @@ _live_lock = threading.Lock()
 _live_frames = {}
 _live_seq = 0                                   # 全局单调帧序号（Web 侧用它判断“有新帧了”）
 
+# ---------------------------------------------------------------------------
+# 闭环事件（loop event）—— 板端按键触发 → 本地反馈 → 远端显示 → 回应/取消
+#
+# 与 tasks（Web 下发、板端执行）方向正好相反：这里是**板端发起、Web 接收**。
+# 因此不复用 tasks 表（tasks 的主键语义是「服务端派发的任务」，把板端发起的事件
+# 塞进去会让 /tasks/next 把它当成待执行任务下发给板子，形成回环）。
+#
+# 状态机（互斥、单向，除 pending 外都不可回退）：
+#
+#        ┌──────────── trigger ────────────┐
+#        │                                 ▼
+#      (板端按键)                        pending ── respond(cancel) ──▶ cancelled
+#                                          │  │
+#                                          │  └── respond(accept) ──▶ ack ──┐
+#                                          │                               │
+#                                          └── respond(confirm) ──────────┴──▶ completed
+#
+#   pending   板端已触发，等远端（Web）处理 —— 页面显示「待处理」
+#   ack       板端/远端已回应「受理」 —— 页面显示「已回应」
+#   cancelled 被取消（板端长按取消键，或页面点「取消」）
+#   completed 闭环完成（页面点「确认完成」，或板端在已 ack 后再次回应）
+# 板端把 ack / cancelled / completed 都视为「远端已回来」，随即回到 IDLE。
+# ---------------------------------------------------------------------------
+EVENT_STATUS_PENDING = "pending"
+EVENT_STATUS_ACK = "ack"
+EVENT_STATUS_CANCELLED = "cancelled"
+EVENT_STATUS_COMPLETED = "completed"
+EVENT_STATUS_EXPIRED = "expired"
+EVENT_STATUSES = (EVENT_STATUS_PENDING, EVENT_STATUS_ACK,
+                  EVENT_STATUS_CANCELLED, EVENT_STATUS_COMPLETED,
+                  EVENT_STATUS_EXPIRED)
+EVENT_TERMINAL_STATES = (EVENT_STATUS_CANCELLED, EVENT_STATUS_COMPLETED,
+                         EVENT_STATUS_EXPIRED)
+EVENT_STATUS_CN = {
+    EVENT_STATUS_PENDING: "待处理",
+    EVENT_STATUS_ACK: "已回应",
+    EVENT_STATUS_CANCELLED: "已取消",
+    EVENT_STATUS_COMPLETED: "已完成",
+    EVENT_STATUS_EXPIRED: "已过期",
+}
+# respond 的 action → 目标状态。accept/cancel/confirm 三个动作共用一条接口，
+# 所以「板端回应/取消」和「Web 远端确认」走的是同一个 POST /api/v1/events/respond。
+EVENT_ACTION_TO_STATUS = {
+    "accept": EVENT_STATUS_ACK,
+    "cancel": EVENT_STATUS_CANCELLED,
+    "confirm": EVENT_STATUS_COMPLETED,
+}
+EVENT_DEFAULT_KIND = "alert"      # 触发语义：当前只有一种「呼叫/求助」型事件
+EVENT_MAX_KIND_LEN = 32
+EVENT_MAX_NOTE_LEN = 200
+EVENT_DEFAULT_LIMIT = 20          # GET /api/v1/events 默认返回条数
+EVENT_MAX_LIMIT = 200
+# 事件有效期：超过即惰性判为过期（板端掉电/断网后不会永远挂在「待处理」）。
+# 与 tasks 的惰性超时同一哲学，不引入后台线程。
+EVENT_DEFAULT_TTL_S = float(os.environ.get("SENSOR_EVENT_TTL_S", "300"))
+
 app = FastAPI(
     title="ESP32-S3 IMU Sensor Receiver",
     description="接收并存储开发板 IMU 传感数据，提供查询接口。",
@@ -344,6 +400,29 @@ def init_db():
                     ON photos (device_id, received_at);
                 CREATE INDEX IF NOT EXISTS idx_photos_request
                     ON photos (request_id);
+                -- 闭环事件：板端按键触发 → 远端（Web）显示 → 板端回应/取消。
+                -- 与 tasks 方向相反（板端发起、Web 接收），故独立成表，避免被
+                -- /api/v1/tasks/next 当成待下发任务回环给板子。
+                CREATE TABLE IF NOT EXISTS events (
+                    request_id     TEXT PRIMARY KEY,   -- 板端生成的闭环请求号
+                    device_id      TEXT NOT NULL,
+                    source         TEXT NOT NULL,
+                    kind           TEXT NOT NULL DEFAULT 'alert',
+                    status         TEXT NOT NULL,      -- pending/ack/cancelled/completed
+                    created_at     REAL NOT NULL,      -- 服务端接收触发时刻(epoch s)
+                    device_ts_ms   INTEGER,            -- 板端触发时刻(epoch ms, NTP)
+                    responded_at   REAL,               -- 最近一次响应时刻(epoch s)
+                    response       TEXT,               -- 最近一次 action：accept/cancel/confirm
+                    responded_by   TEXT,               -- device / web
+                    closed_at      REAL,               -- 进入终态的时刻(epoch s)
+                    expires_at     REAL NOT NULL,      -- 超过即惰性判 expired
+                    ip             TEXT,
+                    note           TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_device_time
+                    ON events (device_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_events_status
+                    ON events (status, created_at);
                 """
             )
             _migrate_uploads_columns(conn)
@@ -826,6 +905,93 @@ def _expire_stale_tasks(conn, device_id=None):
         sql += " AND device_id = ?"
         args.append(device_id)
     return conn.execute(sql, args).rowcount
+
+
+def _expire_stale_events(conn, device_id=None):
+    """闭环事件的惰性过期判定：pending/ack 超过 expires_at 即视为「无人处理」。
+
+    与 _expire_stale_tasks 同一哲学——不引入后台线程，任何读事件的路径先调用，
+    因此服务重启后状态自洽，且板端掉电/断网的事件不会永远挂在「待处理」。
+    """
+    now = time.time()
+    sql = ("UPDATE events SET status='expired', closed_at=?,"
+           " note=COALESCE(note, 'no response before ttl')"
+           " WHERE status IN ('pending','ack') AND expires_at < ?")
+    args = [now, now]
+    if device_id:
+        sql += " AND device_id = ?"
+        args.append(device_id)
+    return conn.execute(sql, args).rowcount
+
+
+def _event_view(row):
+    """events 行 → 对外结构（附中文状态、剩余 TTL 与各时刻字符串）。"""
+    ev = dict(row)
+    ev["status_cn"] = EVENT_STATUS_CN.get(ev["status"],
+                                          ev["status"])
+    ev["terminal"] = ev["status"] in EVENT_TERMINAL_STATES
+    ev["needs_attention"] = ev["status"] == EVENT_STATUS_PENDING
+    for key in ("created_at", "responded_at", "closed_at", "expires_at"):
+        ev[f"{key}_str"] = _fmt_time(ev.get(key))
+    ev["ttl_left_s"] = round(ev["expires_at"] - time.time(), 1)
+    return ev
+
+
+def validate_event_trigger(payload):
+    """校验板端触发请求，返回 (ok, data|error)。
+
+    与 validate_payload 风格一致：字段缺失/类型错误都给出可读原因，
+    便于板端只写串口日志也能定位。
+    """
+    if not isinstance(payload, dict):
+        return False, "payload must be a JSON object"
+
+    device_id = payload.get("device_id")
+    if not isinstance(device_id, str) or not device_id.strip():
+        return False, "missing or empty 'device_id'"
+    device_id = device_id.strip()
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+
+    source = payload.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return False, "missing or empty 'source'"
+    source = source.strip()[:MAX_SOURCE_LEN]
+
+    kind = payload.get("kind", EVENT_DEFAULT_KIND)
+    if not isinstance(kind, str) or not kind.strip():
+        kind = EVENT_DEFAULT_KIND
+    kind = kind.strip()[:EVENT_MAX_KIND_LEN]
+
+    # request_id 由**板端生成**（板端先本地亮灯、再上报，不能等服务端发号）：
+    # 这样即使 HTTP 失败重试，同一次按键也只会产生一条事件（主键幂等）。
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not REQUEST_ID_RE.match(request_id.strip()):
+        return False, "invalid or missing 'request_id' (expect 6-64 chars of [A-Za-z0-9_-])"
+    request_id = request_id.strip()
+
+    device_ts_ms = payload.get("ts_ms")
+    if device_ts_ms is not None:
+        if not isinstance(device_ts_ms, int) and not (
+            isinstance(device_ts_ms, float) and device_ts_ms.is_integer()
+        ):
+            return False, "'ts_ms' must be an integer epoch millisecond"
+        device_ts_ms = int(device_ts_ms)
+
+    note = payload.get("note")
+    if note is not None and not isinstance(note, str):
+        return False, "'note' must be a string"
+    if isinstance(note, str):
+        note = note.strip()[:EVENT_MAX_NOTE_LEN] or None
+
+    return True, {
+        "request_id": request_id,
+        "device_id": device_id,
+        "source": source,
+        "kind": kind,
+        "device_ts_ms": device_ts_ms,
+        "note": note,
+    }
 
 
 def _task_view(row):
@@ -2028,6 +2194,307 @@ def get_control(request: Request):
     )
 
 
+@app.post("/api/v1/events/trigger")
+async def trigger_event(request: Request):
+    """板端按键「触发」上报 —— 闭环的第一跳。
+
+    方向与 tasks 相反：**板端发起、Web 接收**。板端在发这条请求之前就已经把
+    LED 闪了、LCD 也改了（本地反馈不等网络），所以这里只负责「把事件登记到
+    服务端」，让远端页面立刻显示出来。
+
+    request_id 由板端生成并作为主键：同一次按键重试只会命中一条事件
+    （返回 200 + idempotent=true），不会在页面上刷出两条。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "request body must be valid JSON"},
+        )
+
+    ok, result = validate_event_trigger(payload)
+    if not ok:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": result},
+        )
+
+    ip = request.client.host if request.client else None
+    now = time.time()
+    conn = _connect()
+    try:
+        _expire_stale_events(conn, result["device_id"])
+        existing = conn.execute(
+            "SELECT * FROM events WHERE request_id=?", (result["request_id"],)
+        ).fetchone()
+        if existing is not None:
+            conn.commit()
+            # 板端重试（同一 request_id 再发一次）：不新建、不改状态，
+            # 直接把当前状态回给板端，让它自行对齐。
+            return JSONResponse(
+                status_code=200,
+                content={"code": "DUPLICATE", "ok": True, "idempotent": True,
+                         "event": _event_view(existing)},
+            )
+
+        conn.execute(
+            "INSERT INTO events (request_id, device_id, source, kind, status,"
+            " created_at, device_ts_ms, expires_at, ip, note)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                result["request_id"],
+                result["device_id"],
+                result["source"],
+                result["kind"],
+                EVENT_STATUS_PENDING,
+                now,
+                result["device_ts_ms"],
+                now + EVENT_DEFAULT_TTL_S,
+                ip,
+                result["note"],
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM events WHERE request_id=?", (result["request_id"],)
+        ).fetchone()
+    except sqlite3.Error as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content={"code": "DB_ERROR", "ok": False,
+                     "error": f"create event failed: {e}"},
+        )
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=201,
+        content={"code": "OK", "ok": True, "idempotent": False,
+                 "event": _event_view(row)},
+    )
+
+
+@app.post("/api/v1/events/respond")
+async def respond_event(request: Request):
+    """回应 / 取消 / 确认完成 —— 闭环的收口，板端与 Web 共用这一条接口。
+
+    body: {"request_id": "…", "action": "accept|cancel|confirm", "by": "device|web"}
+
+      accept  → ack       （板端单击「回应键」，或页面点「回应」）
+      cancel  → cancelled （板端长按「回应键」，或页面点「取消」）
+      confirm → completed （页面点「确认完成」；板端也能发，语义是「我这边结束了」）
+
+    转移规则刻意收紧：终态不可再变（重复发同一动作幂等返回 200，
+    发冲突动作返回 409），避免板端连点把状态来回翻。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "request body must be valid JSON"},
+        )
+
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "missing or empty 'request_id'"},
+        )
+    request_id = request_id.strip()
+
+    action = payload.get("action")
+    if not isinstance(action, str) or action.strip().lower() not in EVENT_ACTION_TO_STATUS:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "'action' must be one of accept / cancel / confirm"},
+        )
+    action = action.strip().lower()
+    target = EVENT_ACTION_TO_STATUS[action]
+
+    by = payload.get("by")
+    if not isinstance(by, str) or by.strip().lower() not in ("device", "web"):
+        # 默认当成 Web 侧（板端会显式带 by=device）
+        by = "web"
+    else:
+        by = by.strip().lower()
+
+    note = payload.get("note")
+    note = note.strip()[:EVENT_MAX_NOTE_LEN] if isinstance(note, str) else None
+
+    conn = _connect()
+    try:
+        _expire_stale_events(conn)
+        row = conn.execute(
+            "SELECT * FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "ok": False,
+                         "error": f"unknown request_id '{request_id}'"},
+            )
+
+        current = row["status"]
+
+        # 幂等：重复发同一个动作直接返回当前状态，不改任何时间戳。
+        if current == target:
+            conn.commit()
+            return JSONResponse(
+                status_code=200,
+                content={"code": "DUPLICATE", "ok": True, "idempotent": True,
+                         "event": _event_view(row)},
+            )
+
+        # 终态不可回退（expired 也不允许被改写）。
+        if current in EVENT_TERMINAL_STATES:
+            conn.commit()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "CONFLICT", "ok": False,
+                         "error": f"event is already '{current}' and cannot become '{target}'",
+                         "event": _event_view(row)},
+            )
+
+        now = time.time()
+        terminal = target in EVENT_TERMINAL_STATES
+        conn.execute(
+            "UPDATE events SET status=?, responded_at=?, response=?, responded_by=?,"
+            " closed_at=?, note=COALESCE(?, note) WHERE request_id=?",
+            (target, now, action, by,
+             now if terminal else None,
+             note, request_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM events WHERE request_id=?", (request_id,)
+        ).fetchone()
+    except sqlite3.Error as e:
+        conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content={"code": "DB_ERROR", "ok": False,
+                     "error": f"respond to event failed: {e}"},
+        )
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "idempotent": False,
+                 "event": _event_view(row)},
+    )
+
+
+@app.get("/api/v1/events/status")
+def event_status(request: Request):
+    """板端轮询闭环事件的最新状态 —— 闭环的最后一跳。
+
+    两种用法：
+      ?device_id=…&request_id=…  查指定事件（板端持号轮询，最常用）
+      ?device_id=…               查该设备最近一条事件（便于联调时确认板端与
+                                 服务端看到的是同一条）
+
+    为了让板端只做最简解析，响应里除了完整 event 还额外给一个顶层 `status`。
+    未知 request_id 返回 200 + found=false（而不是 404）：板端每 1 s 轮询一次，
+    这类「还没登记上」是正常过渡态，不该在板端日志里刷成错误。
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+
+    device_id = (request.query_params.get("device_id") or "").strip()
+    if not device_id:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False, "error": "missing 'device_id'"},
+        )
+    request_id = (request.query_params.get("request_id") or "").strip()
+
+    conn = _connect()
+    try:
+        _expire_stale_events(conn, device_id)
+        if request_id:
+            row = conn.execute(
+                "SELECT * FROM events WHERE request_id=? AND device_id=?",
+                (request_id, device_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM events WHERE device_id=?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (device_id,),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "found": False, "status": None,
+                     "event": None},
+        )
+
+    view = _event_view(row)
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "found": True, "status": view["status"],
+                 "event": view},
+    )
+
+
+@app.get("/api/v1/events")
+def list_events(request: Request):
+    """闭环事件列表（新的在前）—— 供 Web「闭环事件」卡片渲染。
+
+    ?device_id=…  只看某台设备；?limit=n（1-200，默认 20）
+    ?active=1     只看未终态的（待处理/已回应），用于页面顶部「有事件待处理」提示
+    """
+    device_id = (request.query_params.get("device_id") or "").strip()
+    try:
+        limit = int(request.query_params.get("limit", EVENT_DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        limit = EVENT_DEFAULT_LIMIT
+    limit = max(1, min(EVENT_MAX_LIMIT, limit))
+
+    only_active = (request.query_params.get("active") or "").strip() in ("1", "true", "yes")
+
+    sql = "SELECT * FROM events WHERE 1=1"
+    args = []
+    if device_id:
+        sql += " AND device_id = ?"
+        args.append(device_id)
+    if only_active:
+        sql += " AND status IN ('pending','ack')"
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit)
+
+    conn = _connect()
+    try:
+        _expire_stale_events(conn, device_id or None)
+        rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+    events = [_event_view(r) for r in rows]
+    return JSONResponse(
+        status_code=200,
+        content={"code": "OK", "ok": True, "count": len(events),
+                 "pending": sum(1 for e in events
+                                if e["status"] == EVENT_STATUS_PENDING),
+                 "events": events},
+    )
+
+
 @app.get("/api/v1/health")
 def health():
     """服务健康状态 + 汇总，便于验证/排错。"""
@@ -2056,6 +2523,17 @@ def health():
             last = conn.execute(
                 "SELECT device_id, ts_ms, received_at, sample_count, source, unit"
                 " FROM uploads ORDER BY received_at DESC LIMIT 1"
+            ).fetchone()
+            # 与 list/status 接口保持一致：先做惰性过期再统计。
+            # 否则已超时但仍记为 pending 的事件会被算进 events_by_status，
+            # 于是 health 显示"待处理 2 条"、而 GET /api/v1/events 只返回 1 条，
+            # 排查时看到自相矛盾的汇总。
+            _expire_stale_events(conn)
+            event_rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM events GROUP BY status"
+            ).fetchall()
+            last_event = conn.execute(
+                "SELECT * FROM events ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
         finally:
             conn.close()
@@ -2090,6 +2568,9 @@ def health():
             "tasks_by_status": {r["status"]: r["n"] for r in task_rows},
             "total_photos": n_photos,
             "latest_photo": latest_photo,
+            "total_events": sum(r["n"] for r in event_rows),
+            "events_by_status": {r["status"]: r["n"] for r in event_rows},
+            "latest_event": _event_view(last_event) if last_event else None,
             "latest": latest,
         },
     )
