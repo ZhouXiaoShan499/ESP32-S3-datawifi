@@ -22,6 +22,40 @@ Thumbs.db
 *.map
 build_log.txt
 
+# ---- 真机联调「一轮」产物（serial_round.py / analyze_round.py / photos_check.py）----
+serial_round*.txt
+trigger_round*.txt
+analysis_round*.txt
+photos_api*.txt
+flash_log.txt
+round*_log.txt
+
+# ---- 真机联调「一轮」脚本本体与临时产物（本机环境相关，不进交付物）----
+# 输出文件已由上一块忽略，这里忽略脚本同一批的临时文件（wifi.md 是
+# docs/static_ip_fallback_fix.md 的现场副本，.finalchk.txt 是逐条核对清单）。
+serial_round.py
+analyze_round.py
+photos_check.py
+round2.ps1
+wifi.md
+.finalchk.txt
+
+# ---- AI 助手会话记忆与 ESP-IDF 激活脚本（本机环境相关）----
+.workbuddy/
+esp_idf_activate_user/
+
+# ---- ESP-IDF 激活/构建脚本留下的临时文件（形如 tmp3wu5t_iridf_2396）----
+# 不带结尾的 "/"：实测它们在某些环境里是**文件**而不是目录，只写 "tmp*idf*/"
+# 会漏掉（git status 里不带结尾斜杠的 ?? 条目就是文件）。
+tmp*idf*
+
+# ---- 一次性取证/联调产物（本地脚本、抓到的帧与照片、串口与构建日志）----
+# 根锚定（/tmp_*）：只忽略仓库根下的这些文件，避免误伤子目录里名字碰巧
+# 以 tmp_ 开头的源文件。加规则前已核对：git ls-files 里没有任何以 tmp_ 开头
+# 的受跟踪文件（复核命令：git ls-files -i -c --exclude-standard 应为空）。
+/tmp_*
+/flash_log*.txt
+
 # ---- Web/server runtime artifacts ----
 server/data/
 server/photos/
@@ -29,4 +63,10 @@ server/__pycache__/
 __pycache__/
 *.db
 *.sqlite3
+
+# ---- SQLite 副产品：WAL 模式会生成 -wal / -shm（崩溃/强杀后残留 -journal）----
+# 这几种后缀不会被上面的 *.db 匹配到（upload.db-wal 不以 .db 结尾）。
+*.db-wal
+*.db-shm
+*.db-journal
 
