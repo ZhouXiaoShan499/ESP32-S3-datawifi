@@ -21,7 +21,7 @@
     # 对照组：本机网卡自己的 MAC（ipconfig /all 里的「物理地址」）
     python server/dhcp_probe.py 54-01-4a-5e-26-e5 8
 
-实测结论（2026-09-23，10.1.41.0/24）：板子 MAC / 同网段另一块在线 ESP32 的 MAC /
+实测结论（2026-09-23，192.0.2.0/24）：板子 MAC / 同网段另一块在线 ESP32 的 MAC /
 本机网卡 MAC 三种 chaddr 全部 8 s 内零回应 → 该网段当时没有 DHCP 服务。
 """
 import random

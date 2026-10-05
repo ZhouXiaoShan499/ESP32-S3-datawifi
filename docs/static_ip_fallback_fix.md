@@ -50,7 +50,7 @@ if (STATIC_IP_FALLBACK_ENABLED && s_dhcp_giveup_count >= STATIC_IP_GIVEUP_LIMIT)
 CONFIG_STATIC_IP_ADDR="192.168.4.200"     ← 占位默认值
 ```
 
-排查的关键线索：**`CONFIG_WIFI_SSID="431"`、服务器 URL `…10.1.41.14…` 这些人工改过的老配置项全都还在**。如果 `sdkconfig` 是被整体重新生成的，它们也会丢。所以不是"整体重置"，而是：
+排查的关键线索：**`CONFIG_WIFI_SSID="<你的SSID>"`、服务器 URL `…192.0.2.10…` 这些人工改过的老配置项全都还在**（本文里的真实 SSID 与网段已按仓库脱敏规则换成占位值，`192.0.2.0/24` 是 RFC 5737 文档网段）。如果 `sdkconfig` 是被整体重新生成的，它们也会丢。所以不是"整体重置"，而是：
 
 > **ESP-IDF 的 CMake 配置生成（confgen）在发现 `sdkconfig` 中缺少新加入的 Kconfig 符号时，会按 `default` 值补写进去；而我手改的那次发生在"新符号第一次经过 confgen"之前，于是就被默认值覆盖了。**
 
@@ -79,7 +79,7 @@ CONFIG_STATIC_IP_ADDR="192.168.4.200"     ← 占位默认值
 | 文件 | 改法 | 目的 |
 |---|---|---|
 | `main/main.c`（209–218 行） | 把 `#define STATIC_IP_GIVEUP_LIMIT 2` **移到 `#if` 外面无条件定义**，只有 `STATIC_IP_FALLBACK_ENABLED` 继续由 Kconfig 控制；注释里解释了"为什么运行期 `if` 的引用逼着它必须无条件定义" | 让**开/关两种配置都能编译**，根除报错 |
-| `sdkconfig`（git 忽略） | 重新写回 `CONFIG_USE_STATIC_IP_FALLBACK=y`、`10.1.41.200` / `255.255.255.0` / `10.1.41.254` / `223.5.5.5`，并删掉重复的 `is not set` 行 | 让板子在实验室网段能用静态兜底 |
+| `sdkconfig`（git 忽略） | 重新写回 `CONFIG_USE_STATIC_IP_FALLBACK=y`、`192.0.2.200` / `255.255.255.0` / `192.0.2.254` / `223.5.5.5`，并删掉重复的 `is not set` 行 | 让板子在实验室网段能用静态兜底 |
 | `docs/wifi_network_troubleshooting.md` | 新增 **§8.1「改完怎么确认真的生效了」** | 记录这个 confgen 回写陷阱与验证方法，避免下次再踩 |
 | `Kconfig.projbuild` / `sdkconfig.defaults` | **保持不变**：`default n` + 注释掉的占位地址 | 不把实验室网段强行烧进默认值（否则别人的板子会出问题） |
 
@@ -87,7 +87,7 @@ CONFIG_STATIC_IP_ADDR="192.168.4.200"     ← 占位默认值
 
 1. **关掉开关编译**：`main.c` 零错误 → 证明那个缺陷是真修好了，而不是被开启开关掩盖。
 2. **打开开关完整构建**：`BUILD_EXIT=0`；`data_capture_sim.bin` = `0x16f110 / 0x177000`（剩余 2%）。
-3. **确认编译器真的看到配置**：`build/config/sdkconfig.h` 里是 `#define CONFIG_USE_STATIC_IP_FALLBACK 1` 和 `CONFIG_STATIC_IP_ADDR "10.1.41.200"`（只看 `sdkconfig` 不够，必须看这个生成头文件）。
+3. **确认编译器真的看到配置**：`build/config/sdkconfig.h` 里是 `#define CONFIG_USE_STATIC_IP_FALLBACK 1` 和 `CONFIG_STATIC_IP_ADDR "192.0.2.200"`（只看 `sdkconfig` 不够，必须看这个生成头文件）。
 4. **确认产物真的含兜底代码**：在 `.bin` 里能搜到只属于"开启分支"的字符串——`Static IP fallback applied`、`WiFi connected (static IP)`、`NET:%s`、`NTP:%s`。若这些字符串不在，说明开关没生效。
 5. **确认配置稳定**：构建（confgen 跑过）之后 `sdkconfig` 仍是 `=y` → 说明这次是一次性回写，现在编辑是稳定的。
 6. 临时文件全部删除，工作区干净。
@@ -106,6 +106,6 @@ CONFIG_STATIC_IP_ADDR="192.168.4.200"     ← 占位默认值
 flash_idf.bat        （项目约定：COM5，日志写入 build_log.txt）
 ```
 
-- 烧写前先确认 `10.1.41.200` 空闲（`ping` 无回应）；
-- DHCP 死掉时的预期序列：`NET:assoc` → `No IP 15 s (1/3)…(3/3)` → `DHCP gave no lease - forcing re-association` → `Static IP fallback applied: 10.1.41.200/…` → `Got IP: 10.1.41.200` → `SNTP time synchronized: …(UTC+8)`，LCD 1 秒内显示 IP 与日期、不重启；
-- 若 LCD 显示 `NET:10.1.41.200` 但 `NTP:try`（日志 `SNTP no sync yet … link_up=1 ip=1`），就把 `sdkconfig` 的 `CONFIG_SNTP_SERVER` 换成字面 IP 重新构建，**不需要改代码**。
+- 烧写前先确认 `192.0.2.200` 空闲（`ping` 无回应）；
+- DHCP 死掉时的预期序列：`NET:assoc` → `No IP 15 s (1/3)…(3/3)` → `DHCP gave no lease - forcing re-association` → `Static IP fallback applied: 192.0.2.200/…` → `Got IP: 192.0.2.200` → `SNTP time synchronized: …(UTC+8)`，LCD 1 秒内显示 IP 与日期、不重启；
+- 若 LCD 显示 `NET:192.0.2.200` 但 `NTP:try`（日志 `SNTP no sync yet … link_up=1 ip=1`），就把 `sdkconfig` 的 `CONFIG_SNTP_SERVER` 换成字面 IP 重新构建，**不需要改代码**。

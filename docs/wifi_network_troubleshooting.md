@@ -17,7 +17,7 @@
 | **LCD 底部状态栏（`SD:OK 100Hz:OK Live:OFF`）是空白** | `refresh_ui()` 从未执行 ⇒ **卡在 `app_main()` 的启动早期**（WiFi/SD/IMU/相机，这些仍会阻塞启动），看第三节 |
 | 状态行 `Idle  NET:--`、`Time: … NTP:--` | 连 AP 都没关联上（L2 没建立）⇒ 查 SSID/密码/AP，看第二节的 `Retrying WiFi connection` |
 | 状态行 `Idle  NET:assoc`、`Time: … NTP:--` | **已关联、但一直没有 IP**（DHCP 没发租约 —— 本仓库实测到的故障）⇒ SNTP 连请求都发不出去，看第三节 |
-| 状态行 `Idle  NET:10.1.41.x`、`Time: -- (up 00:03:12) NTP:try` | **有 IP，SNTP 在退避重试** ⇒ 网段里 DNS/NTP 不可达，改 `CONFIG_SNTP_SERVER`（可填 IP）或看第五节 |
+| 状态行 `Idle  NET:192.0.2.x`、`Time: -- (up 00:03:12) NTP:try` | **有 IP，SNTP 在退避重试** ⇒ 网段里 DNS/NTP 不可达，改 `CONFIG_SNTP_SERVER`（可填 IP）或看第五节 |
 | `Time: -- (up 00:03:12)` 且秒数在走 | 启动流程走完了，只是没联网（SNTP 没同步）。这个字段每秒刷新一次，**秒数还在走 = 板子没卡死**，只是对不上时间 |
 | LCD 状态栏正常、`Time:` 是 `2026-09-23 10:19:59` 这样的日期 | 对时成功（DNS + NTP 都可达）；若时间不刷新则看第五节的对时日志 |
 
@@ -38,13 +38,13 @@
 | 日志 | 含义 | 处理 |
 |------|------|------|
 | `wifi:connected with 431, aid = 1` 之后再无输出 | 关联成功但 **DHCP 没发租约**（本仓库实测到的故障），旧固件会在这里死等 | 见第三节；新固件会打印 `WiFi: no IP after 20 s …` 并继续启动 |
-| `Got IP: 10.1.41.x` | 拿到 IP，网络层 OK | 查服务端/防火墙 |
+| `Got IP: 192.0.2.x` | 拿到 IP，网络层 OK | 查服务端/防火墙 |
 | `Retrying WiFi connection... (n/5) reason=…` | 关联失败在重试，`reason` 是 `wifi_err_reason_t`（`201`=NO_AP_FOUND，`205`=CONNECTION_FAIL，`15`=4WAY_HANDSHAKE_TIMEOUT…） | 检查 SSID/密码/AP 是否在；`205` 多为密码错或 AP 拒绝 |
 | `WiFi still down after 6 attempts (reason=…) - background retry every 5 s` | 超过 5 次，转入后台慢重连（**新固件不会放弃**） | 不用管，等网络恢复即可自愈 |
 | `WiFi lost IP (DHCP lease lost)` | 租约被路由器收回 | 自动重新申请 |
 | `No IP 15 s after association - restarting DHCP client (n/3)` | 自愈逻辑在重启 DHCP 客户端 | 若反复出现，见第三节根因 |
 | `DHCP gave no lease - forcing re-association` | 重启 DHCP 3 次无效，强制断开重连重走一遍 | 同上 |
-| `Static IP fallback applied: 10.1.41.200/255.255.255.0 gw 10.1.41.254 dns 223.5.5.5` | 本网段没有 DHCP 服务应答，Kconfig 打开了静态兜底，固件停掉 DHCP 客户端改用固定地址（下一步就是 `Got IP:` + 对时成功） | 正常；换网段/地址冲突时改 Kconfig 的 `Static IP Fallback` 四项（第八节） |
+| `Static IP fallback applied: 192.0.2.200/255.255.255.0 gw 192.0.2.254 dns 223.5.5.5` | 本网段没有 DHCP 服务应答，Kconfig 打开了静态兜底，固件停掉 DHCP 客户端改用固定地址（下一步就是 `Got IP:` + 对时成功） | 正常；换网段/地址冲突时改 Kconfig 的 `Static IP Fallback` 四项（第八节） |
 | `Static IP fallback: invalid Kconfig values …` | Kconfig 里填的地址不是合法 IPv4 ⇒ 兜底本次开机不生效（只报一次） | 改 `CONFIG_STATIC_IP_ADDR/NETMASK/GATEWAY` |
 | `Wifi: no IP after 20 s (link_up=1 …) - booting offline` | 启动阶段没等到 IP，但**继续启动**了（板子离线可用） | 板子会在后台自愈 |
 | `SNTP task started: server=pool.ntp.org, retry 5000 ms -> 60000 ms` | 后台对时任务已启动（**不再阻塞启动流程**） | 正常 |
@@ -62,12 +62,12 @@ DHCP DISCOVER，三种客户端 MAC 全部 8 s 内零回应：
 | 探测用的 chaddr | 结果 |
 |---|---|
 | `94-a9-90-1c-6f-b4`（本板 STA） | no reply |
-| `94-a9-90-1c-70-9c`（同网段另一块**在线**的 ESP32，10.1.41.103） | no reply |
+| `94-a9-90-1c-70-9c`（同网段另一块**在线**的 ESP32，192.0.2.103） | no reply |
 | `54-01-4a-5e-26-e5`（本机网卡） | no reply |
 
-结论：`10.1.41.0/24` 这个二层段现在收不到任何 DHCP OFFER，**任何新接入的客户端都拿不到 IP**；
-网段里还能 ping 通的设备靠**长租约或静态 IP** 硬撑（本机以太网也是静态 `10.1.41.14/24`，
-`arp -a` 里 10.1.41.x 全部显示「静态」）。板子上午 10:22 还能正常上报（服务端
+结论：`192.0.2.0/24` 这个二层段现在收不到任何 DHCP OFFER，**任何新接入的客户端都拿不到 IP**；
+网段里还能 ping 通的设备靠**长租约或静态 IP** 硬撑（本机以太网也是静态 `192.0.2.14/24`，
+`arp -a` 里 192.0.2.x 全部显示「静态」）。板子上午 10:22 还能正常上报（服务端
 `/api/v1/devices` 里 `last_seen=2026-09-23 10:22:40`），说明当时 DHCP 是好的 —— 故障点在
 AP / 路由器 / DHCP 服务侧，**固件改不掉它**。
 
@@ -142,7 +142,7 @@ CMake 会打印 `Trying to set symbol … to n, but it is currently selected by 
 #   SNTP task started: server=pool.ntp.org, retry 5000 ms -> 60000 ms
 #   SNTP no sync yet (ESP_ERR_TIMEOUT) - next try in 5000 ms (link_up=0 ip=0)
 # 网络接上后（不重启板子）：
-#   Got IP: 10.1.41.x → SNTP time synchronized: 2026-09-23 10:19:59 (UTC+8)
+#   Got IP: 192.0.2.x → SNTP time synchronized: 2026-09-23 10:19:59 (UTC+8)
 #   ← LCD 的 Time: 变成同一时刻（说明时间在运行中补上了）
 ```
 
@@ -176,12 +176,12 @@ s_wifi_connected == true              → 正常，清零计数
 cd server ; python main.py
 
 # 2) 只开一个串口监视器（不要和 VS Code 串口监视器/PuTTY 同时开）
-idf.py -p COM5 monitor        # 期望看到 Got IP: 10.1.41.x / WiFi power save / Camera ready
+idf.py -p COM5 monitor        # 期望看到 Got IP: 192.0.2.x / WiFi power save / Camera ready
 
 # 3) 主机侧确认
 ping <板子IP>                                    # 通
 curl http://127.0.0.1:8000/api/v1/devices        # last_seen 在刷新
-curl http://10.1.41.14:8000/api/v1/live          # active=False 且 devices=[]
+curl http://192.0.2.14:8000/api/v1/live          # active=False 且 devices=[]
 
 # 3.5) 板子拿不到 IP 时，先用探针判断「这个网段到底有没有 DHCP 服务」
 #      （纯 Python、不需要管理员权限；结果与板子无关，是网络侧的事实）
@@ -199,9 +199,9 @@ python server/dhcp_probe.py 54-01-4a-5e-26-e5 8   # 本机网卡 MAC（对照）
 
 ```powershell
 ipconfig                                   # 本机 IP/掩码/网关
-ping 10.1.41.254                           # 网关是否通（区分「本机没网」和「板子没网」）
+ping 192.0.2.254                           # 网关是否通（区分「本机没网」和「板子没网」）
 arp -a | findstr 94-a9-90                  # 找板子/其它 ESP（板子 STA MAC 见启动日志 wifi:mode : sta (…)）
-for /L %i in (1,1,254) do @start /b ping -n 1 -w 300 10.1.41.%i   # 整段扫描后配合 arp -a 用
+for /L %i in (1,1,254) do @start /b ping -n 1 -w 300 192.0.2.%i   # 整段扫描后配合 arp -a 用
 reg query HKLM\HARDWARE\DEVICEMAP\SERIALCOMM                      # COM 口是否还在（板子有没有被拔/掉电）
 netstat -ano -p tcp | findstr :8000                              # 服务端是否在监听
 netsh advfirewall firewall show rule name=all dir=in status=enabled   # 允许 python.exe 入站（公用配置文件）
@@ -247,8 +247,8 @@ DHCP gave no lease - forcing re-association
 `esp_netif_set_dns_info()`，并打印
 
 ```
-W Static IP fallback applied: 10.1.41.200/255.255.255.0 gw 10.1.41.254 dns 223.5.5.5
-I Got IP: 10.1.41.200          ← 由 esp_netif_set_ip_info() 自己 post 的 GOT_IP 事件
+W Static IP fallback applied: 192.0.2.200/255.255.255.0 gw 192.0.2.254 dns 223.5.5.5
+I Got IP: 192.0.2.200          ← 由 esp_netif_set_ip_info() 自己 post 的 GOT_IP 事件
 I SNTP time synchronized: 2026-09-24 … (UTC+8)
 ```
 
@@ -264,9 +264,9 @@ I SNTP time synchronized: 2026-09-24 … (UTC+8)
 
 ```
 CONFIG_USE_STATIC_IP_FALLBACK=y
-CONFIG_STATIC_IP_ADDR="10.1.41.200"        # 同网段另一块 ESP 用 .103、本机 .14，故避开
+CONFIG_STATIC_IP_ADDR="192.0.2.200"        # 同网段另一块 ESP 用 .103、本机 .14，故避开
 CONFIG_STATIC_IP_NETMASK="255.255.255.0"
-CONFIG_STATIC_IP_GATEWAY="10.1.41.254"
+CONFIG_STATIC_IP_GATEWAY="192.0.2.254"
 CONFIG_STATIC_IP_DNS="223.5.5.5"
 ```
 
@@ -287,7 +287,7 @@ findstr STATIC_IP sdkconfig build\config\sdkconfig.h
 ```
 
 - `build/config/sdkconfig.h` 里要有 `#define CONFIG_USE_STATIC_IP_FALLBACK 1` 和
-  `#define CONFIG_STATIC_IP_ADDR "10.1.41.200"`；只有 `sdkconfig` 里写了 `=y` 不算数。
+  `#define CONFIG_STATIC_IP_ADDR "192.0.2.200"`；只有 `sdkconfig` 里写了 `=y` 不算数。
 - `sdkconfig` 里同一项**不要同时留** `# … is not set` 和 `…=y` 两行（confgen 只认最后一行，
   人却容易看错）。
 - 开关关掉时（committed 默认）固件行为与以前完全一致：不做任何静态地址尝试。
