@@ -1440,8 +1440,15 @@ function photoCard(p) {
     '<b>#' + p.id + '</b> · ' + (p.size_kb ?? '—') + ' KB · ' +
     (p.width ?? '?') + '×' + (p.height ?? '?') + '<br>' +
     '接收 ' + (p.received_at_str || '—') + '<br>' +
-    (p.request_id ? '任务 ' + shortRid(p.request_id) : '来源：直接上传（无任务号）') +
-    (p.note ? '<br>备注：' + p.note : '');
+    (p.request_id ? '任务 ' + shortRid(p.request_id) : '来源：直接上传（无任务号）');
+  // note 是**上报方可控的自由文本**（板端 / 任意能访问服务端的客户端都能写入），
+  // 不能拼进 innerHTML —— 一个 "备注" 里塞 <img onerror=…> 就能在页面上执行脚本。
+  // 上面已拼好的部分只会插入数字与 request_id（服务端白名单字符集），可继续用
+  // innerHTML；note 单独用 createTextNode 交给浏览器转义，不手写转义函数。
+  if (p.note) {
+    meta.appendChild(document.createElement('br'));
+    meta.appendChild(document.createTextNode('备注：' + p.note));
+  }
 
   const actions = document.createElement('div');
   actions.className = 'photo-actions';

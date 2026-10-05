@@ -49,6 +49,9 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
     <img> 按 seq 轮询即形成实时画面。直播是连续流，刻意不做逐帧 ACK/幂等：
     丢一帧下一帧立刻补上，服务端重启/板端断网只是画面停在最后一帧（active=false）。
   超过 LIVE_TIMEOUT_S 没有新帧即视为「已停止推流」（板端被按键停止 / 断网 / 掉电）。
+  内存里最多保留 LIVE_MAX_DEVICES 台设备的帧（每帧 ≤LIVE_MAX_FRAME_BYTES），
+  超过 LIVE_STALE_EVICT_S 无新帧或超出台数上限时淘汰最久未推流的那台 ——
+  否则内存只增不减，而 device_id 来自（默认免鉴权的）POST，是一处内存放大点。
 
 运行（本地电脑）：
   python server/main.py          # 默认 http://127.0.0.1:8000
@@ -57,6 +60,7 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
 """
 
 import hmac
+import html
 import json
 import os
 import re
@@ -64,9 +68,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -84,12 +90,19 @@ _DATA_DIR = os.path.join(_BASE_DIR, "data")
 DB_PATH = os.environ.get(
     "SENSOR_DB", os.path.join(_DATA_DIR, "upload.db")
 )
+# sqlite 写锁等待上限（毫秒）：与 sqlite3.connect(timeout=) 同义，显式写出来是为了
+# 让「撞锁时等多久」一眼可见（真正生效的设置在 _tune_conn 里）。
+DB_BUSY_TIMEOUT_MS = 10000
 
 # 限制与常量
 MAX_DEVICE_ID_LEN = 64
 MAX_SOURCE_LEN = 32
 MAX_SAMPLES_PER_BATCH = 2000          # 单批最多样本数（板端约 100 Hz，分批上传）
 MAX_BODY_BYTES = 2 * 1024 * 1024      # 单次请求体上限 2 MB
+# 通用 JSON 接口（events / tasks 这些小对象）的请求体上限。
+# 这几个接口过去直接 `await request.json()`，**完全没有上限** —— 几百 MB 的 body
+# 会先被读进内存，才轮到任何字段校验，等于一个免鉴权的内存放大点（见 _read_body_limited）。
+MAX_JSON_BODY_BYTES = 64 * 1024       # 64 KiB
 SUPPORTED_AXES = ("ax", "ay", "az")
 
 # /api/v1/window（实时波形）上限：
@@ -159,6 +172,22 @@ PHOTO_ID_RE = re.compile(r"^\d{1,18}$")
 # request_id 允许的字符集（uuid4().hex 天然满足，也兼容自定 id）
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
+# device_id 允许的字符集：与 _safe_device_dir() 的落盘规则保持一致（字母/数字/点/横线/下划线）。
+# 为什么要在这里卡住：device_id 由板端上报，会被拼进首页 HTML（index()）和
+# server/photos/<device_id>/ 目录名 —— 白名单一次同时挡住存储型 XSS 与目录穿越，
+# 比在每个输出点补转义更不容易漏（板端 id 形如 esp32s3-eye-0001，天然满足）。
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# 「板端时钟是否可信」的判据。
+# 板端 SNTP 成功之前 gettimeofday() 返回的只是**开机以来的时间**，不是真实 epoch
+# （固件 main.c:5820-5824 的会话锚点就是这么取的），因此它约等于 0 而不是 1.7e12。
+# 拿这种 ts_ms 去和 task.created_at 比大小没有任何意义：判据恒成立，
+# 「网段里没有可用 NTP」的现场就永远做不了按需采集（会被误判成「上传的数据是陈旧的」）。
+# 固件侧对所有「本地消费 epoch」的地方都用 s_time_synced 守卫过
+# （main.c:4042 / 4191 / 4505），但上报给服务端的 ts_ms 本身无法自卫 ——
+# 所以这条判据只服务端兜得住：看起来不像真实毫秒时间的 ts_ms 一律不参与新鲜度比较。
+EPOCH_SANE_MS = 1_600_000_000_000   # 2020-09-13；低于它视为「板端时钟未同步」
+
 # 摄像头实时直播（板端长按 Button A 开启）：
 #   板端循环 POST /api/v1/live（body 即 JPEG 字节）→ 服务端只在内存里保留每台设备的
 #   「最新一帧」，供 Web「摄像头实时画面」卡片按 seq 轮询取图（<img> 即实时画面）。
@@ -167,6 +196,12 @@ LIVE_TIMEOUT_S = float(os.environ.get("SENSOR_LIVE_TIMEOUT_S", "5"))   # 无新�
 LIVE_MAX_FRAME_BYTES = MAX_PHOTO_BYTES          # 单帧上限沿用拍照（512 KiB）
 LIVE_JPEG_MAGIC = PHOTO_JPEG_MAGIC              # 同样用 JPEG SOI 拒绝非图片 body
 LIVE_DEFAULT_FPS = 2.0                          # 板端 LIVE_FRAME_INTERVAL_MS=500 的名义帧率
+# 内存里最多保留几台设备的帧、多久没新帧就彻底丢掉。
+# 不设上限的后果是**内存单调增长**：每条最多 LIVE_MAX_FRAME_BYTES（512 KiB），
+# 任何能访问 POST /api/v1/live 的客户端都能用随机 device_id 把它灌满；
+# 板端停推流后最后一帧也会永久驻留（没有淘汰点）。上限 8 台 ≈ 4 MiB，多板联调够用。
+LIVE_MAX_DEVICES = 8
+LIVE_STALE_EVICT_S = 600                        # 10 分钟没有新帧 ⇒ 连最后一帧也放掉
 _live_lock = threading.Lock()
 # device_id -> {"jpeg": bytes, "width":…, "height":…, "ts_ms":…, "received_at":…, "seq":…, "ip":…}
 _live_frames = {}
@@ -228,10 +263,27 @@ EVENT_MAX_LIMIT = 200
 # 与 tasks 的惰性超时同一哲学，不引入后台线程。
 EVENT_DEFAULT_TTL_S = float(os.environ.get("SENSOR_EVENT_TTL_S", "300"))
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """ASGI 启动钩子：建表。
+
+    两种启动方式都要覆盖——`python main.py` 走本文件底部的 serve()（那里也会
+    显式调一次 init_db()，幂等，好处是绑端口之前就能因权限/路径问题报错退出）；
+    而 `uvicorn main:app` / `--reload` / gunicorn 等 ASGI 服务器**不会执行
+    serve()**，只发 lifespan。少了这里，全新库上的第一个请求就是
+    500 "no such table: uploads"。
+    init_db 定义在文件下方：函数体在 startup 时才执行，前向引用没问题。
+    """
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="ESP32-S3 IMU Sensor Receiver",
     description="接收并存储开发板 IMU 传感数据，提供查询接口。",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 # 交互式实时监控页（server/static 下静态文件，托管于 http://host:port/ui/）
@@ -243,19 +295,50 @@ app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
 _db_init_lock = threading.Lock()
 _initialized = False
 
+# _table_columns() 的白名单（见该函数 docstring）。
+_SQL_TABLES = ("uploads", "samples", "tasks", "device_control", "photos", "events")
+
 
 # ---------------------------------------------------------------------------
 # 数据库
 # ---------------------------------------------------------------------------
+def _tune_conn(conn):
+    """连接级调优：WAL + 显式 busy_timeout。
+
+    WAL 的必要性来自本服务的访问模式 ——「100 Hz 采样按秒批量写 + 高频读」
+    （Web 每 800 ms 轮询、/api/v1/window 画波形）。默认的 rollback-journal 模式下，
+    写事务提交的那一小段是 EXCLUSIVE 锁，读方会直接撞上 SQLITE_BUSY 变成 500。
+    WAL 下写不阻塞读、读不阻塞写，正好对上这个模式。
+
+    journal_mode 是**记在库文件头里的持久设置**，重复执行只是读回来确认一次，
+    代价可忽略；busy_timeout 是连接级设置，所以每个连接都要设。
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={int(DB_BUSY_TIMEOUT_MS)}")
+    except sqlite3.Error as e:
+        # 只读目录 / 不支持 -wal -shm 附属文件的网络盘：不要因此起不来，
+        # 退化成默认日志模式即可（功能不受影响，只是并发读写更容易撞锁）。
+        print(f"[sensor-server] WAL/busy_timeout 设置失败（继续用默认日志模式）: {e}")
+
+
 def _connect():
     os.makedirs(_DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_MS / 1000.0)
     conn.row_factory = sqlite3.Row
+    _tune_conn(conn)
     return conn
 
 
 def _table_columns(conn, table):
-    """读取某表已有列名，用于老库补列判断。"""
+    """读取某表已有列名，用于老库补列判断。
+
+    表名在 SQLite 里**不能**用参数占位符（`PRAGMA table_info(?)` 不合法），只能
+    拼字符串 —— 当前所有调用方都传硬编码字面量，所以是安全的。加一层白名单是为了
+    让"将来有人把变量传进来"时立刻抛错，而不是静默变成注入点。
+    """
+    if table not in _SQL_TABLES:
+        raise ValueError(f"unexpected table name for PRAGMA: {table!r}")
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
@@ -274,6 +357,21 @@ def _migrate_uploads_columns(conn):
         )
     # 一条 request_id 最多对应一条上传：同一任务重复上传不会重复写样本。
     # 必须在补列之后创建，否则老库上会因缺列失败。
+    #
+    # 与 _migrate_photos_index() 同一套防御：唯一的**建索引动作**只有在「没有重复行」
+    # 时才执行，否则 init_db() 会整段抛 IntegrityError ⇒ 服务直接起不来。这不是假想场景：
+    # 加索引之前的历史代码是「SELECT 查重 → INSERT」，并发重试确实能写出重复行
+    # （photos 侧就是这么留下的重复数据，见 _migrate_photos_index 的注释）。
+    # 有重复行时只告警跳过 —— 写路径有 BEGIN IMMEDIATE 串行化 + IntegrityError 幂等兜底，
+    # 不依赖这个索引才正确，服务照常启动。
+    dup = conn.execute(
+        "SELECT request_id FROM uploads WHERE request_id IS NOT NULL"
+        " GROUP BY request_id HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if dup is not None:
+        print(f"[sensor-server] uploads: request_id={dup['request_id']!r} 存在重复行，"
+              "跳过唯一索引（去重后可自动创建）")
+        return
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_request"
         " ON uploads (request_id) WHERE request_id IS NOT NULL"
@@ -299,6 +397,34 @@ def _migrate_tasks_columns(conn):
         "CREATE INDEX IF NOT EXISTS idx_tasks_device_kind"
         " ON tasks (device_id, source, kind, status)"
     )
+
+
+def _migrate_photos_index(conn):
+    """把 photos.request_id 加固成「部分唯一索引」，与 uploads 侧对齐。
+
+    uploads 那边可以无条件 `CREATE UNIQUE INDEX`，photos 不行：老库里可能已经存在
+    同一 request_id 的重复行（那正是过去没有唯一索引时并发写出来的结果），此时建唯一
+    索引会整段失败，让 init_db 抛错、服务直接起不来。
+
+    所以这里的策略是**非破坏性**的：
+      * 有重复行 → 只告警、跳过（由运维决定留哪一张；服务照常启动。写路径已有
+        BEGIN IMMEDIATE 串行化 + IntegrityError 幂等兜底，不依赖这个索引才正确）；
+      * 没有重复行 → 建唯一索引，并顺手删掉被它完全覆盖的普通索引。
+    """
+    dup = conn.execute(
+        "SELECT request_id FROM photos WHERE request_id IS NOT NULL"
+        " GROUP BY request_id HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if dup is not None:
+        print(f"[sensor-server] photos: request_id={dup['request_id']!r} 存在重复行，"
+              "跳过唯一索引（去重后可自动创建）")
+        return
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_request_uq"
+        " ON photos (request_id) WHERE request_id IS NOT NULL"
+    )
+    # idx_photos_request 是 (request_id) 上的普通索引，被上面的部分唯一索引完全覆盖。
+    conn.execute("DROP INDEX IF EXISTS idx_photos_request")
 
 
 def init_db():
@@ -398,8 +524,8 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_photos_device_time
                     ON photos (device_id, received_at);
-                CREATE INDEX IF NOT EXISTS idx_photos_request
-                    ON photos (request_id);
+                -- request_id 上的索引刻意不在这里建：老库可能已有重复行，唯一索引
+                -- 必须走 _migrate_photos_index() 的「先去重判断、失败只告警」路径。
                 -- 闭环事件：板端按键触发 → 远端（Web）显示 → 板端回应/取消。
                 -- 与 tasks 方向相反（板端发起、Web 接收），故独立成表，避免被
                 -- /api/v1/tasks/next 当成待下发任务回环给板子。
@@ -427,6 +553,7 @@ def init_db():
             )
             _migrate_uploads_columns(conn)
             _migrate_tasks_columns(conn)
+            _migrate_photos_index(conn)
             conn.commit()
         finally:
             conn.close()
@@ -448,6 +575,16 @@ def _normalize_unit(raw):
     return None
 
 
+def _device_id_ok(device_id):
+    """device_id 字符白名单（规则与 _safe_device_dir() 一致，见 DEVICE_ID_RE 注释）。
+
+    调用点都在 strip() + 长度检查之后，所以这里只需再查字符集：
+    device_id 会被拼进首页 HTML（index()）与 photos 目录名，卡住字符集一次
+    同时消除存储型 XSS 与目录穿越，比在每处输出点补转义更不易漏。
+    """
+    return DEVICE_ID_RE.match(device_id) is not None
+
+
 def validate_payload(payload):
     """返回 (ok, data|error_message)。"""
     if not isinstance(payload, dict):
@@ -459,6 +596,9 @@ def validate_payload(payload):
     device_id = device_id.strip()
     if len(device_id) > MAX_DEVICE_ID_LEN:
         return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+    if not _device_id_ok(device_id):
+        return False, ("invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+                       " are accepted)")
 
     source = payload.get("source")
     if not isinstance(source, str) or not source.strip():
@@ -498,7 +638,15 @@ def validate_payload(payload):
         except (TypeError, ValueError):
             return False, f"samples[{idx}].t_ms must be an integer"
         seq = s.get("i", idx)
-        cleaned.append({"i": seq, "t_ms": t_ms, **vals})
+        # 与 ts_ms 同一套判据：只接受整数（或整数值的 float）。过去这里直接透传，
+        # 字符串/对象会一路写进 samples.seq；查询侧（/api/v1/window、首页 latest_az
+        # 的 ORDER BY seq）依赖它排序，SQLite 的类型亲和性会让非数值变成字符串比较，
+        # 排序结果就错了。
+        if not isinstance(seq, int) and not (
+            isinstance(seq, float) and seq.is_integer()
+        ):
+            return False, f"samples[{idx}].i must be an integer"
+        cleaned.append({"i": int(seq), "t_ms": t_ms, **vals})
 
     # 可选字段 request_id / trigger：按需采集任务才有；
     # 缺省时行为与旧版完全一致（trigger 归一为 periodic）。
@@ -541,6 +689,9 @@ def validate_photo_payload(payload):
     device_id = device_id.strip()
     if len(device_id) > MAX_DEVICE_ID_LEN:
         return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+    if not _device_id_ok(device_id):
+        return False, ("invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+                       " are accepted)")
 
     jpeg = payload.get("jpeg")
     if not isinstance(jpeg, (bytes, bytearray)) or len(jpeg) < 4:
@@ -610,6 +761,9 @@ def validate_task_request(payload):
     device_id = device_id.strip()
     if len(device_id) > MAX_DEVICE_ID_LEN:
         return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+    if not _device_id_ok(device_id):
+        return False, ("invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+                       " are accepted)")
 
     source = payload.get("source") or TASK_DEFAULT_SOURCE
     if not isinstance(source, str) or not source.strip():
@@ -695,6 +849,11 @@ def store_upload(data, ip=None):
     trigger = data.get("trigger") or ("manual" if request_id else "periodic")
     conn = _connect()
     try:
+        # 显式 BEGIN IMMEDIATE：把「查重 → 插入」整体放进同一把写锁里。
+        # 否则两个并发重试（板端重发 + Web 重复点击）可能同时通过上面的 SELECT，
+        # 后一个 INSERT 撞上 uploads 的 request_id 部分唯一索引 → IntegrityError
+        # → 500，而契约要求幂等返回 200/201。
+        conn.execute("BEGIN IMMEDIATE")
         if request_id:
             row = conn.execute(
                 "SELECT id FROM uploads WHERE request_id=?", (request_id,)
@@ -753,6 +912,18 @@ def store_upload(data, ip=None):
             )
         conn.commit()
         return upload_id, False
+    except sqlite3.IntegrityError:
+        # 兜底（BEGIN IMMEDIATE 已经把窗口堵住，这里是双保险）：唯一索引拒绝说明
+        # 另一路并发请求刚写了同一个 request_id —— 按幂等契约回它已落库的 id，
+        # 而不是把 500 丢给正在重试的板端。
+        conn.rollback()
+        if request_id:
+            row = conn.execute(
+                "SELECT id FROM uploads WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if row is not None:
+                return row["id"], True
+        raise
     except sqlite3.Error:
         conn.rollback()
         raise
@@ -799,6 +970,9 @@ def store_photo(data):
     conn = _connect()
     abs_path = None
     try:
+        # 同 store_upload：把「查重 → 写行 → 落盘」放进同一把写锁，避免并发的
+        # 同 request_id 上传各自通过 SELECT 后撞唯一索引（→ 500 + 可能多一张图）。
+        conn.execute("BEGIN IMMEDIATE")
         if request_id:
             row = conn.execute(
                 "SELECT id FROM photos WHERE request_id=? ORDER BY id LIMIT 1",
@@ -845,6 +1019,25 @@ def store_photo(data):
             )
         conn.commit()
         return photo_id, False
+    except sqlite3.IntegrityError:
+        # 并发同 request_id（见 store_upload 同名分支）：唯一索引拒绝时文件可能已经
+        # 写进磁盘，先清掉临时/正式文件，再按幂等契约回已存在的那一行。
+        conn.rollback()
+        if abs_path:
+            for path in (abs_path, abs_path + ".part"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass          # 清理失败不应掩盖原始错误
+        if request_id:
+            row = conn.execute(
+                "SELECT id FROM photos WHERE request_id=? ORDER BY id LIMIT 1",
+                (request_id,),
+            ).fetchone()
+            if row is not None:
+                return row["id"], True
+        raise
     except (sqlite3.Error, OSError):
         conn.rollback()
         if abs_path:
@@ -863,9 +1056,18 @@ def store_photo(data):
 # 路由
 # ---------------------------------------------------------------------------
 def _fmt_time(epoch_s):
+    """epoch 秒 → 本地时间串；异常值（None / 0 / 超出平台范围）不抛异常。
+
+    与 _fmt_epoch_ms() 同口径：格式化属于展示层，不该因为库里出现一个极端时间戳就
+    让整个接口 500（Windows 上 datetime.fromtimestamp 对越界值是抛 OverflowError，
+    而 _fmt_time 会被 health / tasks / events / photos 等所有读路径调用）。
+    """
     if not epoch_s:
         return None
-    return datetime.fromtimestamp(epoch_s).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return datetime.fromtimestamp(epoch_s).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return str(epoch_s)
 
 
 def _device_auth_ok(request):
@@ -888,6 +1090,55 @@ def _unauthorized():
         content={"code": "UNAUTHORIZED", "ok": False,
                  "error": "missing or invalid bearer token"},
     )
+
+
+def _too_large(label, limit):
+    """统一的 413：消息里带上上限，便于板端/脚本一眼定位（原来四个接口各写一套）。"""
+    return JSONResponse(
+        status_code=413,
+        content={"code": "TOO_LARGE", "ok": False,
+                 "error": f"{label} too large (max {limit} bytes)"},
+    )
+
+
+async def _read_body_limited(request, limit, label="request body"):
+    """读请求体并强制上限，返回 (raw, error_response)，二者恰有一个为 None。
+
+    两道闸：
+      ① 先看 Content-Length —— 能在**不把 body 读进内存**的前提下拒掉超大请求；
+      ② 读完再量一次，兜住没有 Content-Length 的 chunked 请求。
+    旧写法是「先把整个 body 读进内存，再比较长度」：body 有 1 GB 时内存先就没了，
+    长度检查根本没机会执行 —— 大小上限等于形同虚设。
+    """
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > limit:
+                return None, _too_large(label, limit)
+        except (TypeError, ValueError):
+            pass                      # 头不合法就当没给，靠第 ② 道闸兜住
+    raw = await request.body()
+    if len(raw) > limit:
+        return None, _too_large(label, limit)
+    return raw, None
+
+
+async def _read_json_limited(request, limit=MAX_JSON_BODY_BYTES, label="request body"):
+    """读 JSON 请求体并强制上限，返回 (payload, error_response)。
+
+    要么给出 payload，要么给出 413/400 响应；调用方只判 error_response 是否为 None。
+    """
+    raw, too_large = await _read_body_limited(request, limit, label)
+    if too_large is not None:
+        return None, too_large
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "request body must be valid JSON"},
+        )
 
 
 def _expire_stale_tasks(conn, device_id=None):
@@ -952,6 +1203,9 @@ def validate_event_trigger(payload):
     device_id = device_id.strip()
     if len(device_id) > MAX_DEVICE_ID_LEN:
         return False, f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+    if not _device_id_ok(device_id):
+        return False, ("invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+                       " are accepted)")
 
     source = payload.get("source")
     if not isinstance(source, str) or not source.strip():
@@ -1119,8 +1373,16 @@ def _check_task_match(request_id, data):
             problems.append(
                 f"sample_count too small ({len(data['samples'])} < {task['sample_count']})"
             )
-        if data["ts_ms"] < int(task["created_at"] * 1000) - 5000:
-            problems.append("ts_ms is older than the task creation time")
+        # 新鲜度（防回放）只在板端时钟可信时才有意义，判据见 EPOCH_SANE_MS 注释：
+        # SNTP 没成功的板子 ts_ms 只是开机毫秒数，与 created_at 相比恒为「陈旧」，
+        # 那样会把「该现场根本没网对时」错报成「板端上传了旧数据」，任务被置 failed
+        # 且板端收到 4xx 不再重试 —— 按需采集在现场彻底不可用。
+        if data["ts_ms"] >= EPOCH_SANE_MS:
+            if data["ts_ms"] < int(task["created_at"] * 1000) - 5000:
+                problems.append("ts_ms is older than the task creation time")
+        else:
+            print(f"[sensor-server] request_id={request_id}: ts_ms={data['ts_ms']} 低于"
+                  f" {EPOCH_SANE_MS}，判定板端时钟未同步 -> 跳过新鲜度检查")
         if problems:
             message = "; ".join(problems)
             conn.execute(
@@ -1203,13 +1465,11 @@ async def upload(request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
-    raw = await request.body()
-    if len(raw) > MAX_BODY_BYTES:
-        return JSONResponse(
-            status_code=413,
-            content={"code": "TOO_LARGE", "ok": False,
-                     "error": "request body too large"},
-        )
+    # 上限校验必须在读内存之前：旧顺序是「先整包读进来，再比长度」，
+    # body 有 1 GB 时内存先就没了，长度检查根本执行不到（见 _read_body_limited）。
+    raw, too_large = await _read_body_limited(request, MAX_BODY_BYTES)
+    if too_large is not None:
+        return too_large
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1230,12 +1490,19 @@ async def upload(request: Request):
     request_id = result.get("request_id")
     if request_id:
         # 带任务号的上传先校验归属；不匹配则把任务置 failed 并返回 4xx（板端不重试）
-        mismatch = _check_task_match(request_id, result)
+        mismatch = await run_in_threadpool(_check_task_match, request_id, result)
         if mismatch is not None:
             return mismatch
 
+    # 板端时钟是否可信（见 EPOCH_SANE_MS 注释）：未同步时 ts_ms 只是开机毫秒数。
+    # 回给调用方，Web 页面就能提示「板端未对时」，而不是让波形时间轴默默错到 1970。
+    clock_synced = result["ts_ms"] >= EPOCH_SANE_MS
+
     try:
-        upload_id, idempotent = store_upload(result, ip=ip)
+        # store_upload 是同步 sqlite 写（1 条 INSERT + N 条 executemany），直接在
+        # async 处理器里调用会阻塞事件循环：板端上传与 Web 轮询会互相拖慢。
+        # 丢到线程池，事件循环继续服务其他请求（sqlite 连接本身每请求独立，线程安全）。
+        upload_id, idempotent = await run_in_threadpool(store_upload, result, ip)
     except sqlite3.Error as e:
         return JSONResponse(
             status_code=500,
@@ -1256,6 +1523,7 @@ async def upload(request: Request):
             "request_id": request_id,
             "trigger": result["trigger"],
             "idempotent": idempotent,
+            "clock_synced": clock_synced,
         },
     )
 
@@ -1279,13 +1547,10 @@ async def upload_photo(request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
-    raw = await request.body()
-    if len(raw) > MAX_PHOTO_BYTES:
-        return JSONResponse(
-            status_code=413,
-            content={"code": "TOO_LARGE", "ok": False,
-                     "error": f"photo too large (max {MAX_PHOTO_BYTES} bytes)"},
-        )
+    # 同上：先用 Content-Length 挡掉超大 body 再读（见 _read_body_limited）
+    raw, too_large = await _read_body_limited(request, MAX_PHOTO_BYTES, "photo")
+    if too_large is not None:
+        return too_large
 
     qp = request.query_params
     params = {
@@ -1308,12 +1573,14 @@ async def upload_photo(request: Request):
     request_id = result.get("request_id")
     if request_id:
         # 带任务号的照片先校验归属；不匹配则把任务置 failed 并返回 4xx（板端不重试）
-        mismatch = _check_photo_task_match(request_id, result)
+        mismatch = await run_in_threadpool(_check_photo_task_match, request_id, result)
         if mismatch is not None:
             return mismatch
 
     try:
-        photo_id, idempotent = store_photo(result)
+        # 同 /api/v1/upload：store_photo 内是同步的「写库 + 落盘 JPEG」，放到线程池
+        # 执行，避免一次拍照上传把事件循环（以及直播取帧）卡住。
+        photo_id, idempotent = await run_in_threadpool(store_photo, result)
     except (sqlite3.Error, OSError) as e:
         return JSONResponse(
             status_code=500,
@@ -1332,9 +1599,15 @@ async def upload_photo(request: Request):
             "code": "OK",
             "ok": True,
             "photo_id": photo_id,
+            # 板端时钟是否可信（见 EPOCH_SANE_MS）：未同步时 ts_ms 只是开机毫秒数；
+            # 没带 ts_ms（None）也按「不可信」处理，页面据此提示「板端未对时」。
+            "clock_synced": bool(result["ts_ms"] and result["ts_ms"] >= EPOCH_SANE_MS),
             "device_id": result["device_id"],
             "request_id": request_id,
-            "bytes": len(result["jpeg"]),
+            # 顶层 bytes 取**库里那一行**的值，而不是本次请求体的长度：幂等重放时
+            # 板端若重传了长度不同的字节，store_photo 会忽略新字节、只回老 photo_id，
+            # 此时用 len(result["jpeg"]) 会让顶层 bytes / photo.bytes 互相矛盾。
+            "bytes": row["bytes"] if row else len(result["jpeg"]),
             "idempotent": idempotent,
             "photo": _photo_view(row),
         },
@@ -1526,6 +1799,42 @@ def _live_int_param(qp, name):
         return "INVALID"
 
 
+def _live_device_id_error(device_id):
+    """直播接口的 device_id 校验（与 upload/photos/tasks/events 同一套白名单）。
+
+    为什么直播也要卡：device_id 会被原样回吐给 Web（GET /api/v1/live 的 devices[]）。
+    前端目前一律走 textContent，所以这不构成 XSS；但「只剩一层前端防线」不该是设计 ——
+    服务端卡一次才是纵深防御，顺带避免同一台板子因拼写差异在内存态里被记成两台。
+    """
+    if len(device_id) > MAX_DEVICE_ID_LEN:
+        return f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"
+    if not _device_id_ok(device_id):
+        return ("invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+                " are accepted)")
+    return None
+
+
+def _live_prune_locked(now):
+    """丢掉超龄设备（长时间没推流 ⇒ 连最后一帧也释放）。调用方必须已持有 _live_lock。"""
+    for dev in [d for d, e in _live_frames.items()
+                if now - float(e["received_at"]) > LIVE_STALE_EVICT_S]:
+        _live_frames.pop(dev, None)
+        print(f"[sensor-server] live: {dev!r} 已 {LIVE_STALE_EVICT_S}s 无新帧，释放其帧")
+
+
+def _live_make_room_locked(device_id):
+    """给新设备腾位置：仅当「设备是新的」且已达上限时，淘汰最久未推流的那台。
+
+    只在写路径调用，读路径刻意不淘汰 —— 板端停推流后页面还能显示最后一帧
+    （`active=false` 的「已停止（保留最后一帧）」），这是有意的 UX，见 LIVE_STALE_EVICT_S。
+    """
+    while device_id not in _live_frames and len(_live_frames) >= LIVE_MAX_DEVICES:
+        oldest = min(_live_frames, key=lambda d: _live_frames[d]["received_at"])
+        _live_frames.pop(oldest, None)
+        print(f"[sensor-server] live: 设备数达上限 {LIVE_MAX_DEVICES}，淘汰最久未推流的"
+              f" {oldest!r}（内存上界 ≈ {LIVE_MAX_DEVICES * LIVE_MAX_FRAME_BYTES // 1024} KiB）")
+
+
 @app.post("/api/v1/live")
 async def upload_live_frame(request: Request):
     """接收板端直播推流的一帧 JPEG，覆盖该设备在内存里的上一帧。
@@ -1537,13 +1846,10 @@ async def upload_live_frame(request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
-    raw = await request.body()
-    if len(raw) > LIVE_MAX_FRAME_BYTES:
-        return JSONResponse(
-            status_code=413,
-            content={"code": "TOO_LARGE", "ok": False,
-                     "error": f"live frame too large (max {LIVE_MAX_FRAME_BYTES} bytes)"},
-        )
+    # 同上：先用 Content-Length 挡掉超大 body 再读（见 _read_body_limited）
+    raw, too_large = await _read_body_limited(request, LIVE_MAX_FRAME_BYTES, "live frame")
+    if too_large is not None:
+        return too_large
 
     qp = request.query_params
     device_id = (qp.get("device_id") or "").strip()
@@ -1553,11 +1859,11 @@ async def upload_live_frame(request: Request):
             content={"code": "INVALID", "ok": False,
                      "error": "missing or empty 'device_id'"},
         )
-    if len(device_id) > MAX_DEVICE_ID_LEN:
+    dev_err = _live_device_id_error(device_id)
+    if dev_err is not None:
         return JSONResponse(
             status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+            content={"code": "INVALID", "ok": False, "error": dev_err},
         )
     if not raw:
         return JSONResponse(
@@ -1581,9 +1887,33 @@ async def upload_live_frame(request: Request):
             content={"code": "INVALID", "ok": False,
                      "error": "ts_ms / w / h must be integers when present"},
         )
+    # 范围与 /api/v1/photos 对齐（ts_ms>=0、宽高 1..8192）：这些值会原样进内存态、
+    # 原样回吐给页面，负数/天文数字最终会显示成「1970-01-01」之类的东西。
+    if ts_ms is not None and ts_ms < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'ts_ms' (expect a non-negative epoch ms)"},
+        )
+    if width is not None and not 1 <= width <= 8192:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'w' (expect 1-8192)"},
+        )
+    if height is not None and not 1 <= height <= 8192:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'h' (expect 1-8192)"},
+        )
 
     global _live_seq
     with _live_lock:
+        # 写路径是唯一腾内存的地方（读路径刻意不淘汰，见 _live_make_room_locked）：
+        # 先释放超龄设备，再在设备数达上限时给新设备挤掉最久未推流的那台。
+        _live_prune_locked(time.time())
+        _live_make_room_locked(device_id)
         _live_seq += 1
         _live_frames[device_id] = {
             "jpeg": raw,
@@ -1621,12 +1951,15 @@ def live_status(request: Request):
     """
     qp = request.query_params
     device_id = (qp.get("device_id") or "").strip()
-    if len(device_id) > MAX_DEVICE_ID_LEN:
-        return JSONResponse(
-            status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
-        )
+    if device_id:
+        # 指定设备时同样走白名单（与写路径一致）：非法 device_id 不可能存在于内存态，
+        # 直接 400 比回一个「从未推流」的 200 更准确。
+        dev_err = _live_device_id_error(device_id)
+        if dev_err is not None:
+            return JSONResponse(
+                status_code=400,
+                content={"code": "INVALID", "ok": False, "error": dev_err},
+            )
 
     now = time.time()
     with _live_lock:
@@ -1676,11 +2009,11 @@ def live_frame(request: Request):
             content={"code": "INVALID", "ok": False,
                      "error": "missing or empty 'device_id'"},
         )
-    if len(device_id) > MAX_DEVICE_ID_LEN:
+    dev_err = _live_device_id_error(device_id)
+    if dev_err is not None:
         return JSONResponse(
             status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": f"'device_id' too long (max {MAX_DEVICE_ID_LEN})"},
+            content={"code": "INVALID", "ok": False, "error": dev_err},
         )
 
     with _live_lock:
@@ -1714,14 +2047,10 @@ async def create_task(request: Request):
     因此新建控制任务时把反方向那条未终态控制任务置 failed（superseded by newer
     control task）。
     """
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": "request body must be valid JSON"},
-        )
+    # 上限 + 解析合成一步（见 _read_json_limited）：Web 侧创建任务也没有过 body 上限。
+    payload, bad = await _read_json_limited(request)
+    if bad is not None:
+        return bad
 
     ok, result = validate_task_request(payload)
     if not ok:
@@ -1982,9 +2311,14 @@ async def fail_task(request_id: str, request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
+    # 先卡上限再解析：body 非法（或不是对象）沿用原来的「空 reason」语义，
+    # 但超大 body 直接 413 —— 这个接口过去完全没有上限（见 _read_body_limited）。
+    body_raw, too_large = await _read_body_limited(request, MAX_JSON_BODY_BYTES)
+    if too_large is not None:
+        return too_large
     reason = ""
     try:
-        body = await request.json()
+        body = json.loads(body_raw.decode("utf-8"))
         if isinstance(body, dict):
             reason = str(body.get("error") or body.get("reason") or "").strip()
     except Exception:
@@ -2046,9 +2380,13 @@ async def applied_task(request_id: str, request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
+    # 先卡上限再解析（见 _read_body_limited）：解析失败沿用原来的「无可选 body」语义。
+    body_raw, too_large = await _read_body_limited(request, MAX_JSON_BODY_BYTES)
+    if too_large is not None:
+        return too_large
     reported_until_ms = None
     try:
-        body = await request.json()
+        body = json.loads(body_raw.decode("utf-8"))
         if isinstance(body, dict):
             raw = body.get("paused_until_ms")
             if isinstance(raw, (int, float)) and not isinstance(raw, bool):
@@ -2139,15 +2477,17 @@ async def applied_task(request_id: str, request: Request):
                     (task["device_id"], task["source"], new_paused, new_until,
                      request_id, now),
                 )
-        conn.commit()
+        # commit 必须放在 _control_view() 之后：它内部的惰性归零（device_control
+        # 里到点的行置回未暂停）也是一次 UPDATE，若在它之前提交，这次归零会随
+        # conn.close() 一起被回滚，等于白做。
         control = _control_view(conn, task["device_id"], task["source"])
         row = conn.execute(
             "SELECT * FROM tasks WHERE request_id=?", (request_id,)
         ).fetchone()
+        conn.commit()
     finally:
         conn.close()
 
-    ESP = "ok"
     return JSONResponse(
         status_code=200,
         content={"code": "OK", "ok": True, "applied": True, "updated": updated,
@@ -2208,14 +2548,11 @@ async def trigger_event(request: Request):
     if not _device_auth_ok(request):
         return _unauthorized()
 
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": "request body must be valid JSON"},
-        )
+    # 上限 + 解析合成一步（见 _read_json_limited）：旧写法直接 await request.json()，
+    # 这个接口没有任何 body 上限。
+    payload, bad = await _read_json_limited(request)
+    if bad is not None:
+        return bad
 
     ok, result = validate_event_trigger(payload)
     if not ok:
@@ -2293,14 +2630,10 @@ async def respond_event(request: Request):
     转移规则刻意收紧：终态不可再变（重复发同一动作幂等返回 200，
     发冲突动作返回 409），避免板端连点把状态来回翻。
     """
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"code": "INVALID", "ok": False,
-                     "error": "request body must be valid JSON"},
-        )
+    # 上限 + 解析合成一步（见 _read_json_limited）：这个接口过去也没有 body 上限。
+    payload, bad = await _read_json_limited(request)
+    if bad is not None:
+        return bad
 
     request_id = payload.get("request_id")
     if not isinstance(request_id, str) or not request_id.strip():
@@ -2422,7 +2755,10 @@ def event_status(request: Request):
 
     conn = _connect()
     try:
+        # 惰性过期改了行就必须提交：sqlite 在 conn.close() 时会回滚未提交事务，
+        # 只靠同连接内的 SELECT 是"看得见、留不下"（响应看着对，磁盘上还是 pending）。
         _expire_stale_events(conn, device_id)
+        conn.commit()
         if request_id:
             row = conn.execute(
                 "SELECT * FROM events WHERE request_id=? AND device_id=?",
@@ -2481,6 +2817,7 @@ def list_events(request: Request):
     conn = _connect()
     try:
         _expire_stale_events(conn, device_id or None)
+        conn.commit()          # 同上：不提交则过期状态不落库
         rows = conn.execute(sql, args).fetchall()
     finally:
         conn.close()
@@ -2501,6 +2838,14 @@ def health():
     try:
         conn = _connect()
         try:
+            # 所有统计型 SELECT 之前先做惰性过期（README 注意事项 14），且必须
+            # 提交：tasks 与 events 各扫一次，否则 health 的汇总口径会和
+            # GET /api/v1/tasks、GET /api/v1/events 打架（显示"待处理 2 条"、
+            # 列表只返回 1 条）。不 commit 的话过期 UPDATE 会被 conn.close() 回滚，
+            # 于是每条读路径都重算一遍、状态永远落不了库。
+            _expire_stale_tasks(conn)
+            _expire_stale_events(conn)
+            conn.commit()
             n_uploads = conn.execute(
                 "SELECT COUNT(*) FROM uploads"
             ).fetchone()[0]
@@ -2524,11 +2869,7 @@ def health():
                 "SELECT device_id, ts_ms, received_at, sample_count, source, unit"
                 " FROM uploads ORDER BY received_at DESC LIMIT 1"
             ).fetchone()
-            # 与 list/status 接口保持一致：先做惰性过期再统计。
-            # 否则已超时但仍记为 pending 的事件会被算进 events_by_status，
-            # 于是 health 显示"待处理 2 条"、而 GET /api/v1/events 只返回 1 条，
-            # 排查时看到自相矛盾的汇总。
-            _expire_stale_events(conn)
+            # 事件/任务的惰性过期已在函数开头统一做完（见那里的注释）。
             event_rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM events GROUP BY status"
             ).fetchall()
@@ -2580,6 +2921,9 @@ def health():
 def devices():
     conn = _connect()
     try:
+        # pending_tasks 属于统计口径：必须先惰性判超时，否则早已 timeout 的任务
+        # 仍被算成待办，与 GET /api/v1/tasks 的 status=timeout 互相矛盾。
+        _expire_stale_tasks(conn)
         rows = conn.execute(
             # 设备集合 = 上传过样本的设备 ∪ 拍过照片的设备（只有照片没样本的设备
             # 也必须出现在下拉里，否则画廊里会看不到它自己的照片）。
@@ -2802,7 +3146,10 @@ def index():
                 "服务端收到：%s（%s 秒前）<br>"
                 "末样本 az ≈ %s<br>累计批次：%s</p>"
             ) % (
-                it["device_id"],
+                # device_id 已由 validate_payload/_device_id_ok 白名单卡住字符集（不含
+                # '<'），这里再转义一次是纵深防御：模板拼接一旦被改动，输出侧也不会
+                # 直接执行板端可控的标记。
+                html.escape(str(it["device_id"])),
                 color[it["state"]],
                 state_cn[it["state"]],
                 it["last_ts"],
