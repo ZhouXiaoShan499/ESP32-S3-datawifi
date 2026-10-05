@@ -3,6 +3,9 @@
 真实网络端到端自检：以子进程方式真正启动服务（uvicorn），
 再用标准库 urllib 通过真实 HTTP 上传并查询。
 
+另含一项「ASGI 冷启动」自检：用全新临时库 + `uvicorn main:app`（不走 serve()）
+验证建表挂在 lifespan 上（漏挂时全新库的第一个请求就是 500 no such table）。
+
 运行：python server/e2e_server_check.py   （需已安装 fastapi + uvicorn）
 """
 
@@ -24,11 +27,26 @@ for _stream in (sys.stdout, sys.stderr):
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _E2E_DB = os.path.join(_HERE, "data", "e2e_upload.db")
-if os.path.exists(_E2E_DB):
-    os.remove(_E2E_DB)
+
+
+def _remove_db_files(path):
+    """删库时连 WAL 副产品（-wal/-shm/-journal）一起删（理由见 test_receive.py 同名函数）。"""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.remove(path + suffix)
+        except OSError:
+            pass
+
+
+_remove_db_files(_E2E_DB)
 
 PORT = "8011"
 BASE = f"http://127.0.0.1:{PORT}"
+
+# 「ASGI 冷启动」自检专用：独立端口 + 独立全新库（见 check_asgi_cold_start）
+_ASGI_DB = os.path.join(_HERE, "data", "e2e_asgi_cold.db")
+ASGI_PORT = "8014"
+ASGI_BASE = f"http://127.0.0.1:{ASGI_PORT}"
 
 
 def request(method, url, data=None):
@@ -44,7 +62,55 @@ def request(method, url, data=None):
         return e.code, json.loads(e.read().decode("utf-8"))
 
 
+def check_asgi_cold_start():
+    """`uvicorn main:app` 冷启动（全新库）必须自动建表。
+
+    `python main.py` 走 serve()（内部调 init_db()），而 uvicorn/gunicorn 只发
+    ASGI lifespan 事件、**不执行 serve()** —— 建表因此同时挂在
+    `FastAPI(lifespan=...)` 上。漏挂时全新库上的第一个请求就是
+    500 "no such table: uploads"，所以这里用**全新库**验证，不能复用已有库。
+    """
+    _remove_db_files(_ASGI_DB)      # 全新库：连 WAL 副产品一起清（见 _remove_db_files）
+
+    env = dict(os.environ)
+    env["SENSOR_DB"] = _ASGI_DB
+    env["SENSOR_HOST"] = "127.0.0.1"
+    env["SENSOR_PORT"] = ASGI_PORT
+    env.pop("SENSOR_TOKEN", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "main:app",
+         "--host", "127.0.0.1", "--port", ASGI_PORT, "--log-level", "warning"],
+        cwd=_HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        first = None
+        for _ in range(60):
+            if proc.poll() is not None:
+                raise SystemExit("uvicorn main:app exited early:\n"
+                                 + (proc.stdout.read() if proc.stdout else ""))
+            try:
+                first = request("GET", ASGI_BASE + "/api/v1/health")
+                break
+            except Exception:
+                time.sleep(0.2)
+        assert first is not None, "uvicorn main:app 没有起来"
+        st, body = first
+        assert st == 200 and body["status"] == "ok", (st, body)
+        assert body["total_uploads"] == 0 and body["total_tasks"] == 0, body
+        print("[PASS] uvicorn main:app 冷启动（全新库，仅 ASGI lifespan）:"
+              " /api/v1/health 200，表已建好")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
 def main():
+    check_asgi_cold_start()
+
     env = dict(os.environ)
     env["SENSOR_DB"] = _E2E_DB
     env["SENSOR_PORT"] = PORT

@@ -8,7 +8,9 @@
 
 import os
 import sys
+import threading
 import time
+import uuid
 
 # 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -20,8 +22,23 @@ for _stream in (sys.stdout, sys.stderr):
 # 先指到临时库，再导入 main（main 在 import 时读取 SENSOR_DB）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TEST_DB = os.path.join(_HERE, "data", "test_upload.db")
-if os.path.exists(_TEST_DB):
-    os.remove(_TEST_DB)
+
+
+def _remove_db_files(path):
+    """删库时连 WAL 副产品（-wal/-shm/-journal）一起删。
+
+    服务端现在跑 WAL 模式，只删 .db 会留下孤立的 -wal/-shm：它们不影响 sqlite 打开
+    新库（WAL 头对不上会被丢弃，实测连跑两次仍全绿），但目录里会多出几个「看起来像
+    数据」的文件，排查时容易误判。
+    """
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.remove(path + suffix)
+        except OSError:
+            pass
+
+
+_remove_db_files(_TEST_DB)
 os.environ["SENSOR_DB"] = _TEST_DB
 os.environ["SENSOR_HOST"] = "127.0.0.1"
 
@@ -554,6 +571,219 @@ def main_run():
     assert len(tj2["tasks"]) >= 7, tj2["count"]
     print("[PASS] 任务历史含控制任务：kinds=%s，共 %d 条"
           % (sorted(kinds), tj2["count"]))
+
+    # 36) 惰性超时是**写操作**，必须落库：只调 /api/v1/health（不碰任何会做惰性
+    #     超时的任务接口），再用**另一个连接**直读 tasks.status。
+    #     漏 conn.commit() 时 sqlite 会在 conn.close() 时回滚这次 UPDATE ——
+    #     health 的 tasks_by_status 已经算作 timeout（同连接可见），库里却仍是
+    #     submitted，且这个连接下次还会把它当待办（见 README 注意事项 14）。
+    def task_status_from_new_conn(request_id):
+        c = main._connect()
+        try:
+            return c.execute("SELECT status FROM tasks WHERE request_id=?",
+                             (request_id,)).fetchone()["status"]
+        finally:
+            c.close()
+
+    stale_rid = client.post(
+        "/api/v1/tasks", json={"device_id": task_dev, "timeout_s": 5}
+    ).json()["task"]["request_id"]
+    conn = main._connect()
+    try:
+        conn.execute("UPDATE tasks SET expires_at=? WHERE request_id=?",
+                     (time.time() - 1, stale_rid))
+        conn.commit()
+    finally:
+        conn.close()
+
+    h = client.get("/api/v1/health").json()
+    assert h["tasks_by_status"].get("timeout", 0) >= 2, h["tasks_by_status"]
+    assert task_status_from_new_conn(stale_rid) == "timeout", \
+        "health 的惰性超时没有落库（漏 conn.commit()）"
+    # /devices 的 pending_tasks 是同一口径：先判超时再统计，否则会把已过期的任务
+    # 继续算成待办（对应 README「注意事项 14」里 events 那类口径矛盾）
+    devs2 = {d["device_id"]: d
+             for d in client.get("/api/v1/devices").json()["devices"]}
+    assert devs2[task_dev]["pending_tasks"] == 0, devs2[task_dev]
+    print("[PASS] health/devices 的惰性超时已落库（另开连接读到 timeout，"
+          "pending_tasks=%s）" % devs2[task_dev]["pending_tasks"])
+
+    # 37) 加固回归：device_id 字符白名单。device_id 是首页 HTML（GET /）与照片
+    #     目录名的输入源，过去任意字符都能入库 —— 存储型 XSS / 路径穿越的共同入口。
+    for bad_dev in ("<script>alert(1)</script>", "esp32/../../etc", "bad dev",
+                    "a\"b", "a'b", "设备一"):
+        bad = make_payload(device=bad_dev, n=2)
+        r = client.post("/api/v1/upload", json=bad)
+        assert r.status_code == 400 and r.json()["code"] == "INVALID", (bad_dev, r.text)
+        assert "device_id" in r.json()["error"], r.text
+    ok_dev = "esp32s3-eye_0001.2"
+    r = client.post("/api/v1/upload", json=make_payload(device=ok_dev, n=2))
+    assert r.status_code == 201, r.text
+    print("[PASS] device_id 白名单：脚本标签/路径穿越/空格/引号/中文 全部 400，"
+          "合法 id（含 . _ -）201")
+
+    # 38) samples[i].i 必须是整数。过去直接透传，非数值会写进 samples.seq，而
+    #     /api/v1/window 与首页的 ORDER BY seq 依赖它排序（SQLite 的类型亲和性
+    #     会把它们当字符串比较，排出来的顺序就错了）。
+    for bad_seq in ("1", 1.5, None, [1], {"a": 1}):
+        bad = make_payload(n=3)
+        bad["samples"][0]["i"] = bad_seq
+        r = client.post("/api/v1/upload", json=bad)
+        assert r.status_code == 400, (bad_seq, r.text)
+        assert "samples[0].i must be an integer" in r.json()["error"], r.text
+    ok_float = make_payload(n=3)
+    ok_float["samples"][0]["i"] = 1.0      # 整数值 float 与 ts_ms 同口径，仍接受
+    assert client.post("/api/v1/upload", json=ok_float).status_code == 201
+    print("[PASS] samples[i].i 非整数（str/小数 float/None/list/object）→ 400；"
+          "整数值 float → 201")
+
+    # 39) store_upload 并发竞态：两个线程同时写同一 request_id，必须一个写库、
+    #     另一个幂等返回同一个 upload_id，绝不能抛 IntegrityError —— 旧代码的
+    #     check-then-insert 在并发下会 500，板端重试反而雪上加霜。
+    conc_raw = make_payload(device="esp32s3-eye-conc", n=5)
+    conc_raw["request_id"] = uuid.uuid4().hex
+    conc_raw["trigger"] = "manual"
+    ok_conc, conc_data = main.validate_payload(conc_raw)
+    assert ok_conc, conc_data
+    conc_results, conc_errors = [], []
+
+    def _store_once():
+        try:
+            conc_results.append(main.store_upload(conc_data, ip="127.0.0.1"))
+        except Exception as exc:            # noqa: BLE001 - 测试就是要抓住任何异常
+            conc_errors.append(repr(exc))
+
+    conc_threads = [threading.Thread(target=_store_once) for _ in range(2)]
+    for t in conc_threads:
+        t.start()
+    for t in conc_threads:
+        t.join()
+    assert not conc_errors, conc_errors
+    assert len(conc_results) == 2, conc_results
+    assert sorted(flag for _, flag in conc_results) == [False, True], conc_results
+    assert conc_results[0][0] == conc_results[1][0], "并发重试应回同一个 upload_id"
+    conn = main._connect()
+    try:
+        rows = conn.execute("SELECT COUNT(*) AS n FROM uploads WHERE request_id=?",
+                            (conc_raw["request_id"],)).fetchone()["n"]
+    finally:
+        conn.close()
+    assert rows == 1, "同一 request_id 只允许 1 条 uploads 行，实际 %s" % rows
+    print("[PASS] store_upload 并发同 request_id：一个写库一个幂等，uploads 仍 1 行")
+
+    # 40) 板端 SNTP 未同步时，ts_ms 只是「开机毫秒数」而不是真实 epoch（固件
+    #     main.c:5820 的会话锚点取自 gettimeofday）。过去它会被 _check_task_match
+    #     的新鲜度判据判成「上传了陈旧数据」→ 400 + 任务 failed，而板端收到 4xx
+    #     就不再重试 ⇒ 「网段里没有可用 NTP」的现场按需采集彻底不可用。
+    #     现在只有「看起来像真实时间」的 ts_ms 才参与该判据（EPOCH_SANE_MS）。
+    unsync_dev = "esp32s3-eye-unsync"
+    r = client.post("/api/v1/tasks", json={"device_id": unsync_dev, "sample_count": 3})
+    assert r.status_code == 201, r.text
+    unsync_rid = r.json()["task"]["request_id"]
+    assert client.get("/api/v1/tasks/next",
+                      params={"device_id": unsync_dev}).json()["found"] is True
+    unsynced = make_payload(device=unsync_dev, ts=123456, n=3)   # 开机 123 s
+    unsynced["request_id"] = unsync_rid
+    r = client.post("/api/v1/upload", json=unsynced)
+    assert r.status_code == 201, r.text
+    assert r.json()["clock_synced"] is False, r.text
+    assert r.json()["idempotent"] is False, r.text
+    t = client.get("/api/v1/tasks/" + unsync_rid).json()["task"]
+    assert t["status"] == "completed", t
+    assert t["upload_id"] == r.json()["upload_id"], t
+    print("[PASS] 板端未对时（ts_ms=123456）不再被误判为陈旧：201 + 任务 completed、"
+          "clock_synced=False")
+
+    # 41) 防回放判据没有因此降级：ts_ms 看起来是真实时间、但早于任务创建时间 60 s
+    #     → 仍然 400 且任务置 failed（板端不重试）。这一条是 40) 的安全网。
+    stale_dev = "esp32s3-eye-stale"
+    r = client.post("/api/v1/tasks", json={"device_id": stale_dev, "sample_count": 3})
+    assert r.status_code == 201, r.text
+    stale_rid = r.json()["task"]["request_id"]
+    assert client.get("/api/v1/tasks/next",
+                      params={"device_id": stale_dev}).json()["found"] is True
+    created_at = client.get("/api/v1/tasks/" + stale_rid).json()["task"]["created_at"]
+    stale = make_payload(device=stale_dev, ts=int(created_at * 1000) - 60000, n=3)
+    stale["request_id"] = stale_rid
+    r = client.post("/api/v1/upload", json=stale)
+    assert r.status_code == 400, r.text
+    assert "ts_ms is older than the task creation time" in r.json()["error"], r.text
+    assert client.get("/api/v1/tasks/" + stale_rid).json()["task"]["status"] == "failed"
+    print("[PASS] 真实时钟但陈旧（早于任务创建 60 s）仍 400 且任务 failed"
+          "（防回放未降级）")
+
+    # 42) clock_synced 口径：已对时（ts_ms 是真实 epoch）的上传为 True，
+    #     与 40) 的 False 可区分，Web 页面据此提示「板端未对时」。
+    r = client.post("/api/v1/upload", json=make_payload(device="esp32s3-eye-clock", n=2))
+    assert r.status_code == 201, r.text
+    assert r.json()["clock_synced"] is True, r.text
+    print("[PASS] clock_synced=True（ts_ms 为真实 epoch），与未对时的 False 可区分")
+
+    # 43) 通用 JSON 接口的 body 上限。这几个接口过去直接 await request.json()，
+    #     **完全没有上限** —— 几百 MB 的 body 会先被读进内存才轮到字段校验，
+    #     等价于一个免鉴权的内存放大点。现在超过 MAX_JSON_BODY_BYTES 直接 413。
+    big = (b'{"device_id":"esp32s3-eye-big","pad":"'
+           + b"x" * main.MAX_JSON_BODY_BYTES + b'"}')
+    r = client.post("/api/v1/tasks", content=big,
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 413 and r.json()["code"] == "TOO_LARGE", r.text
+    # 上限之内的正常请求不受影响（同一个 device 稍后还要被 44) 用到）
+    r = client.post("/api/v1/tasks",
+                    json={"device_id": "esp32s3-eye-big", "sample_count": 3})
+    assert r.status_code == 201, r.text
+    print("[PASS] JSON 接口 body 上限：>%d B 的 /api/v1/tasks 请求 413 TOO_LARGE，"
+          "上限内正常 201" % main.MAX_JSON_BODY_BYTES)
+
+    # 44) 存储层跑 WAL：默认的 rollback-journal 模式下写事务提交期是 EXCLUSIVE 锁，
+    #     会挡住读方（Web 每 800 ms 轮询 / window 画波形），实测表现为间歇 500。
+    #     这里直接读 PRAGMA，确认「每个连接都设上了」而不只是写在注释里。
+    conn = main._connect()
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    finally:
+        conn.close()
+    assert mode == "wal", mode
+    assert busy == main.DB_BUSY_TIMEOUT_MS, busy
+    print("[PASS] sqlite 跑 WAL（journal_mode=%s）且 busy_timeout=%d ms 生效"
+          % (mode, busy))
+
+    # 45) 老库升级路径：uploads 里若已存在重复 request_id（建唯一索引之前的历史数据），
+    #     迁移必须「告警跳过」而不是抛 IntegrityError —— 后者会让 init_db() 直接失败、
+    #     服务起不来，而这条路径恰恰只在老库上才走到。photos 侧早有这套防御，
+    #     这里补的是对称性（两边都由同一类历史 bug 造成）。
+    dup_sql = ("INSERT INTO uploads (device_id, source, unit, ts_ms, received_at,"
+               " sample_count, ip, payload, request_id, trigger)"
+               " VALUES ('esp32s3-eye-dup','qma6100p','m/s^2',1,1,0,'127.0.0.1','',"
+               " 'dup-rid-0001','manual')")
+    conn = main._connect()
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_uploads_request")
+        conn.execute(dup_sql)
+        conn.execute(dup_sql)
+        conn.commit()
+        main._migrate_uploads_columns(conn)      # 不抛异常 = 服务起得来
+        conn.commit()
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name='idx_uploads_request'").fetchone()
+    finally:
+        conn.close()
+    assert idx is None, "有重复行时不该建唯一索引（会整段失败）"
+
+    conn = main._connect()
+    try:
+        conn.execute("DELETE FROM uploads WHERE request_id='dup-rid-0001'")
+        conn.commit()
+        main._migrate_uploads_columns(conn)      # 去重后重跑：索引应被补上
+        conn.commit()
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name='idx_uploads_request'").fetchone()
+    finally:
+        conn.close()
+    assert idx is not None, "去重后应能建出唯一索引"
+    print("[PASS] uploads 老库迁移：重复 request_id 只告警不炸，去重后自动补上唯一索引")
 
     print("\nALL CHECKS PASSED")
 

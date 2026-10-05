@@ -24,8 +24,18 @@ for _stream in (sys.stdout, sys.stderr):
 # 先指到临时库，再导入 main（main 在 import 时读取 SENSOR_DB）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TEST_DB = os.path.join(_HERE, "data", "test_events.db")
-if os.path.exists(_TEST_DB):
-    os.remove(_TEST_DB)
+
+
+def _remove_db_files(path):
+    """删库时连 WAL 副产品（-wal/-shm/-journal）一起删（理由见 test_receive.py 同名函数）。"""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.remove(path + suffix)
+        except OSError:
+            pass
+
+
+_remove_db_files(_TEST_DB)
 os.environ["SENSOR_DB"] = _TEST_DB
 os.environ["SENSOR_HOST"] = "127.0.0.1"
 
@@ -252,6 +262,67 @@ def main_run():
     assert h["events_by_status"].get("completed") == 1
     assert h["latest_event"] is not None
     ok("health 汇总事件统计: %s" % h["events_by_status"])
+
+    # 25) 惰性过期必须**落库**：三条读路径各造一条已过期事件、只调目标接口，
+    #     再用另一个连接直读 events.status。漏 conn.commit() 时接口返回完全正常
+    #     （同连接能看见未提交的 UPDATE），但 conn.close() 会回滚，库里仍是 pending。
+    def backdate(request_id):
+        c = main._connect()
+        try:
+            c.execute("UPDATE events SET expires_at=? WHERE request_id=?",
+                      (time.time() - 5, request_id))
+            c.commit()
+        finally:
+            c.close()
+
+    def stored_status(request_id):
+        c = main._connect()          # 新连接 = 磁盘上的真实状态
+        try:
+            return c.execute("SELECT status FROM events WHERE request_id=?",
+                             (request_id,)).fetchone()["status"]
+        finally:
+            c.close()
+
+    dev_list, dev_status, dev_health = DEV + "-a", DEV + "-b", DEV + "-c"
+    expired = {}
+    for dev in (dev_list, dev_status, dev_health):
+        request_id = rid()
+        r = client.post("/api/v1/events/trigger",
+                        json=trigger_body(request_id, device=dev))
+        assert r.status_code == 201, r.text
+        expired[dev] = request_id
+        backdate(request_id)
+    assert stored_status(expired[dev_list]) == "pending", "前置条件：过期前应是 pending"
+
+    # a) 列表接口（带 device 过滤 → 只扫本设备）
+    client.get("/api/v1/events", params={"device_id": dev_list})
+    assert stored_status(expired[dev_list]) == "expired", \
+        "GET /api/v1/events 的惰性过期没有落库（漏 conn.commit()）"
+    assert stored_status(expired[dev_status]) == "pending", "列表接口不该动别的设备"
+    ok("GET /api/v1/events 的惰性过期已落库（另开连接读到 expired，且不越界改别的设备）")
+
+    # b) 板端轮询用的状态接口
+    client.get("/api/v1/events/status",
+               params={"device_id": dev_status, "request_id": expired[dev_status]})
+    assert stored_status(expired[dev_status]) == "expired", \
+        "GET /api/v1/events/status 的惰性过期没有落库"
+    assert stored_status(expired[dev_health]) == "pending", "状态接口不该动别的设备"
+    ok("GET /api/v1/events/status 的惰性过期已落库")
+
+    # c) health（不带 device → 全库扫描，顺带证明这一步也提交了）
+    client.get("/api/v1/health")
+    assert stored_status(expired[dev_health]) == "expired", \
+        "/api/v1/health 的惰性过期没有落库"
+    ok("GET /api/v1/health 的惰性过期已落库")
+
+    # 新增：device_id 白名单同样覆盖 /api/v1/events/trigger（事件表也按
+    # device_id 过滤并在页面上显示，入口必须一致收紧）
+    for bad_dev in ("<script>x</script>", "../up", "bad dev"):
+        r = client.post("/api/v1/events/trigger",
+                        json=trigger_body(rid(), device=bad_dev))
+        assert r.status_code == 400 and r.json()["code"] == "INVALID", (bad_dev, r.text)
+        assert "device_id" in r.json()["error"], r.text
+    ok("events/trigger 的 device_id 白名单：脚本标签/路径穿越/空格 → 400")
 
     print("\n全部通过：%d 项断言" % N)
 
