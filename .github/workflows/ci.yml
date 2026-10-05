@@ -1,0 +1,67 @@
+name: CI
+
+# 触发面刻意与 GitHub Flow 对齐：feature/bugfix 分支开 PR 时跑（pull_request），
+# 合进 main 之后再跑一次（push main），保证「默认分支永远是绿的」。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server-tests:
+    name: server 自测（FastAPI 接收服务）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r server/requirements.txt
+
+      # 先做语法检查，语法错时给出比 assert 更直观的定位
+      - name: 语法检查
+        run: python -m compileall -q server
+
+      # 四个自测脚本各自用独立临时库（server/data/ 已在 .gitignore 里），
+      # 互不干扰；任何一个失败都直接让 job 红。
+      - name: 接收 / 校验 / 存储 / 查询（test_receive.py）
+        run: python server/test_receive.py
+
+      - name: 实时拍照链路（test_photos.py）
+        run: python server/test_photos.py
+
+      - name: 闭环事件链路（test_events.py）
+        run: python server/test_events.py
+
+      - name: 真实网络端到端（e2e_server_check.py，自起 uvicorn 子进程）
+        run: python server/e2e_server_check.py
+
+  secret-scan:
+    name: 机密扫描（gitleaks）
+    runs-on: ubuntu-latest
+    # ⚠️ 暂时 continue-on-error：仓库**历史**里还留着一次已提交的真实 WiFi 凭据
+    # （main/Kconfig.projbuild 的历史版本，见 commit 714eb8a，它已经在 origin/main 上）。
+    # 当前 HEAD 里的默认值已全部改成占位值（WIFI_SSID="YourWiFiSSID"、
+    # SENSOR_SERVER_URL 用 RFC 5737 的 192.0.2.10），所以工作区与 HEAD 都是干净的 ——
+    # 红的是历史。要让它变成硬门禁，只能先重写历史：
+    #     git filter-repo --replace-text <规则> && git push --force-with-lease
+    # 并且**同时轮换那只旧路由器口令**（凭据一旦进过远端就必须视为已泄露）。
+    # 历史清理完成前，这里保持 continue-on-error：它的作用是「早期预警」，不是拦门。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # gitleaks 要扫完整历史，浅克隆会漏
+
+      - name: gitleaks（扫全历史）
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_COMMENTS: "false"
