@@ -18,10 +18,39 @@ set "MSYSTEM_PREFIX="
 set "MINGW_PREFIX="
 
 set "IDF_EXPORT="
+
+REM 候选安装：路径 + 版本号。版本号只用于和 build\config.env 里记录的版本对账
+REM （不解析 JSON —— 路径里的盘符冒号会让 for /f delims 解析变成一团乱麻）。
+set "IDF_C1=C:\esp\v5.5.4\esp-idf"
+set "IDF_V1=5.5.4"
+set "IDF_C2=D:\Espressif\frameworks\esp-idf-v5.4.4"
+set "IDF_V2=5.4.4"
+set "IDF_C3=D:\Espressif\frameworks\esp-idf-v5.4.3"
+set "IDF_V3=5.4.3"
+
+REM build\config.env 里记着「build/ 是用哪个版本配置出来的」（IDF_VERSION 与各 Kconfig
+REM 路径都带版本号）。用它做一次对账：命中哪个候选就把那个候选当成首选。
+REM 这正是原来那个 bug：探测顺序是「新→旧」，于是没导出 IDF_PATH 时会挑 5.5.4，
+REM 而 build/ 是 5.4.3 配置的 ⇒ 拿另一个 IDF 去重配同一个 build/，报错或诡异重编。
+set "IDF_RECORDED=none"
+if exist "build\config.env" (
+    findstr /c:"%IDF_V3%" "build\config.env" >nul 2>&1 && set "IDF_RECORDED=%IDF_V3%"
+    findstr /c:"%IDF_V2%" "build\config.env" >nul 2>&1 && set "IDF_RECORDED=%IDF_V2%"
+    findstr /c:"%IDF_V1%" "build\config.env" >nul 2>&1 && set "IDF_RECORDED=%IDF_V1%"
+)
+
+REM ① IDF_PATH 已导出且可用 —— 用户显式指定，优先级最高
 if defined IDF_PATH if exist "%IDF_PATH%\export.bat" set "IDF_EXPORT=%IDF_PATH%\export.bat"
-if not defined IDF_EXPORT if exist "C:\esp\v5.5.4\esp-idf\export.bat" set "IDF_EXPORT=C:\esp\v5.5.4\esp-idf\export.bat"
-if not defined IDF_EXPORT if exist "D:\Espressif\frameworks\esp-idf-v5.4.4\export.bat" set "IDF_EXPORT=D:\Espressif\frameworks\esp-idf-v5.4.4\export.bat"
-if not defined IDF_EXPORT if exist "D:\Espressif\frameworks\esp-idf-v5.4.3\export.bat" set "IDF_EXPORT=D:\Espressif\frameworks\esp-idf-v5.4.3\export.bat"
+
+REM ② 与 build\config.env 记录版本一致的那个安装
+if not defined IDF_EXPORT if "%IDF_RECORDED%"=="%IDF_V3%" if exist "%IDF_C3%\export.bat" set "IDF_EXPORT=%IDF_C3%\export.bat"
+if not defined IDF_EXPORT if "%IDF_RECORDED%"=="%IDF_V2%" if exist "%IDF_C2%\export.bat" set "IDF_EXPORT=%IDF_C2%\export.bat"
+if not defined IDF_EXPORT if "%IDF_RECORDED%"=="%IDF_V1%" if exist "%IDF_C1%\export.bat" set "IDF_EXPORT=%IDF_C1%\export.bat"
+
+REM ③ 兜底：build/ 还没生成（config.env 不存在）或版本对不上时，按「新→旧」探测
+if not defined IDF_EXPORT if exist "%IDF_C1%\export.bat" set "IDF_EXPORT=%IDF_C1%\export.bat"
+if not defined IDF_EXPORT if exist "%IDF_C2%\export.bat" set "IDF_EXPORT=%IDF_C2%\export.bat"
+if not defined IDF_EXPORT if exist "%IDF_C3%\export.bat" set "IDF_EXPORT=%IDF_C3%\export.bat"
 
 if not defined IDF_EXPORT (
     echo No ESP-IDF export.bat found. Set IDF_PATH or add your install to build_idf.bat. >"build_log.txt"
@@ -29,7 +58,9 @@ if not defined IDF_EXPORT (
     exit /b 1
 )
 
-echo Using IDF export: %IDF_EXPORT% >"build_log.txt"
+REM 选中版本与记录版本都写进日志：对不上时一眼可见（不要再照日志里的
+REM "idf.py fullclean" 建议去做 —— 那是版本错配，不是缓存问题，fullclean 只会白费一次全量编译）。
+echo Using IDF export: %IDF_EXPORT%   [build/config.env recorded: %IDF_RECORDED%] >"build_log.txt"
 call "%IDF_EXPORT%" >>"build_log.txt" 2>&1
 idf.py build >>"build_log.txt" 2>&1
 echo BUILD_EXIT=%errorlevel% >>"build_log.txt"
