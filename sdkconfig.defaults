@@ -44,6 +44,39 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # the stock value and CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE is lowered instead.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 
+# ---- 采样节拍：FreeRTOS tick 从 100 Hz 提到 1000 Hz ----
+# 采样周期是 10 ms。tick=100 Hz 时一个 tick 就是 10 ms，而 sampler_task 的
+# 等待是 vTaskDelay(pdMS_TO_TICKS((delay_us + 500) / 1000))：
+#   想睡 7 ms → pdMS_TO_TICKS(7) = 1 tick = 10 ms（多睡 3 ms）
+#   想睡 3 ms → pdMS_TO_TICKS(3) = 1 tick = 10 ms（多睡 7 ms）
+# 也就是「睡多少都只能睡 10 ms 的整数倍」——10 ms 的周期里这是最粗的量化，
+# 直接表现为采样抖动（系统性地迟到，然后被追赶逻辑连打成一串）。
+# 提到 1000 Hz 后 1 tick = 1 ms，量化误差从 ±10 ms 降到 ±1 ms。
+# 代价：tick 中断频率 ×10（S3 上 1000 Hz 大约多占 <1% CPU），本项目可接受。
+CONFIG_FREERTOS_HZ=1000
+
+# ---- FatFs：**故意保持 ALLOC_PREFER_EXTRAM=y** ----
+# 结论来自源码核对（不是拍脑袋）：
+#   * ESP32-S3 的 SDMMC 不能对 PSRAM 做 DMA。sdmmc_cmd.c 的
+#     sdmmc_write_sectors() 对 PSRAM 指针只能临 heap_caps_aligned_alloc()
+#     一块 **card->csd.sector_size (=512) 字节** 的 MALLOC_CAP_DMA 内存做
+#     bounce buffer，逐扇区 memcpy 后写完再 free；申请失败就返回
+#     ESP_ERR_NO_MEM（串口只有一句 "Not enough heap memory"）。
+#   * FatFs 侧：FF_FS_TINY=0（CONFIG_FATFS_PER_FILE_CACHE=y），每个文件的
+#     扇区缓存 fp->buf[4096] 和 vfs_fat_ctx_t 里的 FATFS.win 都由
+#     ff_memalloc() 分配 → 开了 ALLOC_PREFER_EXTRAM 就在 PSRAM。
+#   * **但数据主路径不经过它们**：ff.c 的 f_write() 在
+#     "Write maximum contiguous sectors directly" 分支直接把**用户缓冲**
+#     交给 disk_write()（ff.c:4117）。只要 stdio 的缓冲是「4096 B 整数倍、
+#     写偏移扇区对齐」，FatFs 就直通，一次 bounce 都不需要。
+#     这正是 main.c 里「CSV 文件静态 stdio 缓冲」（.bss、内部 DRAM、64 B 对齐）
+#     在做的事。
+# 为什么不改成 n：那会把每个打开文件的 4096 B 缓存 + 4096 B 窗口搬到内部 RAM
+# （两个文件 ≈ 12 KiB 常驻），而本板内部 RAM 的主要矛盾恰恰是相机每帧 STREAMON
+# 需要一块 16 KiB 的**连续**内部 DMA 内存（见上面 CAM_CTRL_DVP_DMA_BUFFER_SIZE
+# 的说明）。用 12 KiB 常驻去换「偶尔的目录/FAT 窗口写」，不划算。
+# 也就是说：ALLOC_PREFER_EXTRAM 保持 y，防 bounce 靠 main.c 的静态 stdio 缓冲。
+
 # ---- Camera: OV2640 on the DVP interface, JPEG 640x480 (esp_video) ----
 # sdkconfig is gitignored, so the sensor selection MUST live here: without
 # CONFIG_CAMERA_OV2640 esp_video finds no sensor at runtime ("sensor not found")
@@ -112,7 +145,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 CONFIG_SNTP_SERVER="pool.ntp.org"
 
 # ---- 静态 IP 兜底：网段里根本没有 DHCP 服务时 ----
-# 现场实测（server/dhcp_probe.py）10.1.41.0/24 收不到任何 DHCP OFFER：
+# 现场实测（server/dhcp_probe.py）192.0.2.0/24 收不到任何 DHCP OFFER：
 # 任何新接入的客户端都拿不到 IP，固件侧的 DHCP 重启/重关联注定失败。
 # 打开后 wifi_health_check() 会给 DHCP 完整窗口（3 次重启客户端 + 1 次强制重关联，
 # 约 100 s），确认没救才停掉 DHCP 客户端套固定地址，让 SNTP 至少能对时。
