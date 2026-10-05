@@ -18,14 +18,14 @@
 
 | 假设 | 验证方法 | 结论 |
 |------|----------|------|
-| WiFi 未连上 / IP 未获取 | 串口日志 + 监视器脚本抓取 | **排除**：`WiFi connected, IP=10.1.41.111` |
+| WiFi 未连上 / IP 未获取 | 串口日志 + 监视器脚本抓取 | **排除**：`WiFi connected, IP=192.0.2.11` |
 | SNTP 未同步导致时间戳非法 | 串口日志 | **排除**：`System time set via SNTP` |
-| 板卡与电脑不在同一网段 | 解析 IP + 子网计算 | **排除**：板卡 `10.1.41.111/21`，服务端 `10.1.41.14`，同属 `10.1.40.0/21` |
-| 服务端地址配置错误 | 打印 `CONFIG_SENSOR_SERVER_URL` | **排除**：值为 `http://10.1.41.14:8000/api/v1/upload`，正确 |
+| 板卡与电脑不在同一网段 | 解析 IP + 子网计算 | **排除**：板卡 `192.0.2.11/24`，服务端 `192.0.2.10`，同属 `192.0.2.0/24` |
+| 服务端地址配置错误 | 打印 `CONFIG_SENSOR_SERVER_URL` | **排除**：值为 `http://192.0.2.10:8000/api/v1/upload`，正确 |
 | Windows 防火墙拦截入站 | 临时禁用防火墙后重测 | **排除**：行为无变化，随即恢复防火墙 |
 | 服务端 `/api/v1/upload` 路由异常 | `curl` 直接 POST 100 条样本 | **排除**：返回 `201 Created` |
 | 鉴权失败（401/403） | 核对 token 配置 | **排除**：板卡与服务端 token 均为空串，`verify_token()` 走 no-token 放行分支 |
-| 网络不通 | 板卡侧 `esp_ping` 探测服务端 IP | **排除**：`ping 10.1.41.14 success` |
+| 网络不通 | 板卡侧 `esp_ping` 探测服务端 IP | **排除**：`ping 192.0.2.10 success` |
 
 **关键转折**：上述全部排除后，抓取串口日志统计发现——
 **347 秒内 `[upload] attempt=` 出现次数为 0**。
@@ -149,6 +149,15 @@ static void log_heap(const char *tag) {
              (unsigned)free_int, (unsigned)largest);
 }
 ```
+
+> **2026-09-30 起 `[HEAP]` 行的当前格式**（`main/main.c` 的 `log_heap()`）：
+> `[HEAP] <where>  free=… min=… int_largest=… | dma_free=… dma_largest=… dma_min=… | psram=…`。
+> 新增的 DMA 口径是给 SD 写失败用的：ESP32-S3 的 SDMMC **不能对 PSRAM DMA**，
+> FATFS 的 512 B 缓冲落在 PSRAM（`CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y`）时要临时申请
+> 512 B `MALLOC_CAP_DMA` 做 bounce buffer，申请失败 → `sdmmc_write_blocks` 返回
+> `ESP_ERR_NO_MEM` → `[csv] write failed errno=5`（EIO）。`dma_free`/`dma_largest` 是
+> 瞬时值（两次采样之间也会塌），`dma_min` 是历史谷底 —— 2026-09-30 的现场
+> `dma_largest` 曾掉到 96 B，而当时内部堆总空闲还有 7 MB。
 
 埋点位置：
 

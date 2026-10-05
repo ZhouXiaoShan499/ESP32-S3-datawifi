@@ -46,7 +46,9 @@ data_capture_sim/
 │   ├── manual_capture_task_work_log.md # 按需采集任务的需求 · 交付 · 验证过程记录
 │   ├── realtime_photo_capture.md       # 实时拍照（camera 任务 + JPEG 落盘 + 画廊/删除）设计说明
 │   ├── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
-│   └── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
+│   ├── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
+│   ├── camera_bad_frame_fix_work_log.md # 相机坏帧/拍照失败治理：一轮基线 → 定位改写 → 修复 → 一轮验证（工作记录）
+│   └── camera_frame_truncation_fix_work_log.md # 直播/预览帧尾部截断（下半幅灰带/中段撕裂）：根因定位 → app 侧修复 → 真机验证（工作记录）
 │
 └── server/                        # 服务端（PC 运行，Python/FastAPI）
     ├── main.py                    # FastAPI 服务（校验 + SQLite + 查询 + 任务 + 照片 + 闭环事件接口）
@@ -315,7 +317,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/v1/upload` | 接收板端上传的传感批次（校验后入库，成功返回 201） |
+| `POST` | `/api/v1/upload` | 接收板端上传的传感批次（校验后入库，成功返回 201；响应带 `clock_synced`，`false` = 板端未对时、`ts_ms` 只是开机毫秒数） |
 | `GET` | `/api/v1/health` | 健康状态 + 汇总（总批次 / 总样本 / 设备列表 / 最近上报） |
 | `GET` | `/api/v1/devices` | 设备列表 |
 | `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本、`trigger`、`request_id`）；可选 `&trigger=manual\|periodic` 只看该来源的最近一批（页面「手动 vs 周期」对照区用） |
@@ -331,7 +333,7 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 | `GET` | `/api/v1/photos?device_id=…&limit=12` | 照片列表（新的在前；`limit` 1–200，默认 20；含 `bytes`/`width`/`height`/`size_kb`/`received_at_str`/`url`） |
 | `GET` | `/api/v1/photos/{id}` | 取一张照片的 JPEG 字节（画廊 `<img src>` 直接用它）；不存在 404，库里有行但文件被删 410 |
 | `DELETE` | `/api/v1/photos/{id}` | 删除一张照片（先删库行再删文件，返回 `file_deleted`）；重复删除 404 |
-| `POST` | `/api/v1/live?device_id=…&ts_ms=…&w=…&h=…` | 板端推一帧直播画面（**body 即 JPEG 字节**，`Content-Type: image/jpeg`）；校验 `device_id` / SOI 魔数 / 大小上限（512 KiB），成功 201 + 全局单调 `seq`；**只写内存、不落盘不入库、不建任务** |
+| `POST` | `/api/v1/live?device_id=…&ts_ms=…&w=…&h=…` | 板端推一帧直播画面（**body 即 JPEG 字节**，`Content-Type: image/jpeg`）；校验 `device_id`（与其它接口同一套字符白名单）/ SOI 魔数 / 大小上限（512 KiB）/ `ts_ms`·`w`·`h` 范围，成功 201 + 全局单调 `seq`；**只写内存、不落盘不入库、不建任务**，且内存有上限（最多 `LIVE_MAX_DEVICES`=8 台，超龄或超额时淘汰最久未推流的一台，≈4 MiB 封顶） |
 | `GET` | `/api/v1/live?device_id=…` | 直播状态：`active`（超过 `SENSOR_LIVE_TIMEOUT_S`，默认 5 s，没有新帧即 `false`）/ `seq` / `age_ms` / 分辨率 / 字节数 / 时间戳 / `devices[]`；未知设备返回 200 + `active=false` |
 | `GET` | `/api/v1/live/frame?device_id=…` | 最新一帧 JPEG 字节（页面 `<img src>` 直接用；`Cache-Control: no-store`）；从未推流 404 |
 | `POST` | `/api/v1/events/trigger` | **闭环事件：板端按键触发**。body 为 JSON（`device_id`/`source`/`kind`/`request_id`/`ts_ms`）；`request_id` 由**板端生成**并作主键，同号重传返回 200 + `idempotent=true`（同一次按键只算一条事件） |
@@ -375,8 +377,13 @@ label,timestamp_ms,accel_x,accel_y,accel_z
   与 `tasks.kind` / `tasks.duration_s`（历史任务自动按 `capture` 看待，Web 渲染不受影响）。
 - 任务超时是**惰性判定**：创建/查询/领取路径先把过期的非终态任务置 `timeout`（无后台线程，
   服务重启后状态依然自洽），过期任务也不会被 `/tasks/next` 下发。
+  `/api/v1/health` 与 `/api/v1/devices`（`pending_tasks`）这类**统计口径**也必须先扫一遍，
+  否则汇总里的「待办」会包含早已超时的任务。
 - 暂停到期同样是**惰性归零**：任何读控制状态的路径（`/api/v1/control`、`/api/v1/devices`、
   `/api/v1/tasks/{id}/applied`）先把 `paused_until` 已过的行置回「未暂停」，同样不需要后台线程。
+- 以上三种惰性判定都**改了行，所以必须 `conn.commit()`**：sqlite 在 `conn.close()` 时回滚
+  未提交事务（默认 `isolation_level=''`），漏提交时同一个连接里的 `SELECT` 看得见新值、
+  响应看着完全正确，但**磁盘上那一行从没变过**，等于每次请求都白算一遍。详见注意事项 14。
 
 ---
 
@@ -426,11 +433,29 @@ label,timestamp_ms,accel_x,accel_y,accel_z
 13. **闭环事件与动作协议共用 LCD 那条黄色状态行**：优先级为
     「动作协议 > 闭环状态 > `s_status_text`」。屏幕只有 240×240，状态栏已贴底，
     硬塞第四行会被裁掉，因此协议运行时闭环文本会被临时盖住（协议结束即恢复）。
-14. **事件状态的所有读路径都要先做惰性过期**：`pending`/`ack` 超 TTL 后的 `expired`
-    不是后台线程改的，而是**每条读取路径自己先判**（`_expire_stale_events()`）。
-    少调一处就会出现口径矛盾——实测 `/api/v1/health` 漏调时，它报「待处理 2 条」
-    而 `GET /api/v1/events` 只返回 1 条，排查时极易被误导。新增任何读 `events`
-    的接口（尤其统计类）时，务必在 `SELECT` **之前**补上这次调用。
+14. **事件/任务状态的所有读路径都要先做惰性过期**：`pending`/`ack` 超 TTL 后的 `expired`
+    不是后台线程改的，而是**每条读取路径自己先判**（`_expire_stale_events()` /
+    `_expire_stale_tasks()`）。少调一处就会出现口径矛盾——实测 `/api/v1/health` 漏调时，
+    它报「待处理 2 条」而 `GET /api/v1/events` 只返回 1 条，排查时极易被误导。
+    新增任何读 `events`/`tasks` 的接口（尤其统计类）时，务必在 `SELECT` **之前**补上这次调用。
+    另外这次判定是**写操作**，所以还必须 `conn.commit()`：漏提交时同连接的 `SELECT` 照样
+    看得见新状态、接口响应完全正常，但 `conn.close()` 会把这次 UPDATE 回滚掉，
+    磁盘上仍是旧状态（`GET /api/v1/events`、`GET /api/v1/events/status`、`/api/v1/health`
+    曾同时踩这一条）。改完用「另开一个连接直读 DB」的方式验证是否真的落库，
+    不要只看接口返回。
+15. **`SENSOR_SERVER_URL` 必须以 `/api/v1/upload` 结尾**：板端用 `server_api_url()`
+    把该后缀替换成目标路径来推导 tasks/photos/live/events 等兄弟接口地址（这样反向代理
+    前缀会被自动保留，例如 `http://host/esp/api/v1/upload` → `http://host/esp/api/v1/tasks/next`）。
+    后缀之后若还有内容（查询串、重定向目标），或该 URL 只是**恰好包含**这个子串，
+    推导结果就会与真正的上传地址不一致——表现为「上传正常、其它功能莫名失败」。
+    这种情况板端会明确禁用这些功能并在串口打
+    `cannot derive API base ...` 警告（不再静默拼到错地址上）。
+16. **两种启动方式都必须能建表**：`python main.py` 走 `serve()`（内部调 `init_db()`），
+    而 `uvicorn main:app` / `--reload` / gunicorn 只发 ASGI lifespan 事件、**不会执行 `serve()`**，
+    所以建表同时挂在 `FastAPI(lifespan=...)` 上。两者都幂等，先起的那个生效；
+    只有一个全新库上才看得出来——漏挂 lifespan 时第一个请求就是
+    `500 no such table: uploads`。新增启动期初始化（清理临时目录、起后台线程等）时，
+    请一并挂到 `_lifespan`，不要只写在 `serve()` 里。
 
 ---
 
@@ -449,7 +474,11 @@ ESP32-S3-EYE ──WiFi(局域网)──▶ 本机 PC:8000 (FastAPI + SQLite) �
    ```bash
    cd server && python main.py
    ```
-3. 板端配置 `SENSOR_SERVER_URL = http://<本机IP>:8000/api/v1/upload`，`SENSOR_DEVICE_ID` 用本组唯一标识（`idf.py menuconfig` 或改本地 `sdkconfig`）。
+   也可以交给 ASGI 服务器托管（适合反向代理 + 进程守护的部署，建表同样会自动完成，见注意事项 16）：
+   ```bash
+   cd server && python -m uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
+3. 板端配置 `SENSOR_SERVER_URL = http://<本机IP>:8000/api/v1/upload`，`SENSOR_DEVICE_ID` 用本组唯一标识（`idf.py menuconfig` 或改本地 `sdkconfig`）。**必须以 `/api/v1/upload` 结尾**（见注意事项 15）。
 4. 烧录运行，浏览器打开 `http://<本机IP>:8000/ui/` 观察实时数据。
 
 > - Windows 防火墙若拦截，需放行 `8000/TCP`（专用网络）。

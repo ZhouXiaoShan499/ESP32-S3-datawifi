@@ -48,7 +48,9 @@ data_capture_sim/                  # 仓库根目录
 │   ├── camera_live_stream.md           # 摄像头实时直播（长按 Button A → 内存最新帧 → 页面实时画面）
 │   ├── wifi_network_troubleshooting.md # WiFi 关联成功却拿不到 IP：DHCP 排查与静态兜底验证
 │   ├── static_ip_fallback_fix.md       # 静态 IP 兜底复盘：条件编译缺陷 + sdkconfig 回写陷阱
-│   └── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
+│   ├── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
+│   ├── camera_bad_frame_fix_work_log.md # 相机坏帧/拍照失败治理：一轮基线 → 定位改写 → 修复 → 一轮验证
+│   └── camera_frame_truncation_fix_work_log.md # 直播/预览帧尾部截断（下半幅灰带/中段撕裂）：根因 → 修复 → 验证
 │
 └── server/                        # 服务端（PC 上运行，Python/FastAPI）
     ├── main.py                    # FastAPI 服务（约 2600 行：接收 + 存储 + 查询 + 任务 + 照片 + 闭环事件）

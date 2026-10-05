@@ -136,7 +136,10 @@ Web 远端显示 ……▶  GET  /api/v1/events
 
 没有 VPS 时，板端与服务端同处一个局域网，服务地址就是电脑的局域网 IP，
 下面的接口与 `SENSOR_SERVER_URL` 里配的 `/api/v1/upload` 自动同源
-（板端用 `server_api_url()` 从上传 URL 推导 base，不需要额外配置）。
+（板端用 `server_api_url()` 从上传 URL 推导 base，不需要额外配置；
+**前提是该 URL 以 `/api/v1/upload` 结尾**——反向代理前缀会被保留，
+但后缀之后不能再有查询串等内容，否则板端会禁用这些接口并打
+`cannot derive API base ...` 警告，见 README 注意事项 15）。
 
 ### 4.1 `POST /api/v1/events/trigger` （板端 → 服务端）
 
@@ -202,6 +205,10 @@ Web 远端显示 ……▶  GET  /api/v1/events
 > 仍是 `pending`"的事件算进待处理，出现 **health 说「待处理 2 条」、而
 > `GET /api/v1/events` 只返回 1 条** 的自相矛盾。惰性过期要求**每一条读路径**都先过期，
 > 少一条就会在汇总口径上露馅。
+> ⚠ 而且这一步是**写操作**：调完必须 `conn.commit()`。sqlite 在 `conn.close()` 时回滚
+> 未提交事务，而同一个连接里的 `SELECT` 看得见未提交的 UPDATE —— 于是漏提交时**接口
+> 返回值完全正常、磁盘上那一行却仍是 `pending`**，是最难发现的一类"静默失效"。验证时
+> 请另开一个连接直读 `events.status`，不要只看响应。
 
 ---
 

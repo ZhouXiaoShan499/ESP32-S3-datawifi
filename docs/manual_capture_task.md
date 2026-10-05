@@ -129,7 +129,8 @@
 
 // 201 Created（首次） / 200 OK（同一 request_id 重放，idempotent=true 且不写样本）
 {"code": "OK", "ok": true, "upload_id": 42, "request_id": "8f3c…",
- "trigger": "manual", "idempotent": false, "sample_count": 100}
+ "trigger": "manual", "idempotent": false, "sample_count": 100,
+ "clock_synced": true}      // false = 板端 ts_ms 看起来未对时（见 §4.2「时间戳与新鲜度判据」）
 ```
 
 控制任务（`kind=pause` / `kind=resume`）——不产生任何上传，靠板端 `/applied` 收尾：
@@ -217,7 +218,7 @@
 |----|----|------|
 | 任务名 | `task_poll` | 优先级 3、栈 8192 B（HTTP + cJSON 需要） |
 | 轮询周期 | `TASK_POLL_INTERVAL_MS` = 3000 ms | 仅在 WiFi 已连接时轮询 |
-| 地址推导 | `server_api_url()` | 把 `CONFIG_SENSOR_SERVER_URL` 结尾的 `/api/v1/upload` 换成目标路径；后缀不匹配则**禁用轮询**，避免往错误地址发请求 |
+| 地址推导 | `server_api_url()` | 把 `CONFIG_SENSOR_SERVER_URL` 结尾的 `/api/v1/upload` 换成目标路径；后缀必须**位于 URL 末尾**（反向代理前缀会被保留，后缀之后有查询串等则判定失败），不匹配则**禁用轮询**并打 `cannot derive API base` 警告，避免往错误地址发请求 |
 
 `task_poll_task` 的处理顺序：`MANUAL_ERROR` → 上报失败回执；非 `IDLE` → 采集/上传进行中，不领新任务；
 重试未送达的 `applied` 回执（有界）；`IDLE` → `GET /tasks/next`（`?device_id=` 用
@@ -258,6 +259,12 @@ if (!manual_tick && !periodic_paused && s_wifi_connected) {
   闸门"由关变开"即视为新会话（`s_sample_count = 0` → 重新锚定）。否则板子空闲时被任务唤起会沿用上一次会话的
   样本序号，时间戳落到过去，被服务端以 `ts_ms is older than the task creation time` 拒收（实测复现并已修，见
   `docs/manual_capture_task_work_log.md` §7.4）。
+- **时间戳与新鲜度判据**（与上一条同源但原因不同）：服务端只在 `ts_ms` 看起来是**真实 epoch**
+  （≥ `EPOCH_SANE_MS` = `1600000000000`，即 2020-09-13）时才做 `ts_ms < 任务创建时间 - 5 s` 的回放检查。
+  板端 SNTP 没成功时 `gettimeofday()` 只是「开机毫秒数」，拿它跟任务创建时间比大小恒为「陈旧」，会把
+  「这个现场没有可用 NTP」误判成「板端上传了旧数据」（400 + 任务 `failed`，而板端收到 4xx 就不再重试）。
+  现在这种上传按正常批次入库，响应里 `clock_synced=false`，页面/脚本据此提示「板端未对时」。
+  防回放能力没有降级：时钟可信但批次确实陈旧时仍然 400。
 - `rate_hz < 100` 时按 `period_ticks = 100 / rate_hz` 抽点（如 10 Hz 即每 10 拍取一个点）。
 - 批次填满后**非阻塞**入队（`xQueueSend(..., 0)`）：队列满就在下一拍重试，绝不阻塞 10 ms 采样循环；
   直到本地 deadline（理论采集时长 ×2 + 5 s）仍失败才判失败。
@@ -298,7 +305,7 @@ typedef struct {
 ### 4.5 日志样例
 
 ```
-I (12345) app: [task] polling http://10.1.41.14:8000/api/v1/tasks/next?device_id=esp32s3-eye-0001 every 3000 ms
+I (12345) app: [task] polling http://192.0.2.10:8000/api/v1/tasks/next?device_id=esp32s3-eye-0001 every 3000 ms
 I (15346) app: [task] accepted 8f3c…: 100 samples @ 100 Hz
 I (15347) app: [task] capturing 8f3c…
 I (16350) app: [task] captured 100 samples for 8f3c…
