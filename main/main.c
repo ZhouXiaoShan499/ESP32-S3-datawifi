@@ -70,6 +70,10 @@
 #include "jpeg_decoder.h"      /* esp_jpeg 软解：把 JPEG 解成 RGB565（本地 LCD 预览用） */
 #include <stdlib.h>
 #include "freertos/queue.h"
+/* 相机 mmap 缓冲在 PSRAM（esp_video 用 MALLOC_CAP_SPIRAM|CACHE_ALIGNED 分配），
+ * 在「还给驱动之前把缓冲写 0」时必须做 C2M cache 同步（见 camera_wipe_map_locked()）。 */
+#include "esp_cache.h"
+#include "esp_memory_utils.h"
 
 /* ================================================================
  *  Common Config
@@ -194,10 +198,51 @@
 #define PHOTO_API_PATH           "/api/v1/photos"
 #define PHOTO_HTTP_TIMEOUT_MS    20000    /* 一帧 JPEG（数十 KB）上传上限 */
 #define PHOTO_RESP_BUF_LEN       512      /* 只看状态码，响应体只收一小段 */
-#define CAMERA_BUFFER_COUNT      2        /* V4L2 mmap 缓冲数（PSRAM） */
-#define CAMERA_FRAME_SKIP_MAX    8        /* 跳过坏帧（V4L2_BUF_FLAG_ERROR）上限 */
-#define CAMERA_DQBUF_TIMEOUT_MS  3000     /* 单帧等待上限（VIDIOC_S_DQBUF_TIMEOUT） */
-#define CAMERA_LOCK_TIMEOUT_MS   5000     /* 等相机锁上限（直播 vs 单帧拍照串行化） */
+/* 相机采集参数（详见下方「Camera — 持久会话」一节）。
+ *   CAMERA_BUFFER_COUNT      : V4L2 mmap 缓冲数。3 = 驱动手里至少有一个可写缓冲，
+ *                              我们的消费端（HTTP 上传 / JPEG 软解）慢一拍也不会让
+ *                              DVP 空转；DVP 一空转，下一帧就从半帧开始（NO-SOI），
+ *                              要等驱动内部重试 —— 串口上表现为随机坏帧。
+ *   CAMERA_WARMUP_FRAMES     : 新会话刚 STREAMON 后主动丢掉的帧数。驱动自己会做
+ *                              SOI/EOI 校验，这里再丢两帧只是保险（而且会记下
+ *                              「有没有白丢好帧」，见 warmup_dropped_good）。
+ *   CAMERA_DQBUF_TIMEOUT_MS  : 单帧拍照的 DQBUF 上限（宁等 3 s，也别让「拍一张
+ *                              照片」失败）。
+ *   CAMERA_DQBUF_TIMEOUT_LIVE_MS : 直播 / 本地预览的上限（坏帧就快速失败重试，
+ *                              不把 500 ms 的推流节拍拖死）。
+ *   CAMERA_SESSION_IDLE_MS   : 这么久没人取帧就关会话（STREAMOFF + munmap + close）。 */
+#define CAMERA_BUFFER_COUNT          3
+#define CAMERA_FRAME_SKIP_MAX        8
+#define CAMERA_WARMUP_FRAMES         2
+#define CAMERA_DQBUF_TIMEOUT_MS      3000
+#define CAMERA_DQBUF_TIMEOUT_LIVE_MS 800
+#define CAMERA_SESSION_IDLE_MS       2000
+#define CAMERA_LOCK_TIMEOUT_MS       5000
+#define CAMERA_DIAG_FRAMES           3    /* 会话前几帧打印诊断（flags/bytesused/SOI） */
+/* 坏帧兜底与重同步（2026-09-29；机制见 camera_resync_locked() 的注释与
+ * docs/realtime_photo_capture.md §三·补二）：
+ *   CAMERA_RESYNC_POLL_MS    : 排空驱动 done 列表时下发的 DQBUF 上限。0 = 非阻塞
+ *                              （esp_video_set_dqbuf_timeout()：0 ms → ticks = 0 →
+ *                               xSemaphoreTake(sem, 0)，**不是** portMAX_DELAY）。
+ *   CAMERA_RESYNC_MAX_FRAMES : 一次排空最多回收几个缓冲（缓冲数 3，留 1 个余量）。
+ *   CAMERA_SOFT_FAIL_LIMIT   : 连续这么多次「没取到可用帧」才关会话重建 ——
+ *                              关会话（STREAMOFF + close）本身正是制造 done 列表残留
+ *                              元素的那一步（见 camera_resync_locked），能不关就不关。
+ *   CAMERA_JPEG_MIN_BYTES    : 兜底接受驱动 ERROR 帧时，自校验出的 JPEG 至少这么大；
+ *                              小于它一律当垃圾丢掉，绝不把半帧当图收下。
+ *
+ * 2026-09-30 真机实测（本机一轮 250 s 串口抓取，8 个 kind=camera 任务
+ * + 90 s kind=preview）：**驱动对每一帧都报 used=0**（含每次会话的头两帧暖机帧），
+ * 而同一块映射缓冲里自校验都能找到一整帧 JPEG（8927/8893/…/9028 B），
+ * 且 0 次 NO-SOI / NO-EOI / RX-DA OVF —— 即 DVP 交回的元素与「真正装了这一帧的
+ * 元素」不是同一个（done 列表里排着 valid_size=0 的元素，数据却已写进缓冲）。
+ * 结论：`used=0` 是**本传感器配置下的常态**，不是偶发残留。于是「拍照模式不做兜底」
+ * 等于拍照 100% 失败（8/8 任务），故拍照也启用兜底，只多一道新鲜度闸门
+ * （见 camera_jpeg_hash()）。 */
+#define CAMERA_RESYNC_POLL_MS        0
+#define CAMERA_RESYNC_MAX_FRAMES     4
+#define CAMERA_SOFT_FAIL_LIMIT       3
+#define CAMERA_JPEG_MIN_BYTES        1024
 
 /* 相机 XCLK 频率：必须 20 MHz。
  * BSP 的 bsp_camera_start() 把 XCLK 写死成 BSP_CAMERA_XCLK_CLOCK_MHZ(=16 MHz)，
@@ -220,15 +265,48 @@
 #define LIVE_HTTP_TIMEOUT_MS     8000     /* 单帧上传上限（比单帧拍照短，避免拖慢节拍） */
 #define LIVE_FAIL_LIMIT          5        /* 连续失败上限 → 自动停止推流并记日志 */
 #define LIVE_TASK_STACK          8192     /* HTTP + 一帧 JPEG 拷贝 + LVGL 刷新 */
-#define LIVE_TASK_PRIORITY       2        /* 低于 sampler(5)/uploader(4)/task_poll(3) */
+#define LIVE_TASK_PRIORITY       2        /* 低于 sampler(8)/uploader(4)/task_poll(3) */
+
+/* ================================================================
+ *  CSV 落盘缓冲 / 刷盘策略
+ *
+ *  背景（现场故障，见 docs 的 SD 写失败分析）：ESP32-S3 的 SDMMC 控制器
+ *  **不能对 PSRAM 做 DMA**（SOC_SDMMC_PSRAM_DMA_CAPABLE=0）。一旦
+ *  sdmmc_write_sectors() 收到 PSRAM 指针，它只能临时 heap_caps_aligned_alloc()
+ *  一块 512 B 的内部 DMA 内存做 bounce buffer，写完再 free。
+ *
+ *  而 FatFs 的缓冲区默认放在 PSRAM（CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y），
+ *  所以「每采一个点就 fprintf + fflush」= 每秒 100 次 512 B 的内部 DMA
+ *  申请/释放。内部 DMA 堆被相机（每帧 16 KB 连续块）切碎后，某一次申请失败
+ *  就返回 FR_DISK_ERR → fprintf 返回 -1 → 原来的代码立刻 stop_collection()，
+ *  整段录制报废，串口只留下一句 "Not enough heap memory" / "CSV write failed"。
+ *
+ *  对策分两层：
+ *   1) 每个 CSV FILE* 挂一块**静态 .bss 的 4096 B 内部 RAM 缓冲**（天然的
+ *      内部、DMA-capable、64 B 对齐）。stdio 攒满 4096 B 再下发，FatFs 直接
+ *      从内部 RAM 走 Sdmmc 的直通 DMA 路径（一条 CMD25 写 8 个扇区），
+ *      **一次 bounce 申请都不需要**，SD 命令数还少 8 倍。
+ *   2) 把「每点 fflush」改成**按时间刷盘**：单扇区写的尾延迟（SD 卡内部
+ *      GC/磨损均衡时可达 50~200 ms）远大于 10 ms 的采样周期，它本身就是
+ *      采样抖动源之一。每秒 100 次写降到 ~2 次。
+ * ================================================================ */
+#define CSV_IO_BUF_SIZE        4096    /* 必须 ≥512 且为 512 的整数倍 */
+#define CSV_IO_BUF_COUNT       2       /* 同时最多两个 CSV 文件：数据文件 + calibration.csv
+                                        * （stand/jump 的 *data_file 与 s_data_file 互为别名，
+                                        *  见 start_stand/jump_protocol_locked 里的 s_data_file = ...） */
+#define CSV_FLUSH_INTERVAL_MS  500     /* 按时间刷盘间隔：掉电最多丢 500 ms（协议阶段切换点仍立即刷） */
+#define CSV_WRITE_FAIL_LIMIT   20      /* 连续这么多个采样周期写失败才停采集（20×10 ms = 200 ms） */
+#define CSV_FLUSH_RETRY        3       /* 一次刷盘失败时在同一 tick 内立刻重试的次数 */
 
 /* Device identity / server URL come from Kconfig (see Kconfig.projbuild).
- * Fallbacks keep the code compiling if the config header is stale. */
+ * Fallbacks keep the code compiling if the config header is stale -- keep them
+ * as harmless placeholders: a real LAN address committed here would stay in the
+ * git history forever (the same reason WIFI_SSID's default is a placeholder). */
 #ifndef CONFIG_SENSOR_DEVICE_ID
 #define CONFIG_SENSOR_DEVICE_ID "esp32s3-eye-0001"
 #endif
 #ifndef CONFIG_SENSOR_SERVER_URL
-#define CONFIG_SENSOR_SERVER_URL "http://10.1.41.14/api/v1/upload"
+#define CONFIG_SENSOR_SERVER_URL "http://192.0.2.10:8000/api/v1/upload"   /* 192.0.2.0/24 = RFC 5737 doc range */
 #endif
 #ifndef CONFIG_SENSOR_TOKEN
 #define CONFIG_SENSOR_TOKEN ""    /* empty = no auth (LAN debugging only) */
@@ -237,8 +315,10 @@
 /* 6-face calibration config */
 #define FACE_DURATION_SEC        10       /* Each face: 10 seconds */
 #define FACE_DURATION_MS         (FACE_DURATION_SEC * 1000)
-#define STATIONARY_THRESHOLD     0.5f     /* m/s² - max variance to be considered stationary */
-#define STATIONARY_SAMPLES       50       /* Number of samples to check for stationary */
+/* 这里原有 STATIONARY_THRESHOLD / STATIONARY_SAMPLES 两个宏（配合 check_stationary()
+ * 做「静止判定」）。该函数没有任何调用点、其缓冲也没有读方，编译时只剩
+ * "-Wunused-variable" 告警，故整组一起删除；若日后要把「先确认静止再采校准数据」
+ * 接进 start_calibration_locked()，可从 git 历史里取回这组实现。 */
 
 /* Stand action protocol config */
 #define STAND_PREP_DURATION_SEC           3    /* 3s prep: hold stand pose */
@@ -344,14 +424,87 @@ static const char *TAG = "imu_logger";
  *   int_largest = biggest single contiguous INTERNAL block; this is what
  *                 WiFi/i2c actually need, and it shrinks with
  *                 fragmentation long before "free" looks alarming.
+ *   dma_free / dma_largest = the heap the SDMMC driver actually needs.
+ *                 ESP32-S3 的 SDMMC **不能对 PSRAM DMA**，写一个 PSRAM 指针
+ *                 必须临时申请 512 B 的 MALLOC_CAP_DMA 做 bounce buffer
+ *                 （见 sdmmc_cmd.c 的 sdmmc_write_sectors / esp_dma_capable_malloc）。
+ *                 这个申请失败时串口只有一句 "dma_utils: Not enough heap memory"，
+ *                 和 int_largest 看起来完全对不上号——因为 int_largest 是
+ *                 INTERNAL 整个capability的最大块，而失败的是它内部 DMA 子集。
+ *                 dma_largest 一旦掉到几百字节，SD 写就开始随机失败。
+ *   dma_min   = DMA 子堆的低水位（历次最小值）。SD 写失败的判据就是它：
+ *               dma_free/dma_largest 是「此刻」的瞬时值，采样间隔里也可能塌下去，
+ *               而 dma_min 记的是曾经到过的谷底（2026-09-30 的 errno=5 现场
+ *               就是 dma_largest 掉到 96 B 时发生的）。
+ *   psram_free = PSRAM 总空闲（相机帧缓冲 / LVGL 池在这里）
  * ------------------------------------------------------------------ */
 static void log_heap(const char *where)
 {
-    ESP_LOGI(TAG, "[HEAP] %-22s free=%6u  min_free=%6u  int_largest=%6u",
+    ESP_LOGI(TAG, "[HEAP] %-22s free=%6u min=%6u int_largest=%6u | dma_free=%6u"
+                  " dma_largest=%5u dma_min=%5u | psram=%7u",
              where,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* ================================================================
+ *  CSV 文件静态 stdio 缓冲
+ *
+ *  setvbuf() 挂进来的缓冲必须活到 fclose() 为止，所以只能静态分配（.bss 天然
+ *  在内部 DRAM → 天然 DMA-capable）。newlib 的 FILE 里没有回指缓冲的字段，
+ *  所以这里用 owner 表记录「哪块静态缓冲当前归哪个 FILE*」，关闭时归还槽位。
+ *
+ *  注意：所有调用点都在 s_state_mutex 保护下（协议的 start/stop 与采样写盘
+ *  同一把锁），因此这里不需要额外加锁。
+ * ================================================================ */
+static uint8_t s_csv_io_buf[CSV_IO_BUF_COUNT][CSV_IO_BUF_SIZE] __attribute__((aligned(64)));
+static FILE *s_csv_io_owner[CSV_IO_BUF_COUNT];
+
+/* 给 CSV 文件挂静态内部 RAM 缓冲。失败只告警，退回默认缓冲（功能不受影响）。 */
+static void csv_io_attach(FILE *f)
+{
+    if (!f) {
+        return;
+    }
+    for (int i = 0; i < CSV_IO_BUF_COUNT; i++) {
+        if (s_csv_io_owner[i] == f) {
+            return;                       /* 已挂过 */
+        }
+    }
+    for (int i = 0; i < CSV_IO_BUF_COUNT; i++) {
+        if (s_csv_io_owner[i] == NULL) {
+            if (setvbuf(f, (char *)s_csv_io_buf[i], _IOFBF, CSV_IO_BUF_SIZE) == 0) {
+                s_csv_io_owner[i] = f;
+            } else {
+                ESP_LOGW(TAG, "[csv_io] setvbuf failed, keeping default stdio buffer");
+            }
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "[csv_io] static buffer pool exhausted, keeping default stdio buffer");
+}
+
+/* fclose() + 归还静态缓冲槽位。**必须先 fclose 再归还**：fclose 内部要把
+ * 残留数据刷出去，那一刻缓冲还得算在这个 FILE 名下（静态内存不会被 free，
+ * 顺序其实都安全，但先关后还更不容易出错）。 */
+static void csv_fclose(FILE **pf)
+{
+    if (!pf || !*pf) {
+        return;
+    }
+    FILE *f = *pf;
+    *pf = NULL;
+    fclose(f);
+    for (int i = 0; i < CSV_IO_BUF_COUNT; i++) {
+        if (s_csv_io_owner[i] == f) {
+            s_csv_io_owner[i] = NULL;
+        }
+    }
 }
 
 /* ================================================================
@@ -378,7 +531,10 @@ static bool s_ui_ready = false;
 /* State variables */
 static bool s_sd_ready;
 static bool s_collecting;
-static bool s_wifi_connected;
+/* 跨任务读写：WiFi 事件任务写，sampler / live / task_poll / loop 读。
+ * 与 s_live_streaming / s_wifi_link_up 同口径加 volatile —— 编译器不能把它缓存进
+ * 寄存器，否则各任务里的轮询循环可能永远看不到状态变化（关联成功却还在等 IP）。 */
+static volatile bool s_wifi_connected;
 static bool s_time_synced;
 static FILE *s_data_file;
 static float s_latest_accel_x;
@@ -476,13 +632,6 @@ static int64_t s_face_start_time_ms = 0;
 static FILE *s_calibration_file = NULL;
 static char s_face_name[16] = "IDLE";
 
-/* Stationary detection */
-static float s_stationary_buffer_x[STATIONARY_SAMPLES];
-static float s_stationary_buffer_y[STATIONARY_SAMPLES];
-static float s_stationary_buffer_z[STATIONARY_SAMPLES];
-static uint32_t s_stationary_index = 0;
-static bool s_stationary_ready = false;
-
 /* Calibration mode accumulators */
 static float s_calib_sum_x[7] = {0};  /* Index by face enum */
 static float s_calib_sum_y[7] = {0};
@@ -529,7 +678,6 @@ static char s_stairs_display[64] = "Stairs: IDLE";    /* UI display text */
 static bool s_stairs_protocol_active = false;          /* Is stairs protocol running? */
 static int s_stairs_duration_sec = 25;                 /* Current stairs duration (20-30s) */
 static int s_stairs_interval_sec = 60;                 /* Current stairs interval (60s) */
-static FILE *s_stairs_data_file = NULL;                /* Current group data file */
 
 /* Bend action protocol state */
 #define BEND_PREP_DURATION_SEC    3        /* 3s prep: hold bend pose */
@@ -549,8 +697,6 @@ static char s_bend_display[64] = "Bend: IDLE";      /* UI display text */
 static bool s_bend_protocol_active = false;          /* Is bend protocol running? */
 static int s_bend_duration_sec = 25;                 /* Current bend duration (20-30s) */
 static int s_bend_interval_duration_sec = 60;        /* Current interval duration (60-90s) */
-static char s_bend_file_path[FILE_PATH_LEN];         /* Current group file path */
-static FILE *s_bend_data_file = NULL;                /* Current group data file */
 
 /* Jump action protocol state */
 #define JUMP_PREP_DURATION_SEC    3        /* 3s prep: hold jump pose */
@@ -592,8 +738,6 @@ static char s_fall_display[64] = "Fall: IDLE";      /* UI display text */
 static bool s_fall_protocol_active = false;          /* Is fall protocol running? */
 static int s_fall_duration_sec = 5;                  /* Current fall duration (5-10s) */
 static int s_fall_interval_duration_sec = 15;        /* Current interval duration (15-30s) */
-static char s_fall_file_path[FILE_PATH_LEN];         /* Current group file path */
-static FILE *s_fall_data_file = NULL;                /* Current group data file */
 
 /* Forward declaration */
 static void refresh_ui(void);
@@ -1005,16 +1149,39 @@ static void wifi_init_sta(void)
                                                         &wifi_event_handler,
                                                         NULL, NULL));
 
+    /* 认证门槛保持 WPA2_PSK（2026-10-05 现场实测修正）：
+     * 现场热点实测是纯 WPA2-PSK，16:43 的串口日志为证（SSID/BSSID 已脱敏，
+     * 真实值只留在本机那份 git-ignored 的 sdkconfig 里）：
+     *     wifi:connected with <ssid>, aid = 1, channel 6, BW20,
+     *     bssid = <bssid>
+     *     wifi:security: WPA2-PSK, phy: bgn, rssi: -43
+     * （整段日志里一条 reason= 都没有。）
+     *
+     * 这里**不能**抬到 WIFI_AUTH_WPA2_WPA3_PSK：IDF 的强度表
+     * （esp_wifi_types_generic.h:80-82）是
+     *     OPEN < WEP < WPA_PSK < OWE < WPA2_PSK = WPA_WPA2_PSK
+     *     < WAPI_PSK < WPA3_PSK = WPA2_WPA3_PSK < DPP
+     * 即 WPA2_WPA3_PSK 属于 WPA3 档；而 threshold.authmode 的语义是
+     * 「fast scan 里可接受的**最弱**认证」（esp_wifi_types_generic.h:364）。
+     * 门槛设到 WPA3 档 = 要求 AP 至少是 WPA2/WPA3 混合，纯 WPA2 的热点反而
+     * 低于门槛，可能在扫描阶段就被判成「同名 AP 但安全不兼容」。WPA2-only 的
+     * AP 就用 WPA2_PSK；只有确认 AP 广播 WPA2/WPA3 混合时才换成混合值。
+     *
+     * pmf_cfg.capable=true 只把 STA 的 MFPC 能力写进 RSN IE（required=false
+     * = 不强制），纯 WPA2 的老 AP 照旧可连，保留它没有副作用。
+     * S3 的 SAE 支持来自 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y（sdkconfig 已开）。 */
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = { .capable = true, .required = false },
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi auth threshold: WPA2_PSK + PMF capable");
 
     /* 关掉 modem sleep：本项目是持续取样 + 周期上传 + 500 ms 推流，
      * 省电没有意义；而默认的 WIFI_PS_MIN_MODEM 会让 RTT 抖动到 200 ms 以上
@@ -1409,11 +1576,11 @@ static esp_err_t app_accel_read(float *out_x, float *out_y, float *out_z)
  *  XCLK 由本文件自己起 20 MHz（见 app_camera_init()），不用 bsp_camera_start()
  *  —— BSP 把它写死成 16 MHz，OV2640 的 JPEG 格式表会因此出不了完整帧。
  *
- *  运行路径（每次拍照都重新 open/close 设备，只在开机时初始化一次硬件）：
- *    open(BSP_CAMERA_DEVICE) → VIDIOC_G_FMT 确认当前是 JPEG
- *    → VIDIOC_S_FMT（宽高必须与传感器当前格式完全一致，DVP 设备会校验）
- *    → REQBUFS / QUERYBUF / mmap / QBUF → STREAMON → DQBUF 取一帧
- *    → STREAMOFF / munmap / close；JPEG 立即拷到堆（PSRAM）再由 http 上传。
+ *  运行路径：设备只 open / REQBUFS / STREAMON 一次（= 一个「采集会话」），
+ *  之后每次取帧只做 DQBUF → 拷贝 → 立刻 QBUF 归还，会话空闲
+ *  CAMERA_SESSION_IDLE_MS 后才 STREAMOFF / munmap / close。
+ *  为什么不再「每帧 open→STREAMON→DQBUF→STREAMOFF」：那正是随机坏帧
+ *  （flags=0x41、bytesused=0）的来源，根因与修法见下面「持久会话」一节。
  *  帧缓冲由 esp_video 在 PSRAM 上按 640x480x8bit ≈ 300 KB/缓冲 分配，
  *  相机不占用采样器，也不影响周期上报。
  * ================================================================ */
@@ -1535,81 +1702,274 @@ static esp_err_t app_camera_init(void)
     return ESP_OK;
 }
 
-/* 拍一帧 JPEG。成功时 out->data 由调用方用 jpeg_frame_free() 释放。 */
-static esp_err_t app_camera_capture_jpeg(jpeg_frame_t *out)
+/* ================================================================
+ *  相机采集 —— 持久会话（一次 open / STREAMON，多帧复用）
+ *
+ *  旧实现是「每次取帧都 open → REQBUFS → STREAMON → DQBUF 一帧 →
+ *  STREAMOFF → close」。它能出图，但有一个**源码级的竞态**：
+ *  DVP 控制器在 STREAMON 之后是按 VSYNC 连续采样的。我们拿到第 1 帧时，
+ *  硬件已经在往第 2 个缓冲里写第 2 帧了；此时我们 STREAMOFF，而
+ *  esp_video 的 esp_video_stop_capture() 会做：
+ *      video->ops->stop()      // 停 DVP
+ *      → 清空 stream->ready_sem
+ *      → TAILQ_INIT(&stream->done_list)        // 丢掉所有「已完成」元素
+ *      → esp_video_buffer_reset(stream->buffer) // 元素标回 free 且 valid_size = 0
+ *  如果第 2 帧的完成回调（dvp_video_on_trans_finished →
+ *  esp_video_done_buffer → esp_video_done_element，注意 done_element 只要求
+ *  元素是 free）赶在 buffer_reset() 之后落地，这个元素就会被塞进**下一次
+ *  会话**的 done_list，并且带着上一轮或已被清零的 valid_size。于是下一次
+ *  取帧可能拿到：
+ *    - 上一轮的旧帧（内容错，但看着「成功」——最坏的情况，静默错数据）；
+ *    - 或被 reset 清零的元素 → DQBUF 返回
+ *      flags = V4L2_BUF_FLAG_MAPPED | V4L2_BUF_FLAG_ERROR (0x41)、bytesused = 0，
+ *      也就是串口上那条 "[photo] dropping bad frame flags=0x41"。
+ *  每帧都开关一次设备，等于把这枚骰子每帧掷一次 —— 这正是「直播时随机
+ *  坏帧 / 偶发旧帧」的机制。
+ *
+ *  改成**持久会话**后，一个会话只 open / REQBUFS / STREAMON 一次，
+ *  之后每次取帧只做 DQBUF → 拷贝 →（立刻）QBUF 归还；空闲
+ *  CAMERA_SESSION_IDLE_MS 后才由 housekeeping_task 关掉（放掉 DVP + mmap）。
+ *  三条配套铁律：
+ *    1) 好帧也必须**先拷贝、再立刻 QBUF 归还**：驱动只有在 queued 队列非空时
+ *       才继续接收下一帧；还晚了硬件就空转，下一帧从半帧开始（NO-SOI），要
+ *       等驱动内部重试 —— 同样表现为随机坏帧。归还靠前，坏帧自然消失。
+ *    2) 缓冲数 3：消费端是 HTTP 上传 / JPEG 软解，慢一拍也不至于饿死 DVP。
+ *    3) 锁（s_camera_mutex）只在「取帧」期间持有，HTTP 上传不占锁 ——
+ *       直播与按需拍照照旧互不长时间阻塞。
+ *  日志上配套给出诊断：每条会话 open/close 一行，前 CAMERA_DIAG_FRAMES 帧
+ *  打印 V4L2 flags/bytesused/缓冲头 4 字节（判断 SOI=FF D8 FF）与等待时间，
+ *  坏帧单独一行；遇到 0 字节元素还会打 `resync(...)`（排空了几个残留元素）与
+ *  `salvaged ERROR frame ...`（自校验救回来的帧）。这样「是不是相机问题」不再靠猜。
+ *
+ *  2026-09-29 补：`used=0 / flags=0x41` 这类坏帧还有一个 app 侧就能自愈的来源 ——
+ *  REQBUFS 不重置驱动 stream->done_list（残留元素会被当成「已完成」交回），而旧代码
+ *  「一失败就关会话」恰好就是制造这些残留的动作，两者叠加成自持的 0 字节帧循环。
+ *  改动与机制见 `camera_resync_locked()` 上方那段注释（A/B/C 三层）。
+ * ================================================================ */
+typedef struct {
+    int      fd;                          /* <0 = 会话未建立 */
+    uint32_t buf_count;                   /* 驱动实际给到的 mmap 缓冲数 */
+    bool     streaming;
+    uint8_t *map[CAMERA_BUFFER_COUNT];
+    size_t   map_len[CAMERA_BUFFER_COUNT];
+    uint32_t width;
+    uint32_t height;
+    int      dqbuf_timeout_ms;            /* 当前已下发的 DQBUF 上限 */
+    int      warmup_left;                 /* 还要丢几帧（仅新会话 > 0） */
+    uint32_t frames;                      /* 本会话成功取到的帧数 */
+    uint32_t bad_frames;                  /* 本会话丢掉的坏帧数（驱动报 ERROR） */
+    uint32_t warmup_dropped_good;         /* 暖机期被丢掉的「其实是好帧」的个数 */
+    uint32_t soft_fail_streak;            /* 连续多少次没取到可用帧（软失败，决定要不要重建会话） */
+    uint32_t resyncs;                     /* 本会话做过几次 done 列表重同步（排空残留元素） */
+    uint32_t salvaged;                    /* 本会话有多少帧是「纠错兜底」救回来的（坏帧自校验通过） */
+    uint32_t stale_frames;                /* 本会话有多少个元素「不属于本会话」（userptr 与 mmap 表对不上） */
+    uint32_t bogus_len_frames;            /* 本会话有多少帧长度越界（> map_len，野值，如 0xFFFFE19F = -7777） */
+    uint32_t dup_drops;                   /* 本会话有多少个「拍照兜底候选」因与上一张照片逐字节相同被丢弃 */
+    int64_t  opened_us;
+} camera_session_t;
+
+static camera_session_t s_cam = { .fd = -1 };   /* 受 s_camera_mutex 保护 */
+static int64_t s_cam_last_use_us  = 0;          /* 最后一次取帧时刻（空闲回收用） */
+static bool    s_cam_timeout_warned = false;    /* S_DQBUF_TIMEOUT 不支持只告警一次 */
+
+/* 诊断：打印一帧的 V4L2 元数据 + 缓冲头 4 字节（FF D8 FF = JPEG SOI）。
+ *
+ * 三个新字段的判读：
+ *   userptr —— MMAP 模式下驱动会把 element->buffer 回填进这里
+ *               （esp_video_ioctl.c:204-207），而 mmap() 返回的正是同一个指针
+ *               （esp_video_mman.c → esp_video_get_element_index_payload()）。
+ *               所以 owner=y（userptr == 本会话 map[idx]）⇒ 元素确实属于本会话；
+ *               owner=N ⇒ done 列表里混进了上一次会话/已销毁缓冲对象的元素，
+ *               它的 index/bytesused 读的都是别人的内存，一律不可信。
+ *   cap     —— 本会话该缓冲的映射长度（307200）。bytesused 必须 ≤ cap：
+ *              驱动能写出 0xFFFFE19F(= 4294959519 = -7777) 这种野长度的原因是
+ *              trans->buflen = ELEMENT_SIZE(element) = element->video_buffer->info.size
+ *              （esp_video_buffer.h:22、esp_video_dvp_device.c:158）：残留元素的
+ *              video_buffer 已被释放/复用 ⇒ buflen 变野值 ⇒ esp_cam_ctlr_dvp_cam.c:754-758
+ *              以 buflen 为界的夹取全部失效 ⇒ dvp_calculate_jpeg_size() 从远超缓冲的
+ *              偏移上扫回一个「长度」，经 element->valid_size 交给 DQBUF。
+ *   归属与长度两条检查的分工：owner 只用来**记账/诊断**（地址可能复用，会误判），
+ *   真正拦死野值的是 bytesused ≤ cap —— 见 camera_grab_locked() 里的 usable 判定。 */
+static void camera_log_frame_diag(const char *what, const struct v4l2_buffer *buf,
+                                  const uint8_t *data, size_t cap, bool owner, int64_t waited_us)
 {
-    if (!out) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    memset(out, 0, sizeof(*out));
-    if (!s_camera_ready) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    const uint8_t *p = data;
+    ESP_LOGW(TAG, "[cam] %s idx=%" PRIu32 " flags=0x%08" PRIx32 " used=%" PRIu32
+                  " cap=%u owner=%s userptr=0x%08" PRIx32 " wait=%" PRId64
+                  "ms first4=%02X %02X %02X %02X",
+             what, (uint32_t)buf->index, (uint32_t)buf->flags,
+             (uint32_t)buf->bytesused, (unsigned)cap, owner ? "y" : "N",
+             (uint32_t)(uintptr_t)buf->m.userptr, waited_us / 1000,
+             p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0);
+}
 
-    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-    /* 相机独占：与实时直播串行化。直播循环只在取帧期间持锁（不含 HTTP 上传），
-     * 所以单帧拍照最多等一帧的时间；反过来直播最多等一次单帧拍照（含 3 s DQBUF 上限）。 */
-    bool locked = false;
-    if (s_camera_mutex) {
-        if (xSemaphoreTake(s_camera_mutex,
-                           pdMS_TO_TICKS(CAMERA_LOCK_TIMEOUT_MS)) != pdTRUE) {
-            ESP_LOGW(TAG, "[photo] camera busy (live streaming?), capture skipped");
-            return ESP_ERR_TIMEOUT;
-        }
-        locked = true;
+/* 就地下发 DQBUF 上限（esp_video 私有 ioctl）。同一个值不重复下发，
+ * 驱动不支持时只告警一次并沿用驱动默认值。 */
+static void camera_set_dqbuf_timeout_locked(int ms)
+{
+    if (s_cam.fd < 0 || s_cam.dqbuf_timeout_ms == ms) {
+        return;
     }
-
-    esp_err_t ret = ESP_FAIL;
-    bool streaming = false;
-    uint8_t *map[CAMERA_BUFFER_COUNT] = { 0 };
-    size_t map_len[CAMERA_BUFFER_COUNT] = { 0 };
-    struct v4l2_format format;
-    int fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
-    if (fd < 0) {
-        ESP_LOGE(TAG, "[photo] open(%s) failed: errno=%d", BSP_CAMERA_DEVICE, errno);
-        goto cleanup;      /* 统一从 cleanup 退出，保证相机锁一定归还 */
-    }
-
-    /* 1. 读当前格式：默认格式由 Kconfig 决定（本项目选 OV2640 DVP JPEG 640x480）。
-     *    DVP 设备要求 S_FMT 的宽高与传感器当前格式完全一致，所以先读再写回。 */
-    memset(&format, 0, sizeof(format));
-    format.type = type;
-    if (ioctl(fd, VIDIOC_G_FMT, &format) != 0) {
-        ESP_LOGE(TAG, "[photo] VIDIOC_G_FMT failed: errno=%d", errno);
-        goto cleanup;
-    }
-    if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG) {
-        ESP_LOGE(TAG, "[photo] sensor format 0x%08" PRIx32 " is not JPEG - enable"
-                      " CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS",
-                 (uint32_t)format.fmt.pix.pixelformat);
-        goto cleanup;
-    }
-    out->width = format.fmt.pix.width;
-    out->height = format.fmt.pix.height;
-
-    memset(&format, 0, sizeof(format));
-    format.type = type;
-    format.fmt.pix.width = out->width;
-    format.fmt.pix.height = out->height;
-    format.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
-    if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
-        ESP_LOGE(TAG, "[photo] VIDIOC_S_FMT(%" PRIu32 "x%" PRIu32
-                      " JPEG) failed: errno=%d", out->width, out->height, errno);
-        goto cleanup;
-    }
-
-    /* 2. mmap 缓冲并入队前先把单帧等待上限设成 3 s：传感器不出图时
-     *    DQBUF 不能永久阻塞（否则拍照任务会把整个 task_poll 卡死）。
-     *    该 ioctl 是 esp_video 私有扩展，老版本不支持时只告警、用驱动默认值。 */
-    struct timeval dqbuf_timeout = {
-        .tv_sec  = CAMERA_DQBUF_TIMEOUT_MS / 1000,
-        .tv_usec = (CAMERA_DQBUF_TIMEOUT_MS % 1000) * 1000,
+    struct timeval tv = {
+        .tv_sec  = ms / 1000,
+        .tv_usec = (ms % 1000) * 1000,
     };
-    if (ioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &dqbuf_timeout) != 0) {
-        ESP_LOGW(TAG, "[photo] VIDIOC_S_DQBUF_TIMEOUT unsupported (errno=%d),"
+    if (ioctl(s_cam.fd, VIDIOC_S_DQBUF_TIMEOUT, &tv) != 0 && !s_cam_timeout_warned) {
+        s_cam_timeout_warned = true;
+        ESP_LOGW(TAG, "[cam] VIDIOC_S_DQBUF_TIMEOUT unsupported (errno=%d),"
                       " using driver default", errno);
     }
+    s_cam.dqbuf_timeout_ms = ms;
+}
+
+/* ----------------------------------------------------------------------------
+ * 2026-10-05 修复：还给驱动之前把整块 mmap 缓冲写 0
+ *
+ * 现场症状：直播/预览的 JPEG 下半幅是灰带 + 中段横向撕裂/色带（Web 上就是「花屏」）。
+ *
+ * 代码级根因（本轮真机 + 离线熵解码一起定出来的）：
+ *   1) 本工程实际用的是 **ESP-IDF 5.4.3 自带的 DVP 驱动**
+ *      （`components/esp_driver_cam/dvp/src/esp_cam_ctlr_dvp_cam.c`），
+ *      不是 `espressif__esp_cam_sensor/src/driver_dvp/esp_cam_ctlr_dvp_cam.c`
+ *      —— 后者被 `esp_cam_ctlr_dvp_ext.h` 的 `ESP_IDF_VERSION >= 5.5.2` 挡掉，
+ *      在 5.4.3 上根本没编进固件（`build/compile_commands.json` 里搜不到它）。
+ *   2) 5.4.3 的 HAL 在 `cam_hal_init()` 里执行 `cam_ll_enable_vsync_generate_eof(hw, 1)`
+ *      （`components/hal/cam_hal.c:67`）：**VSYNC 直接产生 DMA 的 EOF**，也就是
+ *      「一帧」的边界完全由 VSYNC 决定。对 JPEG 这种**变长、与行时序无关**的数据流，
+ *      帧尾那部分字节就落在边界之外 ⇒ `esp_cam_ctlr_dvp_dma_get_recv_size()`
+ *      （把 GDMA 描述符的 `dw0.length` 相加）算出来的长度**短于整帧**。
+ *   3) 于是 `esp_cam_ctlr_dvp_get_jpeg_size()`（从收到的区域里往回找 FF D9）**找不到 EOI**
+ *      ⇒ 返回 0 ⇒ `trans.received_size = 0` ⇒（5.4.3 这个驱动**无条件**回调
+ *      `on_trans_finished`）⇒ `element->valid_size = 0` ⇒ DQBUF 交出
+ *      `bytesused = 0` + `V4L2_BUF_FLAG_ERROR`(0x41)。
+ *      —— 这就是历史上「used=0/flags=0x41 是常态」的真正机制（不是残留元素：
+ *      5.4.3 的驱动没有 NO-EOI 日志，`ESP_LOGE` 也没有，所以串口上看不到线索）。
+ *   4) app 的 C 层兜底 `camera_jpeg_span()` 会去扫**整块 307200 B 映射缓冲**；
+ *      缓冲是复用的，没被本帧 DMA 覆盖的部分还是**上一帧的数据**，里面自然有
+ *      上一帧的 EOI(FF D9)。自校验于是搜到「旧帧的结尾」，并把
+ *      「本帧前缀 + 旧帧尾巴」当成一整帧上传 ⇒ 下半幅灰带/撕裂。
+ *
+ * 修法（只动 app，不碰 IDF / managed_components）：
+ *   每次把 mmap 缓冲还给驱动（QBUF）之前，把**整块**缓冲写 0。这样残留区
+ *   不可能再出现 FF D9，`camera_jpeg_span()` 只可能扫到**本帧 DMA 真写进去的**
+ *   EOI —— 要么拿到完整帧，要么明确判为坏帧（不再把旧帧尾巴拼上来）。
+ *
+ * 缓冲在 PSRAM ⇒ 写完必须 C2M 同步：否则脏 cache 行会在 DMA 写完之后被回写，
+ * 把刚收到的新帧数据冲掉（esp_video/驱动对同一块缓冲用的是 M2C 反向同步）。
+ * -------------------------------------------------------------------------- */
+static void camera_wipe_map_locked(uint32_t idx)
+{
+    if (idx >= s_cam.buf_count || !s_cam.map[idx] || s_cam.map_len[idx] == 0) {
+        return;
+    }
+    memset(s_cam.map[idx], 0, s_cam.map_len[idx]);
+    if (esp_ptr_external_ram(s_cam.map[idx])) {
+        esp_cache_msync(s_cam.map[idx], s_cam.map_len[idx],
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
+}
+
+/* 诊断：在「写 0 过的」缓冲里找「已写入区」的边界
+ * = 第一段连续 ≥ CAMERA_ZERO_RUN_MIN 个 0 的起点（= DMA 本帧实际写入的长度）。
+ * 与 camera_jpeg_span() 的 span 一起看就能定性（2026-10-05 真机实测两者相等）：
+ *   span == written ⇒ 本帧的 EOI 就在 DMA 写进来的数据末尾 ⇒ 帧是完整的；
+ *   span == 0      ⇒ 帧尾（含 EOI）压根没进缓冲 ⇒ 帧被截断，应当判为坏帧。
+ * 只在每个会话的头 CAMERA_DIAG_SALVAGE_FRAMES 个「兜底帧」上打印，避免刷屏
+ * （每次调用要扫一遍缓冲，~300 KB，代价可忽略）。 */
+#define CAMERA_ZERO_RUN_MIN 64
+#define CAMERA_DIAG_SALVAGE_FRAMES 12
+static size_t camera_zero_run_end(const uint8_t *p, size_t cap)
+{
+    size_t run = 0;
+
+    for (size_t i = 0; i < cap; i++) {
+        if (p[i] == 0) {
+            if (++run >= CAMERA_ZERO_RUN_MIN) {
+                return i + 1 - run;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    return cap;
+}
+
+/* 关掉会话：STREAMOFF → munmap → close。必须由已持锁的调用者调用。 */
+static void camera_session_close_locked(void)
+{
+    if (s_cam.fd < 0) {
+        return;
+    }
+    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (s_cam.streaming && ioctl(s_cam.fd, VIDIOC_STREAMOFF, &type) != 0) {
+        ESP_LOGW(TAG, "[cam] VIDIOC_STREAMOFF failed: errno=%d", errno);
+    }
+    for (uint32_t i = 0; i < CAMERA_BUFFER_COUNT; i++) {
+        if (s_cam.map[i]) {
+            munmap(s_cam.map[i], s_cam.map_len[i]);
+            s_cam.map[i] = NULL;
+        }
+    }
+    close(s_cam.fd);
+    if (s_cam.opened_us) {
+        ESP_LOGI(TAG, "[cam] session closed: frames=%" PRIu32 " bad=%" PRIu32
+                      " warmup_dropped_good=%" PRIu32 " resyncs=%" PRIu32 " salvaged=%" PRIu32
+                      " stale=%" PRIu32 " bogus_len=%" PRIu32 " dup=%" PRIu32 " uptime=%" PRId64 "ms",
+                 s_cam.frames, s_cam.bad_frames, s_cam.warmup_dropped_good,
+                 s_cam.resyncs, s_cam.salvaged, s_cam.stale_frames, s_cam.bogus_len_frames,
+                 s_cam.dup_drops,
+                 (esp_timer_get_time() - s_cam.opened_us) / 1000);
+    }
+    memset(&s_cam, 0, sizeof(s_cam));
+    s_cam.fd = -1;
+    s_cam_last_use_us = 0;
+}
+
+/* 建立会话：open → G_FMT（必须是 JPEG）→ S_FMT（宽高必须与传感器当前格式一致，
+ * DVP 设备会校验）→ S_DQBUF_TIMEOUT → REQBUFS/QUERYBUF/mmap/QBUF → STREAMON。
+ * 失败时内部自行清理（不会把半开的设备留给下一次）。必须由已持锁的调用者调用。 */
+static esp_err_t camera_session_open_locked(int dqbuf_timeout_ms)
+{
+    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    struct v4l2_format format;
+
+    memset(&s_cam, 0, sizeof(s_cam));
+    s_cam.fd = open(BSP_CAMERA_DEVICE, O_RDONLY);
+    if (s_cam.fd < 0) {
+        ESP_LOGE(TAG, "[cam] open(%s) failed: errno=%d", BSP_CAMERA_DEVICE, errno);
+        return ESP_FAIL;
+    }
+
+    /* 1. 读当前格式：默认格式由 Kconfig 决定（本项目选 OV2640 DVP JPEG 640x480）。 */
+    memset(&format, 0, sizeof(format));
+    format.type = type;
+    if (ioctl(s_cam.fd, VIDIOC_G_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "[cam] VIDIOC_G_FMT failed: errno=%d", errno);
+        goto fail;
+    }
+    if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_JPEG) {
+        ESP_LOGE(TAG, "[cam] sensor format 0x%08" PRIx32 " is not JPEG - enable"
+                      " CONFIG_CAMERA_OV2640_DVP_JPEG_640X480_25FPS",
+                 (uint32_t)format.fmt.pix.pixelformat);
+        goto fail;
+    }
+    s_cam.width  = format.fmt.pix.width;
+    s_cam.height = format.fmt.pix.height;
+
+    memset(&format, 0, sizeof(format));
+    format.type = type;
+    format.fmt.pix.width       = s_cam.width;
+    format.fmt.pix.height      = s_cam.height;
+    format.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+    if (ioctl(s_cam.fd, VIDIOC_S_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "[cam] VIDIOC_S_FMT(%" PRIu32 "x%" PRIu32 " JPEG) failed: errno=%d",
+                 s_cam.width, s_cam.height, errno);
+        goto fail;
+    }
+
+    /* 2. DQBUF 等待上限（esp_video 私有扩展）。 */
+    s_cam.dqbuf_timeout_ms = -1;
+    camera_set_dqbuf_timeout_locked(dqbuf_timeout_ms);
 
     /* 3. mmap 缓冲并入队 */
     struct v4l2_requestbuffers req;
@@ -1617,97 +1977,591 @@ static esp_err_t app_camera_capture_jpeg(jpeg_frame_t *out)
     req.count  = CAMERA_BUFFER_COUNT;
     req.type   = type;
     req.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0) {
-        ESP_LOGE(TAG, "[photo] VIDIOC_REQBUFS failed: errno=%d", errno);
-        goto cleanup;
+    if (ioctl(s_cam.fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "[cam] VIDIOC_REQBUFS failed: errno=%d", errno);
+        goto fail;
     }
-    for (int i = 0; i < CAMERA_BUFFER_COUNT; i++) {
+    if (req.count == 0 || req.count > CAMERA_BUFFER_COUNT) {
+        /* 给多了我们也只用 CAMERA_BUFFER_COUNT 个（map[] 是定长数组）；
+         * 给 0 个说明驱动没接受，直接失败比后面空指针好。 */
+        ESP_LOGW(TAG, "[cam] REQBUFS granted %" PRIu32 " buffers (asked %u)",
+                 (uint32_t)req.count, (unsigned)CAMERA_BUFFER_COUNT);
+        if (req.count == 0) {
+            goto fail;
+        }
+        req.count = CAMERA_BUFFER_COUNT;
+    }
+    s_cam.buf_count = req.count;
+
+    for (uint32_t i = 0; i < s_cam.buf_count; i++) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type   = type;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index  = i;
-        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "[photo] VIDIOC_QUERYBUF(%d) failed: errno=%d", i, errno);
-            goto cleanup;
+        if (ioctl(s_cam.fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[cam] VIDIOC_QUERYBUF(%" PRIu32 ") failed: errno=%d", i, errno);
+            goto fail;
         }
-        map[i] = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, fd, buf.m.offset);
-        if (map[i] == MAP_FAILED) {
-            map[i] = NULL;
-            ESP_LOGE(TAG, "[photo] mmap(%d) failed: errno=%d", i, errno);
-            goto cleanup;
+        s_cam.map[i] = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED, s_cam.fd, buf.m.offset);
+        if (s_cam.map[i] == MAP_FAILED) {
+            s_cam.map[i] = NULL;
+            ESP_LOGE(TAG, "[cam] mmap(%" PRIu32 ") failed: errno=%d", i, errno);
+            goto fail;
         }
-        map_len[i] = buf.length;
-        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "[photo] VIDIOC_QBUF(%d) failed: errno=%d", i, errno);
-            goto cleanup;
+        s_cam.map_len[i] = buf.length;
+        /* 新建会话的第一帧同样要防「上一轮残留」：入队前先写 0（见 camera_wipe_map_locked）。 */
+        camera_wipe_map_locked(i);
+        if (ioctl(s_cam.fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[cam] VIDIOC_QBUF(%" PRIu32 ") failed: errno=%d", i, errno);
+            goto fail;
         }
     }
-    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
-        ESP_LOGE(TAG, "[photo] VIDIOC_STREAMON failed: errno=%d", errno);
-        goto cleanup;
+    if (ioctl(s_cam.fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "[cam] VIDIOC_STREAMON failed: errno=%d", errno);
+        goto fail;
     }
-    streaming = true;
 
-    /* 3. 取一帧：坏帧（没有 V4L2_BUF_FLAG_DONE）丢回队列重取，最多跳 CAMERA_FRAME_SKIP_MAX 帧 */
-    for (int attempt = 0; attempt <= CAMERA_FRAME_SKIP_MAX; attempt++) {
+    s_cam.streaming   = true;
+    s_cam.warmup_left = CAMERA_WARMUP_FRAMES;
+    s_cam.opened_us   = esp_timer_get_time();
+    ESP_LOGI(TAG, "[cam] session open: %s %" PRIu32 "x%" PRIu32 " JPEG, bufs=%" PRIu32
+                  " (each %u B, PSRAM), dqbuf=%d ms",
+             BSP_CAMERA_DEVICE, s_cam.width, s_cam.height, s_cam.buf_count,
+             (unsigned)s_cam.map_len[0], dqbuf_timeout_ms);
+    return ESP_OK;
+
+fail:
+    camera_session_close_locked();   /* opened_us == 0 → 不打 "session closed" */
+    return ESP_FAIL;
+}
+
+/* ============================================================================
+ * 【2026-10-05 更正】下面 2026-09-29/30 那套「done 列表残留元素」分析
+ * **已经被真机推翻**，不要再照着它改代码：
+ *
+ *   - `used=0 / flags=0x41` 的真正机制在 **IDF 自带的 DVP 驱动**里，不在
+ *     `managed_components`：
+ *       * 本工程实际链接的是 ESP-IDF 5.4.3 的
+ *         `components/esp_driver_cam/dvp/src/esp_cam_ctlr_dvp_cam.c`
+ *         （`espressif__esp_cam_sensor` 里那份 DVP 驱动被
+ *          `esp_cam_ctlr_dvp_ext.h` 的 `ESP_IDF_VERSION >= 5.5.2` 挡掉，
+ *          在 5.4.3 上编译成空对象 —— 之前所有引用它的行号都作废；
+ *          可用 `build/compile_commands.json` + `build/config.env` 核对）。
+ *       * 该驱动的「一帧」边界由 VSYNC 决定（HAL 里
+ *         `cam_ll_enable_vsync_generate_eof(hw, 1)`），收到的字节数则由
+ *         `esp_cam_ctlr_dvp_dma_get_recv_size()`（把 GDMA 描述符的
+ *         `dw0.length` 相加）给出；帧尾那截不在计数里 ⇒
+ *         `esp_cam_ctlr_dvp_get_jpeg_size()` 扫不到 EOI ⇒ 返回 0 ⇒
+ *         `trans.received_size = 0` ⇒（5.4.3 的驱动**无条件**回调
+ *         `on_trans_finished`）⇒ `element->valid_size = 0` ⇒ DQBUF 交出
+ *         `bytesused=0` + ERROR(0x41)。**每一帧都是这样**，与残留元素无关。
+ *       * 5.4.3 的驱动没有任何 NO-EOI/NO-SOI 日志，所以串口上「看不出坏帧」。
+ *   - 真正吃掉画面的不是驱动，而是 **app 自己的兜底扫描**：`camera_jpeg_span()`
+ *     扫的是**整块 307200 B 映射缓冲**，而缓冲是复用的 —— 没被本帧 DMA 覆盖的
+ *     部分还是**上一帧数据**，里面有上一帧的 EOI。于是自校验「找到」的其实是
+ *     旧帧结尾，上传的是「本帧前缀 + 旧帧尾巴」⇒ 下半幅灰带 + 中段横向撕裂。
+ *   - 修法见 `camera_wipe_map_locked()`：还给驱动之前把整块缓冲写 0，
+ *     残留区不再可能出现 FF D9，自校验只可能扫到本帧 DMA 真写进去的 EOI。
+ *     真机实测（2026-10-05）：`diag ... span=NNNN written=NNNN` 两者**完全相等**
+ *     （9787=9787、10543=10543、10565=10565）⇒ DMA 其实把整帧（含 EOI）都写进了
+ *     缓冲，只是驱动没算全 ⇒ 写 0 之后 app 拿到的是**完整帧**，不再是拼接帧。
+ * ========================================================================== */
+
+/* ----------------------------------------------------------------------------
+ * 坏帧兜底 + done 列表重同步（2026-09-29）
+ *
+ * 现场症状：直播/预览时 `DQBUF` 周期性返回 flags=0x41 (MAPPED|ERROR)、bytesused=0，
+ * 而映射缓冲里前 4 字节是 FF D8 FF E0（明明躺着一整帧 JPEG 的头）。
+ *
+ * 代码级定位（都在 managed_components 里可核对）：
+ *   1) `V4L2_BUF_FLAG_ERROR` 只有一个来源：`esp_video_ioctl.c:196-203`
+ *      `vbuf->bytesused = element->valid_size; if (!bytesused) flags |= ERROR;`
+ *      ⇒ bytesused=0 等价于「驱动认为这个元素的 valid_size 是 0」。
+ *   2) `valid_size` 的写点只有两处：`esp_video_done_buffer()`（控制器回调给的 n；
+ *      DVP 那条路径 n>0 才回调，见 `esp_cam_ctlr_dvp_cam.c:776`）与
+ *      `esp_video_buffer_reset()`（= 0，**只在 VIDIOC_STREAMOFF 里调用**）。
+ *      ⇒ 0 字节元素不可能来自「DVP 正常收完一帧」，只能是**被 reset 过、
+ *        或者元素对象本身已经不是本会话的了**。
+ *   3) 元素对象为什么会「不是本会话的」：`esp_video_setup_buffer()`
+ *      （= VIDIOC_REQBUFS）会 `esp_video_buffer_destroy()` 掉旧缓冲对象再重建
+ *      （`esp_video.c:861-878`），但**既不重新初始化 stream->queued_list /
+ *      done_list，也不清引用**，而这两个列表挂在 stream 上、跨会话存活；
+ *      同时 `esp_video_done_element()` 只要求元素 `free == true`
+ *      （`esp_video.c:1015`）。DVP 任务在 STREAMOFF/close 之后仍可能让一次完成
+ *      回调落地（vTaskDelete 是异步的）⇒ **旧缓冲对象的元素会被塞进新会话的
+ *      done_list**，DQBUF 从表头取到它，valid_size 就是那块内存里残留的 0
+ *      → flags=0x41、bytesused=0。
+ *      这也解释了「bytesused=0 却能看到 FF D8 FF E0」：index / 缓冲里都是残留值，
+ *      而 app 用 buf.index 查自己的 mmap 表，读到的还是上一帧留下的数据。
+ *   4) 旧代码一旦取帧失败就 `camera_session_close_locked()`（STREAMOFF + close）
+ *      ——**恰恰就是制造上面那条残留的动作**。一次偶发失败因此变成自持循环。
+ *
+ * 处理（三层，全部在 app 侧，不动 managed_components —— 升级组件不会被冲掉）：
+ *   A. 软失败（「没取到可用帧」）不再拆会话：连续 CAMERA_SOFT_FAIL_LIMIT 次才重建；
+ *      硬失败（DQBUF/QBUF ioctl 报错、没内存）仍然立即重建。
+ *   B. 每次取帧遇到第一个坏帧，就非阻塞排空一次驱动 done 列表并把缓冲**立刻**归还
+ *      （camera_resync_locked()）：残留元素被消费掉一次，列表就干净了。
+ *   C. 任何模式下，若驱动报 ERROR 但映射缓冲里确实有一整帧 JPEG
+ *      （SOI 在偏移 0 + 找得到 EOI + 长度 ≥ CAMERA_JPEG_MIN_BYTES，自己校验），
+ *      收下并打 WARN。拍照模式额外加一道「新鲜度」闸门（与上一张照片不同字节），
+ *      防止会话切换时把上一轮的残留图当成本次照片；理由见 camera_jpeg_hash() 上方。
+ *      ——「拍照不做兜底」是 2026-09-29 的旧决定，2026-09-30 真机实测证明它等于
+ *      拍照 100% 失败（8/8）：驱动对**每一帧**都报 used=0，而缓冲里就是完整 JPEG。
+ *
+ * 2026-09-30 追加 D 层（同一个残留根因，但这次漏进的是「长度」而不是「0 字节」）：
+ *   现场症状：`[cam] no heap for 4294959519 B JPEG frame` → `[live] capture failed:
+ *   ESP_ERR_NO_MEM` → 会话被拆。4294959519 = 0xFFFFE19F = **−7777**，即 DQBUF 交回的
+ *   `bytesused` 是野值（负数的补码），不是真的内存不够。
+ *   野长度怎么来的：DVP 侧 `trans->buflen = ELEMENT_SIZE(element) =
+ *   element->video_buffer->info.size`（`esp_video_buffer.h:22`、`esp_video_dvp_device.c:158`）。
+ *   元素若来自**已销毁的旧缓冲对象**（上面第 3 条），`video_buffer` 指向的内存已被释放/复用
+ *   ⇒ `buflen` 变成野值 ⇒ `esp_cam_ctlr_dvp_cam.c:754-758` 里所有以 buflen 为界的夹取
+ *   全部失效 ⇒ `dvp_calculate_jpeg_size()` 会**从远超 307200 的偏移**上往回扫 EOI，
+ *   扫到什么就是什么（0xFFFFE19F 这种值），最后经 `element->valid_size = n`
+ *   （`esp_video.c:1063`）→ `DQBUF` → app。
+ *   旧代码的可用性判据只有 `done && bytesused > 0`，野值于是成了「好帧」：
+ *   `heap_caps_malloc(0xFFFFE19F)` 必然失败 → 被误报成 OOM → 走硬失败分支拆会话
+ *   ⇒ **又制造一批残留元素**，坏帧被放大（和 A 层修掉的那个循环同源）。
+ *   因此新增：
+ *     D1. 长度笼子：`len_ok = bytesused ∈ (0, map_len[idx]]`，只有它成立才可能 usable；
+ *         之后 malloc/memcpy/out->len 一律用夹取后的 `used`，越界读写得不可能发生。
+ *     D2. 归属诊断：MMAP 模式下驱动会回填 `userptr = element->buffer`
+ *         （`esp_video_ioctl.c:204-207`），而 mmap() 给 app 的正是同一个指针
+ *         （`esp_video_mman.c` → `esp_video_get_element_index_payload()`）⇒
+ *         `userptr == map[idx]` 就是「元素属于本会话」的判据。地址可能被复用（会误判），
+ *         所以这一条**只记账 + 打日志**（`stale=`），拦野值的主力是 D1。
+ *     D3. 野长度降级：不再当 OOM。直播走 C 层自校验兜底（扫描范围严格限制在 map_len 内），
+ *         兜不住就当普通坏帧丢回队列 + resync 一次；`ESP_ERR_NO_MEM` 只留给
+ *         「长度合法但堆真不够」的真 OOM。诊断计数：`stale=` / `bogus_len=`。
+ *   根治仍在驱动侧（本项目不采用，避免被组件升级覆盖）：在 `esp_video_setup_buffer()`
+ *   重建缓冲后顺手 `TAILQ_INIT()` 掉 `stream->queued_list` / `done_list`。
+ * ---------------------------------------------------------------------------- */
+
+/* 在映射缓冲里做完整性自检：SOI 必须在偏移 0，且在 cap 之内按 JPEG 段结构找得到 EOI。
+ * 返回 JPEG 长度（含 EOI 两字节）；不像一帧完整 JPEG 就返回 0。
+ *
+ * 为什么不能裸扫 FF D9（旧实现的写法）：JPEG 是**分段**结构，段载荷里完全可能出现
+ * 字节对 FF D9 —— 典型是 APPn/EXIF 里内嵌的缩略图（OV2640 输出的 JPEG 带 APP 段）。
+ * 裸扫会把缩略图的 EOI 当成整帧结尾，span 于是被截短 ⇒ 拷走/上传的"这一帧"其实是
+ * 半张图：HTTP 上传照样成功，但服务端存下来的图显示不完整（底部灰带/花屏）。
+ * 正确做法是按段长跳转，只有进入 SOS 之后的熵编码数据才用裸扫 —— 那里 FF 后面
+ * 只会跟 00 填充或 D0..D7 重启标记，不可能再出现带长度字段的段。
+ * 全程读取都夹在 cap 之内（越界前一律返回 0），所以喂野缓冲也不会越界读。 */
+static size_t camera_jpeg_span(const uint8_t *p, size_t cap)
+{
+    if (!p || cap < CAMERA_JPEG_MIN_BYTES || p[0] != 0xFF || p[1] != 0xD8) {
+        return 0;
+    }
+    size_t i = 2;
+    while (i + 1 < cap) {
+        if (p[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        const uint8_t marker = p[i + 1];
+        if (marker == 0xD9) {                     /* EOI：帧尾就在这里 */
+            const size_t len = i + 2;
+            return (len >= CAMERA_JPEG_MIN_BYTES) ? len : 0;
+        }
+        if (marker == 0xFF || marker == 0x00) {   /* 填充字节 / 熵编码里的 FF00 转义 */
+            i++;
+            continue;
+        }
+        if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            i += 2;                               /* 无载荷标记：SOI / TEM / RSTn */
+            continue;
+        }
+        if (i + 3 >= cap) {                       /* 段长字段本身越界 */
+            return 0;
+        }
+        const size_t seg = ((size_t)p[i + 2] << 8) | (size_t)p[i + 3];
+        if (seg < 2) {                            /* 段长含自身 2 字节，最小即 2 */
+            return 0;
+        }
+        if (marker == 0xDA) {
+            /* SOS：段头之后是熵编码数据，从这里开始只可能有 FF00 / RSTn / EOI */
+            for (size_t j = i + 2 + seg; j + 1 < cap; j++) {
+                if (p[j] == 0xFF && p[j + 1] == 0xD9) {
+                    const size_t len = j + 2;
+                    return (len >= CAMERA_JPEG_MIN_BYTES) ? len : 0;
+                }
+            }
+            return 0;                             /* 熵编码里找不到 EOI ⇒ 不完整 */
+        }
+        i += 2 + seg;                             /* 跳到下一个段标记 */
+    }
+    return 0;
+}
+
+/* 拍照兜底的「新鲜度」指纹（FNV-1a 32）。为什么拍照路径需要它：
+ * 驱动只交出 valid_size=0 的元素（见上面 2026-09-30 的实测结论），所以自校验兜底
+ * 是拍照唯一能拿到图的路；而「一帧旧图混进照片」正是这条路的风险 —— 会话刚 STREAMON
+ * 时读到的缓冲，可能还装着上一次会话最后那一帧。
+ * 于是每次成功拍照都记下这一帧的指纹，下一个候选若逐字节相同就判为残留、丢掉再取下一帧
+ * （真·DVP 连续两帧 JPEG 逐字节相同几乎不可能：同轮实测自校验长度在 8893..9028 B 抖动）。
+ * 0 表示「还没记过」；故意做成 app 级静态量 —— 跨会话的残留正是要拦的对象。
+ * 误判的代价只是多丢一帧（下一帧 ~40 ms 后到），不会让拍照失败。 */
+static uint32_t s_photo_hash = 0;
+
+static uint32_t camera_jpeg_hash(const uint8_t *p, size_t len)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+/* 把驱动 done 列表里的残留元素排空并**立刻 QBUF 归还**。
+ * 用 0 ms 的 DQBUF 上限做非阻塞轮询：拿得到就还回去，拿不到就收手。
+ * 必须由已持锁的调用者调用。 */
+static void camera_resync_locked(const char *why)
+{
+    if (s_cam.fd < 0 || s_cam.buf_count == 0) {
+        return;
+    }
+    const int type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    const int saved_ms = (s_cam.dqbuf_timeout_ms > 0) ? s_cam.dqbuf_timeout_ms
+                                                      : CAMERA_DQBUF_TIMEOUT_LIVE_MS;
+    uint32_t  drained  = 0;
+
+    camera_set_dqbuf_timeout_locked(CAMERA_RESYNC_POLL_MS);   /* 0 ms = 非阻塞 */
+    for (uint32_t i = 0; i < CAMERA_RESYNC_MAX_FRAMES; i++) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type   = type;
         buf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_DQBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "[photo] VIDIOC_DQBUF failed: errno=%d", errno);
-            goto cleanup;
+        if (ioctl(s_cam.fd, VIDIOC_DQBUF, &buf) != 0) {
+            break;                                   /* 没有待取元素了 */
         }
-        bool good = ((buf.flags & V4L2_BUF_FLAG_DONE) != 0) && buf.bytesused > 0
-                    && buf.index < CAMERA_BUFFER_COUNT;
-        if (good) {
-            /* 必须立刻拷贝：缓冲一旦回到队列，esp_video 就会复用它 */
-            uint8_t *copy = heap_caps_malloc(buf.bytesused,
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!copy) {
-                copy = heap_caps_malloc(buf.bytesused, MALLOC_CAP_8BIT);
-            }
-            if (!copy) {
-                ESP_LOGE(TAG, "[photo] no heap for %" PRIu32 " B JPEG frame",
-                         (uint32_t)buf.bytesused);
-                goto cleanup;
-            }
-            memcpy(copy, map[buf.index], buf.bytesused);
-            out->data = copy;
-            out->len = buf.bytesused;
-            ret = ESP_OK;
+        if (buf.index >= s_cam.buf_count) {
+            /* 残留元素的 index 越界：它不属于本会话的 mmap 表，只能在此丢掉
+             * （它已经从 done 列表出队，不会再被取到）。 */
+            ESP_LOGW(TAG, "[cam] resync(%s): dropping stale element idx=%" PRIu32 " (out of range)",
+                     why, (uint32_t)buf.index);
             break;
         }
-        ESP_LOGW(TAG, "[photo] dropping bad frame flags=0x%08" PRIx32 " used=%" PRIu32,
-                 (uint32_t)buf.flags, (uint32_t)buf.bytesused);
-        if (ioctl(fd, VIDIOC_QBUF, &buf) != 0) {
-            ESP_LOGE(TAG, "[photo] VIDIOC_QBUF(recycle) failed: errno=%d", errno);
-            goto cleanup;
+        drained++;
+        camera_wipe_map_locked((uint32_t)buf.index);   /* 残留元素也要清干净再入队 */
+        if (ioctl(s_cam.fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGW(TAG, "[cam] resync(%s): QBUF(idx=%" PRIu32 ") failed: errno=%d",
+                     why, (uint32_t)buf.index, errno);
+            break;
         }
+    }
+    camera_set_dqbuf_timeout_locked(saved_ms);
+    if (drained) {
+        s_cam.resyncs++;
+        ESP_LOGW(TAG, "[cam] resync(%s): drained and returned %" PRIu32 " element(s)", why, drained);
+    }
+}
+
+/* 取帧的两种用途。mode 决定 DQBUF 上限（见 CAMERA_DQBUF_TIMEOUT_*）与
+ * 「ERROR 帧自救」（上面第 C 条）。 */
+typedef enum {
+    CAMERA_MODE_PHOTO = 0,   /* Web「拍一张照片」/ kind=camera 任务：宁等 3 s 也不失败 */
+    CAMERA_MODE_LIVE,        /* 实时直播 / 本地预览：坏帧快速失败重试 */
+} camera_mode_t;
+
+/* 从会话里取一帧（好帧会**立刻**把缓冲还给驱动）。必须由已持锁的调用者调用。
+ *
+ * 返回：
+ *   ESP_OK            —— out 里有一帧完整 JPEG（调用方负责 jpeg_frame_free()）；
+ *   ESP_ERR_NOT_FOUND —— 软失败：这一轮全是坏帧/暖机帧，**会话本身仍然可用**，
+ *                        调用方不要为此关会话（关会话正是制造 done 列表残留的动作）；
+ *   ESP_ERR_TIMEOUT / ESP_FAIL / ESP_ERR_NO_MEM —— 硬失败，会话状态可疑，应当重建。
+ *                        其中 ESP_ERR_NO_MEM 只表示「长度合法（≤ map_len）却仍然分配
+ *                        失败」的真 OOM：驱动交回的野长度（如 0xFFFFE19F）会先被 D1 层
+ *                        的长度笼子拦下，降级成软失败，不再冒充 OOM 去拆会话。 */
+static esp_err_t camera_grab_locked(jpeg_frame_t *out, camera_mode_t mode)
+{
+    const int type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    const int attempts = CAMERA_FRAME_SKIP_MAX + CAMERA_WARMUP_FRAMES + 1;
+    bool resynced      = false;
+
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = type;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        const int64_t t0 = esp_timer_get_time();
+        if (ioctl(s_cam.fd, VIDIOC_DQBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[cam] VIDIOC_DQBUF failed after %" PRId64 " ms: errno=%d",
+                     (esp_timer_get_time() - t0) / 1000, errno);
+            return ESP_ERR_TIMEOUT;
+        }
+        const int64_t  waited_us = esp_timer_get_time() - t0;
+        /* 元素归属 + 长度合法性校验（判读方法见 camera_log_frame_diag() 上方注释）：
+         *   owner_ok : MMAP 模式下 userptr 必然等于本会话 map[index]（见注释）；
+         *   len_ok   : bytesused 必须落在 (0, map_len[index]] 内。
+         * 旧代码只判 `bytesused > 0`，于是驱动交回来的野长度（实例：0xFFFFE19F
+         * = 4294959519 = -7777，即串口上的 `no heap for 4294959519 B JPEG frame`）
+         * 会被当成「可用帧」直接进 heap_caps_malloc/memcpy：前者必然申请失败 →
+         * 被误报成 ESP_ERR_NO_MEM → 走硬失败分支关会话重建，而关会话正是制造
+         * 残留元素的动作（见 camera_resync_locked 上方注释），坏帧不但没治好还被放大。 */
+        const uint32_t idx      = buf.index;
+        const bool     idx_ok   = (idx < s_cam.buf_count) && (s_cam.map[idx] != NULL);
+        const uint8_t *src      = idx_ok ? s_cam.map[idx] : NULL;
+        const size_t   src_cap  = idx_ok ? s_cam.map_len[idx] : 0;
+        const bool     owner_ok = idx_ok && ((const uint8_t *)(uintptr_t)buf.m.userptr == src);
+        const bool     len_ok   = (buf.bytesused > 0) && (buf.bytesused <= src_cap);
+        const bool     done     = (buf.flags & V4L2_BUF_FLAG_DONE) != 0;
+        const bool     warmup   = s_cam.warmup_left > 0;
+        bool           usable   = done && len_ok;   /* len_ok 已含 idx_ok 且保证 src != NULL */
+        bool           rescued  = false;
+
+        /* 归属/长度异常只记账（并在下面打诊断），当场处置交给同一套「坏帧」流程：
+         * 直播先试自校验兜底，兜不住再丢回队列 + resync 一次；连败 CAMERA_SOFT_FAIL_LIMIT
+         * 次才重建会话。这样野长度既不会触发 4 GB malloc，也不会引发无谓的拆会话。 */
+        if (!owner_ok) {
+            s_cam.stale_frames++;
+        } else if (buf.bytesused > src_cap) {
+            /* 只统计「长度越界」这种野值；used=0/flags=0x41 那类 0 字节坏帧不算 */
+            s_cam.bogus_len_frames++;
+        }
+
+        /* 会话最开始那几帧把 V4L2 元数据和缓冲头 4 字节打出来（判断 SOI）。 */
+        if (s_cam.frames + s_cam.bad_frames < CAMERA_DIAG_FRAMES) {
+            camera_log_frame_diag(warmup ? "warmup frame" : "frame", &buf, src,
+                                  src_cap, owner_ok, waited_us);
+        }
+
+        /* C. 兜底（直播/预览/拍照都启用）：驱动报 ERROR（V4L2 语义 = 这一帧数据不可信，
+         * bytesused 常被填 0、也可能是上面那种野值），但映射缓冲里可能明明躺着
+         * 一整帧 JPEG。只收自己校验过的：SOI 在偏移 0 + 找得到 EOI + 长度
+         * ≥ CAMERA_JPEG_MIN_BYTES，且扫描范围严格限制在 src_cap 之内（不越界读）。
+         * 拍照模式多一道新鲜度闸门（与上一张照片逐字节相同 ⇒ 残留旧图，丢掉再取），
+         * 理由与代价见 camera_jpeg_hash() 上方注释。 */
+        if (!usable && !warmup && idx_ok) {
+            const size_t span = camera_jpeg_span(src, src_cap);
+            /* 诊断（2026-10-05）：缓冲已按修复写 0，于是
+             *   written = 「本帧 DMA 真正写入的长度」（第一段连续 ≥64 个 0 之前）
+             *   span    = 自校验找到的 EOI 位置（0 = 没找到 ⇒ 本帧没写完）
+             * 真机实测两者相等（见 camera_zero_run_end() 上方注释）。 */
+            if (s_cam.salvaged < CAMERA_DIAG_SALVAGE_FRAMES) {
+                const size_t written = camera_zero_run_end(src, src_cap);
+                ESP_LOGW(TAG, "[cam] diag idx=%" PRIu32 " driver_used=%" PRIu32
+                              " span=%u written=%u head=%02X %02X %02X %02X",
+                         (uint32_t)buf.index, (uint32_t)buf.bytesused, (unsigned)span,
+                         (unsigned)written, src[0], src[1], src[2], src[3]);
+            }
+            if (span > 0) {
+                const uint32_t fp = (mode == CAMERA_MODE_LIVE) ? 0
+                                                               : camera_jpeg_hash(src, span);
+                if (fp != 0 && fp == s_photo_hash) {
+                    s_cam.dup_drops++;   /* 与上一张照片同字节：当残留丢掉，继续取下一帧 */
+                } else {
+                    ESP_LOGW(TAG, "[cam] salvaged bad frame idx=%" PRIu32 ": driver used=%" PRIu32
+                                  " cap=%u owner=%s flags=0x%" PRIx32 ", self-checked %u B%s",
+                             (uint32_t)buf.index, (uint32_t)buf.bytesused, (unsigned)src_cap,
+                             owner_ok ? "y" : "N", (uint32_t)buf.flags, (unsigned)span,
+                             (mode == CAMERA_MODE_LIVE) ? "" : " (photo)");
+                    buf.bytesused = (uint32_t)span;   /* 换成自校验长度，后续 malloc/memcpy 用它 */
+                    usable        = true;
+                    rescued       = true;
+                    s_cam.salvaged++;
+                    if (fp != 0) {
+                        s_photo_hash = fp;
+                    }
+                }
+            }
+        }
+
+        if (warmup) {
+            /* 新会话刚 STREAMON：头几帧一律丢掉，好帧也丢（只记账，看有没有白丢）。 */
+            s_cam.warmup_left--;
+            if (usable) {
+                s_cam.warmup_dropped_good++;
+            } else {
+                s_cam.bad_frames++;
+            }
+            camera_wipe_map_locked(idx);
+            if (src && ioctl(s_cam.fd, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "[cam] VIDIOC_QBUF(warmup) failed: errno=%d", errno);
+                return ESP_FAIL;
+            }
+            continue;
+        }
+
+        if (!usable) {
+            s_cam.bad_frames++;
+            camera_log_frame_diag("dropping bad frame", &buf, src, src_cap, owner_ok, waited_us);
+            camera_wipe_map_locked(idx);
+            if (src && ioctl(s_cam.fd, VIDIOC_QBUF, &buf) != 0) {
+                ESP_LOGE(TAG, "[cam] VIDIOC_QBUF(recycle) failed: errno=%d", errno);
+                return ESP_FAIL;
+            }
+            /* B. 坏帧 ⇒ 驱动 done 列表里可能混着残留元素（valid_size = 0 的那类）。
+             * 每个 grab 里只清一次：清多了会把真正的新帧也一起丢掉。 */
+            if (!resynced) {
+                resynced = true;
+                camera_resync_locked("bad-frame");
+            }
+            continue;
+        }
+
+        /* 好帧（含兜底救回来的）：先拷走，再**立刻**归还。顺序不能反 —— 驱动只有
+         * 在 queued 队列非空时才继续接收下一帧，还晚了硬件就空转，下一帧从半帧开始。 */
+        const size_t used = buf.bytesused;   /* 已被 len_ok 夹在 (0, src_cap] 内 */
+        uint8_t *copy = heap_caps_malloc(used, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!copy) {
+            copy = heap_caps_malloc(used, MALLOC_CAP_8BIT);
+        }
+        if (!copy) {
+            camera_wipe_map_locked(idx);
+            ioctl(s_cam.fd, VIDIOC_QBUF, &buf);    /* 先把缓冲还回去再报错 */
+            /* 走到这里 = 长度合法但堆真的不够 ⇒ 这才是货真价实的 OOM（可重建会话） */
+            ESP_LOGE(TAG, "[cam] no heap for %u B JPEG frame (idx=%" PRIu32
+                          " flags=0x%08" PRIx32 " cap=%u)",
+                     (unsigned)used, (uint32_t)buf.index, (uint32_t)buf.flags, (unsigned)src_cap);
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(copy, src, used);
+        /* 拷走之后、入队之前把整块 mmap 缓冲写 0：下一帧的「残留区」就不可能是旧帧数据
+         * （根因与代价见 camera_wipe_map_locked() 上方长注释）。 */
+        camera_wipe_map_locked(idx);
+        if (ioctl(s_cam.fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "[cam] VIDIOC_QBUF(return) failed: errno=%d", errno);
+            heap_caps_free(copy);
+            return ESP_FAIL;
+        }
+
+        out->data   = copy;
+        out->len    = used;
+        out->width  = s_cam.width;
+        out->height = s_cam.height;
+        s_cam.frames++;
+        s_cam.soft_fail_streak = 0;      /* 取到帧了，软失败连击清零 */
+        if (s_cam.frames == 1) {
+            /* STREAMON → 第一帧的等待时间：DVP 起振正常与否一眼可见。
+             * 先判长度再取下标：len_ok 只要求 used > 0，一帧 1 字节的"好帧"也能
+             * 走到这里，此时 copy[1] 是堆缓冲区外的 1 字节越界读（ASan 会直接报，
+             * 裸机上则可能读到野值把 SOI 判成 yes）。 */
+            const bool soi_ok = (used >= 2) && (copy[0] == 0xFF) && (copy[1] == 0xD8);
+            ESP_LOGI(TAG, "[cam] first frame: %u B, wait=%" PRId64 " ms, SOI=%s",
+                     (unsigned)used, waited_us / 1000, soi_ok ? "yes" : "NO");
+        }
+        if (rescued && !resynced) {
+            /* 驱动报过 ERROR ⇒ done 列表里可能还有残留元素。要的这一帧已经拷走，
+             * 顺手清一次，免得下一帧又取到 0 字节元素。 */
+            camera_resync_locked("post-salvage");
+        }
+        return ESP_OK;
     }
 
-cleanup:
-    if (streaming && ioctl(fd, VIDIOC_STREAMOFF, &type) != 0) {
-        ESP_LOGW(TAG, "[photo] VIDIOC_STREAMOFF failed: errno=%d", errno);
+    ESP_LOGE(TAG, "[cam] no usable frame in %d attempts (bad=%" PRIu32 ", resyncs=%" PRIu32
+                  ", stale=%" PRIu32 ", bogus_len=%" PRIu32 ", dup=%" PRIu32 ")",
+             attempts, s_cam.bad_frames, s_cam.resyncs,
+             s_cam.stale_frames, s_cam.bogus_len_frames, s_cam.dup_drops);
+    return ESP_ERR_NOT_FOUND;
+}
+
+/* 取一帧的两个入口（`camera_mode_t` 的说明见 camera_grab_locked() 上方）。
+ * 会话按需建立：第一次取帧时 open + REQBUFS + STREAMON；空闲超过
+ * CAMERA_SESSION_IDLE_MS 由 camera_session_idle_close() 关掉。
+ * 成功时 out->data 由调用方用 jpeg_frame_free() 释放。 */
+
+static esp_err_t app_camera_capture_jpeg_ex(jpeg_frame_t *out, camera_mode_t mode)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
     }
-    for (int i = 0; i < CAMERA_BUFFER_COUNT; i++) {
-        if (map[i]) {
-            munmap(map[i], map_len[i]);
+    memset(out, 0, sizeof(*out));
+    if (!s_camera_ready || !s_camera_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 相机独占：只在「取帧」期间持锁（HTTP 上传不占锁），
+     * 所以直播与按需拍照互相最多等一帧的时间。 */
+    if (xSemaphoreTake(s_camera_mutex,
+                       pdMS_TO_TICKS(CAMERA_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "[cam] busy (another capture in progress), skipped");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const int want_timeout = (mode == CAMERA_MODE_LIVE)
+                             ? CAMERA_DQBUF_TIMEOUT_LIVE_MS : CAMERA_DQBUF_TIMEOUT_MS;
+
+    esp_err_t ret;
+    if (s_cam.fd < 0) {
+        ret = camera_session_open_locked(want_timeout);
+    } else {
+        /* 已有会话（多半是直播/预览留下的）：按本次用途调整等待上限 */
+        camera_set_dqbuf_timeout_locked(want_timeout);
+        ret = ESP_OK;
+    }
+    if (ret == ESP_OK) {
+        ret = camera_grab_locked(out, mode);
+    }
+    if (ret == ESP_ERR_NOT_FOUND) {
+        /* 软失败：这一轮没取到可用帧（坏帧/暖机帧用尽），**会话本身是好的**。
+         * 绝不在这里关会话 —— STREAMOFF + close 正是把 DVP 完成回调变成
+         * 「下一次会话 done_list 里残留元素」的那一步（见 camera_resync_locked()），
+         * 旧代码「一失败就关会话」把一次偶发坏帧放大成自持的 0 字节帧循环
+         * （串口上就是 bad=11 反复出现、永不恢复）。改为：留着会话就地重试，
+         * 连续 CAMERA_SOFT_FAIL_LIMIT 次都不行才重建（重建本身只要一帧的钱）。 */
+        s_cam.soft_fail_streak++;
+        if (s_cam.soft_fail_streak >= CAMERA_SOFT_FAIL_LIMIT) {
+            ESP_LOGW(TAG, "[cam] %" PRIu32 " grabs in a row without a usable frame - rebuilding session",
+                     s_cam.soft_fail_streak);
+            camera_session_close_locked();   /* soft_fail_streak 随会话一起清零 */
         }
+    } else if (ret != ESP_OK) {
+        /* 硬失败（DQBUF/QBUF ioctl 出错、没内存、会话没打开）：状态可疑，重建。 */
+        camera_session_close_locked();
     }
-    if (fd >= 0) {
-        close(fd);
-    }
+
+    s_cam_last_use_us = esp_timer_get_time();   /* 空闲回收的计时基准 */
+    xSemaphoreGive(s_camera_mutex);
+
     if (ret != ESP_OK) {
         jpeg_frame_free(out);
     }
-    if (locked) {
-        xSemaphoreGive(s_camera_mutex);   /* 相机交还：直播循环 / 下一次拍照继续用 */
-    }
     return ret;
 }
+
+/* 单帧拍照（Web「拍一张照片」/ kind=camera 任务）。 */
+static esp_err_t app_camera_capture_jpeg(jpeg_frame_t *out)
+{
+    return app_camera_capture_jpeg_ex(out, CAMERA_MODE_PHOTO);
+}
+
+/* 实时直播 / 本地预览：会话保持打开，坏帧快速失败重试。 */
+static esp_err_t app_camera_capture_jpeg_live(jpeg_frame_t *out)
+{
+    return app_camera_capture_jpeg_ex(out, CAMERA_MODE_LIVE);
+}
+
+/* 空闲回收会话：由 housekeeping_task（优先级最低）周期调用。
+ * 用 0 超时拿锁 —— 采样器/推流任务正在取帧时直接跳过、下轮再看，
+ * 绝不为了关相机去阻塞任何实时路径。 */
+static void camera_session_idle_close(void)
+{
+    if (!s_camera_ready || !s_camera_mutex || s_cam.fd < 0) {
+        return;
+    }
+    /* 直播/预览期间不回收会话。这两条路径本来就 ~50 ms 取一帧、永远不会「空闲」；
+     * 能凑满 CAMERA_SESSION_IDLE_MS 的只有「HTTP 上传把节拍拖长」这种情况，
+     * 而那正是最不该 STREAMOFF 的时刻：一次 open/close 要重来一遍
+     * 16 KiB 内部 DMA + 3×307200 B PSRAM 的分配，还会把 dma_largest 压低
+     * （2026-09-30 一轮 250 s 实测：直播/预览开着时 dma_largest 从 10240 掉到
+     *  4096 B，正是 SD 写 errno=5 的前置条件）。 */
+    if (s_live_streaming || s_preview_active) {
+        return;
+    }
+    if (xSemaphoreTake(s_camera_mutex, 0) != pdTRUE) {
+        return;
+    }
+    if (s_cam_last_use_us > 0
+        && esp_timer_get_time() - s_cam_last_use_us > (int64_t)CAMERA_SESSION_IDLE_MS * 1000) {
+        camera_session_close_locked();
+    }
+    xSemaphoreGive(s_camera_mutex);
+}
+
 /* ================================================================
  *  Local LCD camera preview（长按 Button A 三态循环的第 3 态）
  *
@@ -1727,11 +2581,18 @@ cleanup:
 static lv_obj_t *s_preview_canvas = NULL;
 static uint8_t *s_preview_canvas_buf = NULL;   /* 240x240 RGB565，直接绑定给 canvas */
 static uint8_t *s_preview_decode_buf = NULL;   /* 320x240 RGB565，解码中间缓冲 */
+/* 最近一次解码结果的尺寸：中心裁剪要按它算偏移（见 camera_preview_blit）。
+ * 只在预览任务里读写，不需要额外加锁。 */
+static uint32_t s_preview_decoded_w = 0;
+static uint32_t s_preview_decoded_h = 0;
 
-/* 一帧 JPEG → RGB565，中心裁剪进 240x240 的 dst。 */
-static bool camera_preview_decode(const jpeg_frame_t *frame, uint8_t *dst)
+/* 一帧 JPEG → RGB565 软解到 s_preview_decode_buf（**不碰 LVGL 缓冲**）。
+ * 为什么不直接写 canvas 缓冲：canvas 缓冲归 LVGL 渲染线程读，跨任务写入必须在
+ * bsp_display_lock 之内（见 camera_preview_blit），而软解要 30~80 ms，不该把显示锁
+ * 按住那么久。因此拆成「锁外解码 + 锁内拷贝」两段。 */
+static bool camera_preview_decode(const jpeg_frame_t *frame)
 {
-    if (!frame || !frame->data || frame->len < 16 || !dst || !s_preview_decode_buf) {
+    if (!frame || !frame->data || frame->len < 16 || !s_preview_decode_buf) {
         return false;
     }
     esp_jpeg_image_cfg_t cfg = {
@@ -1751,14 +2612,28 @@ static bool camera_preview_decode(const jpeg_frame_t *frame, uint8_t *dst)
         out.width < CAMERA_PREVIEW_W || out.height < CAMERA_PREVIEW_H) {
         return false;
     }
-    /* 中心裁剪：左右各去掉 (out.width - 240)/2 列，逐行拷贝 240 个像素。 */
-    const int x_off = ((int)out.width - CAMERA_PREVIEW_W) / 2;
+    s_preview_decoded_w = out.width;
+    s_preview_decoded_h = out.height;
+    return true;
+}
+
+/* 把最近一次解码结果中心裁剪进 LVGL canvas 的后备缓冲。
+ * **必须在 bsp_display_lock 之内调用**：否则 LVGL 渲染线程可能正在读同一块内存
+ * （旧写法在锁外直接 memcpy 进 canvas 缓冲，画面会撕裂/闪残帧）。 */
+static void camera_preview_blit(uint8_t *dst)
+{
+    if (!dst || !s_preview_decode_buf ||
+        s_preview_decoded_w < CAMERA_PREVIEW_W ||
+        s_preview_decoded_h < CAMERA_PREVIEW_H) {
+        return;
+    }
+    /* 中心裁剪：左右各去掉 (width - 240)/2 列，逐行拷贝 240 个像素。 */
+    const int x_off = ((int)s_preview_decoded_w - CAMERA_PREVIEW_W) / 2;
     for (int y = 0; y < CAMERA_PREVIEW_H; y++) {
         memcpy(dst + (size_t)y * CAMERA_PREVIEW_W * 2,
-               s_preview_decode_buf + ((size_t)y * out.width + x_off) * 2,
+               s_preview_decode_buf + ((size_t)y * s_preview_decoded_w + x_off) * 2,
                CAMERA_PREVIEW_W * 2);
     }
-    return true;
 }
 
 /* 惰性创建预览 canvas + 双缓冲；只做一次，之后反复 show/hide。 */
@@ -1800,9 +2675,14 @@ static void camera_preview_task(void *arg)
     ESP_LOGI(TAG, "[prev] preview started (240x240 RGB565)");
     while (s_preview_active) {
         jpeg_frame_t frame = { 0 };
-        if (app_camera_capture_jpeg(&frame) == ESP_OK) {
-            if (camera_preview_decode(&frame, s_preview_canvas_buf)) {
+        /* 预览按 50 ms 节拍连续取帧 → 走 live 入口：会话保持打开，
+         * DQBUF 上限 800 ms，坏帧快速失败重试（见「Camera — 持久会话」）。 */
+        if (app_camera_capture_jpeg_live(&frame) == ESP_OK) {
+            if (camera_preview_decode(&frame)) {
+                /* 锁内只做「拷贝 + 标脏」：解码已在锁外完成，显示锁的持有时间只剩
+                 * 115 KB memcpy 的量级（毫秒级），不会卡住 LVGL 的刷新节拍。 */
                 if (bsp_display_lock(0)) {
+                    camera_preview_blit(s_preview_canvas_buf);
                     lv_obj_invalidate(s_preview_canvas);
                     bsp_display_unlock();
                 }
@@ -1884,85 +2764,6 @@ static calibration_face_t get_next_face(calibration_face_t current)
     }
 }
 
-/* Check if sensor is stationary (low variance in acceleration) */
-static bool check_stationary(float ax, float ay, float az)
-{
-    s_stationary_buffer_x[s_stationary_index] = ax;
-    s_stationary_buffer_y[s_stationary_index] = ay;
-    s_stationary_buffer_z[s_stationary_index] = az;
-    s_stationary_index = (s_stationary_index + 1) % STATIONARY_SAMPLES;
-
-    if (!s_stationary_ready) {
-        if (s_stationary_index == 0) {
-            s_stationary_ready = true;
-        } else {
-            return false;
-        }
-    }
-
-    /* Calculate variance for each axis */
-    float sum_x = 0, sum_y = 0, sum_z = 0;
-    float sum_sq_x = 0, sum_sq_y = 0, sum_sq_z = 0;
-
-    for (uint32_t i = 0; i < STATIONARY_SAMPLES; i++) {
-        sum_x += s_stationary_buffer_x[i];
-        sum_y += s_stationary_buffer_y[i];
-        sum_z += s_stationary_buffer_z[i];
-        sum_sq_x += s_stationary_buffer_x[i] * s_stationary_buffer_x[i];
-        sum_sq_y += s_stationary_buffer_y[i] * s_stationary_buffer_y[i];
-        sum_sq_z += s_stationary_buffer_z[i] * s_stationary_buffer_z[i];
-    }
-
-    float mean_x = sum_x / STATIONARY_SAMPLES;
-    float mean_y = sum_y / STATIONARY_SAMPLES;
-    float mean_z = sum_z / STATIONARY_SAMPLES;
-
-    float var_x = (sum_sq_x / STATIONARY_SAMPLES) - (mean_x * mean_x);
-    float var_y = (sum_sq_y / STATIONARY_SAMPLES) - (mean_y * mean_y);
-    float var_z = (sum_sq_z / STATIONARY_SAMPLES) - (mean_z * mean_z);
-
-    /* Check if all variances are below threshold */
-    return (var_x < STATIONARY_THRESHOLD * STATIONARY_THRESHOLD) &&
-           (var_y < STATIONARY_THRESHOLD * STATIONARY_THRESHOLD) &&
-           (var_z < STATIONARY_THRESHOLD * STATIONARY_THRESHOLD);
-}
-
-/* Detect which face is currently up based on gravity direction */
-static calibration_face_t detect_current_face(float ax, float ay, float az)
-{
-    /* Gravity is approximately 9.8 m/s² pointing downward */
-    /* When a face is "up", the opposite axis points toward gravity */
-    /* Example: +Z face up → Z axis points up → accel_z ≈ -9.8 m/s² */
-
-    float threshold = 5.0f; /* m/s² - must be close to ±g */
-
-    /* Check Z axis first (most common orientation) */
-    if (az < -threshold) {
-        return FACE_POS_Z;  /* +Z face up, gravity pulls -Z */
-    }
-    if (az > threshold) {
-        return FACE_NEG_Z;  /* -Z face up, gravity pulls +Z */
-    }
-
-    /* Check X axis */
-    if (ax < -threshold) {
-        return FACE_POS_X;  /* +X face up, gravity pulls -X */
-    }
-    if (ax > threshold) {
-        return FACE_NEG_X;  /* -X face up, gravity pulls +X */
-    }
-
-    /* Check Y axis */
-    if (ay < -threshold) {
-        return FACE_POS_Y;  /* +Y face up, gravity pulls -Y */
-    }
-    if (ay > threshold) {
-        return FACE_NEG_Y;  /* -Y face up, gravity pulls +Y */
-    }
-
-    return FACE_IDLE; /* Not aligned with any face */
-}
-
 /* Start calibration mode */
 static esp_err_t start_calibration_locked(void)
 {
@@ -1987,6 +2788,9 @@ static esp_err_t start_calibration_locked(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    /* 静态内部 RAM 缓冲（见「CSV 落盘缓冲 / 刷盘策略」）：让 FatFs 拿到的是
+     * 内部 DMA 指针，SDMMC 走直通路径，不再每 10 ms 申请一次 bounce buffer。 */
+    csv_io_attach(s_data_file);
 
     /* CSV header for calibration data */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -1996,12 +2800,12 @@ static esp_err_t start_calibration_locked(void)
     const char *calib_path = BSP_SD_MOUNT_POINT "/calibration.csv";
     s_calibration_file = fopen(calib_path, "w");
     if (!s_calibration_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
+        csv_fclose(&s_data_file);
         int err = errno;
         set_status_locked("Open calibration.csv failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_calibration_file);
     fprintf(s_calibration_file, "axis,offset,scale,unit\n");
     fflush(s_calibration_file);
 
@@ -2021,8 +2825,6 @@ static esp_err_t start_calibration_locked(void)
     s_current_face = FACE_POS_X;
     s_face_sample_count = 0;
     s_face_start_time_ms = esp_timer_get_time() / 1000;
-    s_stationary_index = 0;
-    s_stationary_ready = false;
     snprintf(s_face_name, sizeof(s_face_name), "Face: +X (0s)");
 
     /* Reset frequency measurement */
@@ -2049,19 +2851,13 @@ static esp_err_t start_calibration_locked(void)
 /* Complete calibration and write calibration.csv */
 static void complete_calibration_locked(void)
 {
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    csv_fclose(&s_data_file);
 
     s_collecting = false;
     s_current_face = FACE_IDLE;
     snprintf(s_face_name, sizeof(s_face_name), "Face: COMPLETE");
 
-    if (s_calibration_file) {
-        fclose(s_calibration_file);
-        s_calibration_file = NULL;
-    }
+    csv_fclose(&s_calibration_file);
 
     set_status_locked("Calibration complete!");
     ESP_LOGI(TAG, "Calibration complete. See calibration.csv for parameters");
@@ -2072,22 +2868,28 @@ static void complete_calibration_locked(void)
  * ================================================================ */
 static void stop_collection_locked(const char *reason)
 {
-    /* Alias protection: s_data_file and s_jump_data_file may point to the
-     * same FILE. If so, detach s_jump_data_file so we never double-close.
-     * s_jump_protocol_active guard is checked inside the block. */
-    if (s_jump_data_file == s_data_file && s_data_file != NULL) {
-        s_jump_data_file = NULL;
+    /* Alias protection: s_data_file / s_jump_data_file / s_stand_data_file may
+     * point to the SAME FILE (see `s_data_file = s_jump_data_file;` in
+     * start_jump_protocol_locked and `s_data_file = s_stand_data_file;` in
+     * create_stand_file_for_current_group). Detach the aliases first so we
+     * never fclose() the same FILE twice.
+     *
+     * 注意：以前只拦了 jump，stand 没拦 —— stand 会话 stop 之后
+     * s_stand_data_file 仍然指向已关闭的 FILE，下一轮 stand 的
+     * create_stand_file_for_current_group() 又去 fclose(s_stand_data_file)，
+     * 就是一次 double free。这里一并修掉。 */
+    if (s_data_file != NULL) {
+        if (s_jump_data_file == s_data_file) {
+            s_jump_data_file = NULL;
+        }
+        if (s_stand_data_file == s_data_file) {
+            s_stand_data_file = NULL;
+            s_stand_file_open = false;
+        }
     }
 
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
-
-    if (s_calibration_file) {
-        fclose(s_calibration_file);
-        s_calibration_file = NULL;
-    }
+    csv_fclose(&s_data_file);
+    csv_fclose(&s_calibration_file);
 
     s_collecting = false;
     s_current_face = FACE_IDLE;
@@ -2113,10 +2915,7 @@ static void stop_collection_locked(const char *reason)
 
     /* Also reset jump protocol state if active */
     if (s_jump_protocol_active) {
-        if (s_jump_data_file) {
-            fclose(s_jump_data_file);
-            s_jump_data_file = NULL;
-        }
+        csv_fclose(&s_jump_data_file);
         s_jump_protocol_active = false;
         s_jump_state = JUMP_PROTOCOL_IDLE;
         s_jump_label[0] = '\0';
@@ -2163,6 +2962,7 @@ static esp_err_t start_collection_locked(void)
 
         s_data_file = fopen(s_file_path, "w");
         if (s_data_file) {
+            csv_io_attach(s_data_file);
             /* CSV header - label first format */
             fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
             fflush(s_data_file);
@@ -2218,12 +3018,9 @@ static esp_err_t start_collection_locked(void)
 /* Create stand file for current group */
 static esp_err_t create_stand_file_for_current_group(void)
 {
-    /* Close previous file if open */
-    if (s_stand_data_file) {
-        fclose(s_stand_data_file);
-        s_stand_data_file = NULL;
-        s_stand_file_open = false;
-    }
+    /* Close previous file if open（顺带归还静态 stdio 缓冲槽位） */
+    csv_fclose(&s_stand_data_file);
+    s_stand_file_open = false;
 
     /* Create stand data file for current group */
     char stand_file_path[STAND_FILE_PATH_LEN];
@@ -2238,6 +3035,7 @@ static esp_err_t create_stand_file_for_current_group(void)
         return ESP_FAIL;
     }
     s_stand_file_open = true;
+    csv_io_attach(s_stand_data_file);   /* 静态内部 RAM stdio 缓冲，见「CSV 落盘缓冲」 */
 
     /* CSV header - label first format */
     fprintf(s_stand_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2311,10 +3109,11 @@ static esp_err_t start_stand_protocol_locked(void)
 /* Complete stand protocol and close file */
 static void complete_stand_protocol_locked(void)
 {
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    csv_fclose(&s_data_file);
+    /* s_data_file 是 s_stand_data_file 的别名（见 create_stand_file_for_current_group），
+     * 上面已经关掉了，这里必须同步清空，否则留下悬空指针。 */
+    s_stand_data_file = NULL;
+    s_stand_file_open = false;
 
     s_collecting = false;
     s_stand_protocol_active = false;
@@ -2352,6 +3151,7 @@ static esp_err_t start_stairs_protocol_locked(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_data_file);
 
     /* CSV header - label first format */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2398,11 +3198,8 @@ static esp_err_t start_stairs_protocol_locked(void)
 /* Create stairs file for current group */
 static esp_err_t create_stairs_file_for_current_group(void)
 {
-    /* Close previous file if open */
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    /* Close previous file if open（顺带归还静态 stdio 缓冲槽位） */
+    csv_fclose(&s_data_file);
 
     /* Create stairs data file for current group */
     char stairs_file_path[STAIRS_FILE_PATH_LEN];
@@ -2416,6 +3213,7 @@ static esp_err_t create_stairs_file_for_current_group(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_data_file);
 
     /* CSV header - label first format */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2429,10 +3227,7 @@ static esp_err_t create_stairs_file_for_current_group(void)
 /* Complete stairs protocol and close file */
 static void complete_stairs_protocol_locked(void)
 {
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    csv_fclose(&s_data_file);
 
     s_collecting = false;
     s_stairs_protocol_active = false;
@@ -2470,6 +3265,7 @@ static esp_err_t start_bend_protocol_locked(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_data_file);
 
     /* CSV header - label first format */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2516,11 +3312,8 @@ static esp_err_t start_bend_protocol_locked(void)
 /* Create bend file for current group */
 static esp_err_t create_bend_file_for_current_group(void)
 {
-    /* Close previous file if open */
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    /* Close previous file if open（顺带归还静态 stdio 缓冲槽位） */
+    csv_fclose(&s_data_file);
 
     /* Create bend data file for current group */
     char bend_file_path[FILE_PATH_LEN];
@@ -2534,6 +3327,7 @@ static esp_err_t create_bend_file_for_current_group(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_data_file);
 
     /* CSV header - label first format */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2547,10 +3341,7 @@ static esp_err_t create_bend_file_for_current_group(void)
 /* Complete bend protocol and close file */
 static void complete_bend_protocol_locked(void)
 {
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    csv_fclose(&s_data_file);
 
     s_collecting = false;
     s_bend_protocol_active = false;
@@ -2588,6 +3379,7 @@ static esp_err_t start_jump_protocol_locked(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_jump_data_file);
 
     /* CSV header - label first format */
     fprintf(s_jump_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2637,10 +3429,8 @@ static esp_err_t start_jump_protocol_locked(void)
 /* Complete jump protocol and close all files */
 static void complete_jump_protocol_locked(void)
 {
-    if (s_jump_data_file) {
-        fclose(s_jump_data_file);
-        s_jump_data_file = NULL;
-    }
+    csv_fclose(&s_jump_data_file);
+    s_data_file = NULL;   /* s_data_file 是 s_jump_data_file 的别名，已随上面关闭 */
 
     s_collecting = false;
     s_jump_protocol_active = false;
@@ -2678,6 +3468,7 @@ static esp_err_t start_fall_protocol_locked(void)
         set_status_locked("Open file failed (errno=%d)", err);
         return ESP_FAIL;
     }
+    csv_io_attach(s_data_file);
 
     /* CSV header - label first format */
     fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
@@ -2726,10 +3517,7 @@ static esp_err_t start_fall_protocol_locked(void)
 /* Complete fall protocol and close file */
 static void complete_fall_protocol_locked(void)
 {
-    if (s_data_file) {
-        fclose(s_data_file);
-        s_data_file = NULL;
-    }
+    csv_fclose(&s_data_file);
 
     s_collecting = false;
     s_fall_protocol_active = false;
@@ -2857,29 +3645,6 @@ static void button_b_long_press_cb(void *arg, void *data)
     refresh_ui();
 }
 
-/* Calculate and write calibration parameters */
-static void calculate_and_write_calibration(float ax_mean, float ay_mean, float az_mean)
-{
-    (void)ax_mean; (void)ay_mean; (void)az_mean;
-    if (!s_calibration_file) return;
-
-    /* 
-     * Calibration formula: real_value = (raw_value - offset) / scale
-     * 
-     * For each face, we know the expected gravity value:
-     * +X face up: ax ≈ -9.80665, ay ≈ 0, az ≈ 0
-     * -X face up: ax ≈ +9.80665, ay ≈ 0, az ≈ 0
-     * +Y face up: ax ≈ 0, ay ≈ -9.80665, az ≈ 0
-     * -Y face up: ax ≈ 0, ay ≈ +9.80665, az ≈ 0
-     * +Z face up: ax ≈ 0, ay ≈ 0, az ≈ -9.80665
-     * -Z face up: ax ≈ 0, ay ≈ 0, az ≈ +9.80665
-     * 
-     * We collect data from all 6 faces and calculate:
-     * offset = (sum of raw values for + direction - sum of raw values for - direction) / 2
-     * scale = gravity / ((sum of + direction raw - sum of - direction raw) / 2)
-     */
-}
-
 /* ================================================================
  *  Button Callback
  * ================================================================ */
@@ -2897,11 +3662,13 @@ static void button_a_single_click_cb(void *arg, void *data)
         snprintf(reason, sizeof(reason), "Saved %" PRIu32 " samples", s_sample_count);
         stop_collection_locked(reason);
         
-        /* Log final frequency measurement (integer: Hz*100 for 0.01 Hz precision) */
+        /* Log final frequency measurement (Hz with one decimal — 以前这里同样把
+         * Hz×100 标成 "Hz"，见采样循环里「6. Frequency measurement」的说明) */
         if (s_freq_valid) {
-            int32_t freq_d2 = (int32_t)(s_measured_freq_hz * 100);
-            ESP_LOGI(TAG, "Session complete. Measured frequency: %" PRId32 " Hz (Target: %d Hz)", 
-                     freq_d2, TARGET_SAMPLE_FREQ_HZ);
+            int32_t freq_d10 = (int32_t)(s_measured_freq_hz * 10);
+            ESP_LOGI(TAG, "Session complete. Measured frequency: %" PRId32 ".%" PRId32
+                          " Hz (Target: %d Hz)",
+                     freq_d10 / 10, freq_d10 % 10, TARGET_SAMPLE_FREQ_HZ);
         }
         
         ESP_LOGI(TAG, "Logging stopped");
@@ -3573,13 +4340,30 @@ static esp_err_t http_collect_event_handler(esp_http_client_event_t *evt)
 
 /* Derive sibling API URLs from the configured upload URL by swapping the
  * "/api/v1/upload" suffix for path. Returns false when the suffix is absent,
- * so callers can disable polling instead of hitting a wrong address. */
+ * so callers can disable polling instead of hitting a wrong address.
+ *
+ * Contract: CONFIG_SENSOR_SERVER_URL must *end* with that suffix (an accidental
+ * trailing '/' is tolerated). If something follows the suffix -- a query
+ * string, a redirect target -- this function would silently drop it while the
+ * upload itself keeps using the configured URL verbatim, i.e. uploads would
+ * work while tasks/photos/live mysteriously fail. A URL that merely *contains*
+ * the suffix has the opposite failure mode (we would build
+ * "http://host/redir?u=/api/v1/tasks/next"). Both are rejected here so the
+ * misconfiguration shows up as a loud, local "cannot derive API base" warning. */
 static bool server_api_url(char *out, size_t out_len, const char *path)
 {
     const char *base = CONFIG_SENSOR_SERVER_URL;
     const char *suffix = "/api/v1/upload";
     const char *pos = strstr(base, suffix);
     if (!pos) {
+        return false;
+    }
+    /* The suffix must be the *tail* of the configured URL: */
+    const char *tail = pos + strlen(suffix);
+    if (*tail == '/') {
+        tail++;
+    }
+    if (*tail != '\0') {
         return false;
     }
     int n = snprintf(out, out_len, "%.*s%s", (int)(pos - base), base, path);
@@ -3949,7 +4733,9 @@ static void live_stream_task(void *arg)
         }
 
         jpeg_frame_t frame = { 0 };
-        esp_err_t ret = app_camera_capture_jpeg(&frame);
+        /* 直播走 live 入口：会话保持打开（不再每帧 STREAMON/STREAMOFF），
+         * DQBUF 上限 800 ms，坏帧快速失败重试。 */
+        esp_err_t ret = app_camera_capture_jpeg_live(&frame);
         if (ret != ESP_OK) {
             /* 相机忙（按需拍照正在用）也走这里，下一轮自然重试 */
             fail_streak++;
@@ -4786,7 +5572,7 @@ static void uploader_task(void *arg)
  *     docs/wifi_network_troubleshooting.md）。
  *  3) 拿到租约又被路由器收回（IP_EVENT_STA_LOST_IP）：状态会回到未联网，
  *     这里同样按 (2) 处理。
- *  4) 整个网段没有 DHCP 服务在应答（现场实测：10.1.41.0/24 三种客户端 MAC
+ *  4) 整个网段没有 DHCP 服务在应答（现场实测：192.0.2.0/24 三种客户端 MAC
  *     全部 8 s 零回应）：DHCP 重启/重关联都注定失败。Kconfig 打开
  *     "Static IP Fallback" 后，这里在确认 DHCP 无救时改用固定地址，
  *     让板子至少能联网对时（细节见 apply_static_ip_fallback()）。
@@ -4940,6 +5726,78 @@ static void wifi_health_check(void)
     }
 }
 
+/* ================================================================
+ *  后台维护任务（housekeeping）
+ *
+ *  这些活以前都挂在 sampler_task（优先级 5）里，和 10 ms 采样共用一个循环：
+ *    - refresh_ui()        ：LVGL 上屏；本地预览态下还要 JPEG 软解 320×240，
+ *                            一次 30~80 ms —— 直接把 7 个采样周期吃掉。
+ *    - refresh_time_str()  ：每秒一次，本身便宜，但它在同一个临界区里排队。
+ *    - wifi_health_check() ：每 5 s 一次；DHCP 重启/重新关联会阻塞上百 ms。
+ *    - log_heap()          ：每 2 s 一次，printf 本身在 921600 波特率下也要
+ *                            几毫秒到几十毫秒（串口是阻塞写）。
+ *  它们都不是「采样」该干的事，却直接决定了采样抖动有多大 —— 正是
+ *  「频率虚高 + 追赶连打」的燃料。全部搬到这里，优先级 2（低于
+ *  task_poll(3)/uploader(4)/sampler(8)），只在采样器空转时才跑。
+ *
+ *  另外还顺手做一件小事：**相机采集会话的空闲回收**（
+ *  camera_session_idle_close）。相机改成「持久会话」后不再每帧 STREAMON，
+ *  必须有人在没人用相机时把它关掉（放掉 DVP + mmap + fd），否则传感器会一直
+ *  满速出图白烧电。用 0 超时拿相机锁，正在取帧就跳过，绝不阻塞实时路径。
+ *
+ *  这三个函数各自内部都会取 s_state_mutex（log_heap 无锁），所以从哪个任务
+ *  调用都安全。周期是各自独立的，故本任务只按 100 ms 心跳醒来判断一次。
+ * ================================================================ */
+#define HK_TICK_MS              100
+#define HK_UI_PERIOD_US         1000000      /* refresh_ui / refresh_time_str */
+#define HK_HEAP_PERIOD_US       2000000      /* log_heap */
+#define HK_WIFI_PERIOD_US       5000000      /* wifi_health_check */
+#define HK_CAM_PERIOD_US        500000      /* 相机会话空闲回收（相机锁用 0 超时，很便宜） */
+
+static void housekeeping_task(void *arg)
+{
+    (void)arg;
+
+    int64_t last_ui_us   = 0;
+    int64_t last_heap_us = 0;
+    int64_t last_wifi_us = 0;
+    int64_t last_cam_us  = 0;
+
+    while (true) {
+        int64_t now_us = esp_timer_get_time();
+
+        if (now_us - last_heap_us >= HK_HEAP_PERIOD_US) {
+            last_heap_us = now_us;
+            log_heap(s_collecting ? "sampler(collecting)" : "sampler(idle)");
+        }
+
+        /* LCD「Time:」每秒刷新：已同步写北京时间，未同步写 uptime ——
+         * 无论联不联网这一行都在动，所以「时间不对」和「板子卡死」在 LCD 上
+         * 可以直接区分开。 */
+        if (now_us - last_ui_us >= HK_UI_PERIOD_US) {
+            last_ui_us = now_us;
+            refresh_time_str();
+            refresh_ui();
+        }
+
+        /* WiFi 自愈：里面可能重启 DHCP 客户端甚至重新关联，耗时不可控，
+         * 所以放在优先级最低的任务里，绝不阻塞采样。 */
+        if (now_us - last_wifi_us >= HK_WIFI_PERIOD_US) {
+            last_wifi_us = now_us;
+            wifi_health_check();
+        }
+
+        /* 相机会话空闲回收：直播/预览停了、或者上一次拍照之后没人再用相机，
+         * 就把 STREAMON 的会话关掉（STREAMOFF + munmap + close）。见「Camera —
+         * 持久会话」：会话开着时传感器一直满速出图，不能一直不管。 */
+        if (now_us - last_cam_us >= HK_CAM_PERIOD_US) {
+            last_cam_us = now_us;
+            camera_session_idle_close();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(HK_TICK_MS));
+    }
+}
 static void sampler_task(void *arg)
 {
     (void)arg;
@@ -4955,36 +5813,34 @@ static void sampler_task(void *arg)
      * resumed) is where the half-filled 1 s window is dropped. */
     bool periodic_pause_was_on = false;
 
+    /* ----------------------------------------------------------------
+     * CSV 刷盘节流 + 写失败容忍（见「CSV 落盘缓冲 / 刷盘策略」）
+     *   csv_flush_next_us : 下一次按时间刷盘的目标时刻
+     *   csv_fail_streak   : 连续「一个采样周期都没写成功」的次数
+     * ---------------------------------------------------------------- */
+    int64_t  csv_flush_next_us = 0;
+    uint32_t csv_fail_streak = 0;
+
+    /* ----------------------------------------------------------------
+     * 节拍遥测（每 1 s 一行 [TICK]）：把「100 Hz」从"信以为真"变成可观测。
+     * 旧实现只有一个 100 点平均值，而且打印时把 Hz×100 当 Hz、把 0.01 s 当 s
+     * （串口上会出现 "Frequency measured: 12419 Hz ... Time: 124 s" 这种鬼数字），
+     * 更关键的是采样器的追赶逻辑会把漏掉的 tick 一次性连打出来 —— 平均值
+     * 看着还行，数据的实际时间分布却是一串「快-快-快-停」。
+     * ---------------------------------------------------------------- */
+    int64_t  tick_stat_start_us   = esp_timer_get_time();
+    uint32_t tick_stat_ticks      = 0;   /* 本轮统计实际执行的 tick 数 */
+    uint32_t tick_stat_late       = 0;   /* 从前一 tick 至此超过 1.5 个周期的次数 */
+    uint32_t tick_stat_catchup    = 0;   /* 「醒来时已过目标时刻」的次数（旧实现会连打） */
+    uint32_t tick_stat_missed     = 0;   /* 已彻底放弃、只重同步的次数 */
+    int32_t  tick_stat_max_late_us = 0;
+
     while (true) {
-        /* Do NOT refresh UI in every loop — only when state changes or periodically.
-         * This reduces jitter in the critical sampling path. */
-
-        /* Periodic heap telemetry (every 2 s). Deliberately OUTSIDE the state
-         * mutex so it never lengthens the 10 ms sampling critical section. */
-        static int64_t s_last_heap_log_us;
-        int64_t heap_now_us = esp_timer_get_time();
-        if (heap_now_us - s_last_heap_log_us >= 2000000) {
-            s_last_heap_log_us = heap_now_us;
-            log_heap(s_collecting ? "sampler(collecting)" : "sampler(idle)");
-        }
-
-        /* LCD「Time:」每秒刷新一次（同样在状态互斥锁之外，不拉长采样临界区）：
-         * 已同步写北京时间，未同步写 uptime —— 无论联不联网，这一行都在动，
-         * 所以「时间不对」和「板子卡死」在 LCD 上可以直接区分开。 */
-        static int64_t s_last_time_ui_us;
-        if (heap_now_us - s_last_time_ui_us >= 1000000) {
-            s_last_time_ui_us = heap_now_us;
-            refresh_time_str();
-            refresh_ui();
-        }
-
-        /* WiFi 自愈检查（每 5 s 一次）。必须在状态互斥锁之外：
-         * 里面可能重启 DHCP 客户端甚至重新关联，耗时不可控。 */
-        static int64_t s_last_wifi_check_us;
-        if (heap_now_us - s_last_wifi_check_us >= 5000000) {
-            s_last_wifi_check_us = heap_now_us;
-            wifi_health_check();
-        }
+        /* 注意：这里**不再**做 1 s 的 refresh_ui()/refresh_time_str()、
+         * 5 s 的 wifi_health_check()、2 s 的 log_heap()。它们是采样抖动的主要
+         * 来源（LVGL 上屏 + JPEG 解码共 30~80 ms、DHCP 重启上百 ms），
+         * 已全部搬到优先级更低的 housekeeping_task（见「后台维护任务」一节）。
+         * 本任务只干三件事：读 IMU、写 CSV、跑协议状态机。 */
 
         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             /* Sampling gate: s_collecting (button/SD session) OR an on-demand
@@ -5007,6 +5863,9 @@ static void sampler_task(void *arg)
             if (gate_open && !gate_was_open) {
                 s_sample_count = 0;
                 s_upload_count = 0;
+                /* 新会话：立刻允许第一次刷盘，并清掉上个会话残留的失败计数 */
+                csv_flush_next_us = 0;
+                csv_fail_streak = 0;
             }
             gate_was_open = gate_open;
 
@@ -5083,16 +5942,75 @@ static void sampler_task(void *arg)
                                 label_buf,
                                 timestamp_ms,
                                 ax_ms2, ay_ms2, az_ms2) < 0) {
+                        /* 4096 B 缓冲下 fprintf 只在「缓冲写满、触发真实写盘」时
+                         * 才失败，所以走到这里就是 SD 写盘失败本身。 */
                         csv_write_failed = true;
                     } else {
-                        fflush(write_file);
+                        /* ---- 刷盘策略：按时间，不按样点 ----
+                         * 旧实现每个点都 fflush()：100 次/秒的单扇区写，每次都要
+                         * 在内部 DMA 堆里申请 512 B 的 bounce buffer（ESP32-S3 的
+                         * SDMMC 不能对 PSRAM DMA），而单扇区写的尾延迟（SD 卡
+                         * 内部 GC/磨损均衡时可达 50~200 ms）又直接砸进 10 ms 的
+                         * 采样周期里 —— 它既是 SD 写失败的元凶，也是采样抖动的元凶。
+                         * 现在改成最多每 CSV_FLUSH_INTERVAL_MS 一次整块刷盘；
+                         * 协议阶段切换点与 stop_collection_locked() 仍立即刷盘，
+                         * 所以掉电最多丢 CSV_FLUSH_INTERVAL_MS 的数据。 */
+                        int64_t now_us_flush = esp_timer_get_time();
+                        if (now_us_flush >= csv_flush_next_us) {
+                            csv_flush_next_us = now_us_flush
+                                + (int64_t)CSV_FLUSH_INTERVAL_MS * 1000;
+                            for (int attempt = 0; attempt < CSV_FLUSH_RETRY; attempt++) {
+                                if (fflush(write_file) == 0) {
+                                    break;
+                                }
+                                csv_write_failed = true;
+                                /* 错误标志是粘的：不清掉后面每次都会立刻失败。
+                                 * 清掉并立刻重试（= 同一个 tick 里再申请一次
+                                 * bounce buffer）；因为这一次什么都没真正写出
+                                 * 去，重试不会产生重复行。偶发的堆碎片就靠这个
+                                 * 挺过去，只有持续失败才会计入 fail_streak。 */
+                                clearerr(write_file);
+                                vTaskDelay(1);
+                            }
+                        }
                     }
                 }
 
                 if (csv_write_failed) {
-                    stop_collection_locked("Write failed");
-                    ESP_LOGE(TAG, "CSV write failed");
-                } else {
+                    csv_fail_streak++;
+                    if (csv_fail_streak == 1) {
+                        /* 第一次失败就把现场打全：以前只有一句
+                         * "CSV write failed"，完全看不出失败点是内部 DMA 堆
+                         * （MALLOC_CAP_DMA）碎片，而不是"总内存不够"。 */
+                        ESP_LOGE(TAG, "[csv] write failed #%u/%d errno=%d ferror=%d"
+                                      " file=%s samples=%" PRIu32
+                                      " | dma_free=%u dma_largest=%u int_largest=%u",
+                                 (unsigned)csv_fail_streak, CSV_WRITE_FAIL_LIMIT,
+                                 errno, ferror(write_file),
+                                 s_file_path[0] ? s_file_path : "(none)",
+                                 s_sample_count,
+                                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                        log_heap("csv write failed");
+                    }
+                    if (csv_fail_streak >= CSV_WRITE_FAIL_LIMIT && s_collecting) {
+                        /* 连续 CSV_WRITE_FAIL_LIMIT 个采样周期一次都没写出去：
+                         * 这不是偶发抖动。停采集并明确报错，而不是默默写出错数据。
+                         * （旧实现是第一次失败就停，一次 5 ms 的内存毛刺就能毁掉
+                         *   一整段录制。） */
+                        stop_collection_locked("Write failed");
+                        ESP_LOGE(TAG, "CSV write failed %d times in a row -> session stopped",
+                                 CSV_WRITE_FAIL_LIMIT);
+                    }
+                }
+                if (!csv_write_failed && csv_fail_streak != 0) {
+                    ESP_LOGW(TAG, "[csv] write recovered after %u failed tick(s)",
+                             (unsigned)csv_fail_streak);
+                    csv_fail_streak = 0;
+                }
+
+                if (!csv_write_failed) {
                     /* Store raw m/s² values for UI (refresh_ui converts to mm/s² for display) */
                     s_latest_accel_x = ax_ms2;
                     s_latest_accel_y = ay_ms2;
@@ -5229,18 +6147,30 @@ static void sampler_task(void *arg)
                         if (elapsed_us > 0) {
                             s_measured_freq_hz = (float)s_freq_sample_count * 1000000.0f / (float)elapsed_us;
                             s_freq_valid = true;
-                            
-                            int32_t freq_d2 = (int32_t)(s_measured_freq_hz * 100);  /* Hz * 100 for integer log (0.01 Hz precision) */
-                            int32_t elapsed_s_d2 = (int32_t)(elapsed_us / 10000);  /* Time in 0.01s units */
-                            ESP_LOGI(TAG, "Frequency measured: %" PRId32 " Hz (Target: %d Hz, Samples: %" PRIu32 ", Time: %" PRId32 " s)",
-                                     freq_d2, TARGET_SAMPLE_FREQ_HZ, 
-                                     s_freq_sample_count, elapsed_s_d2);
-                            
-                            int32_t freq_error_d2 = abs((int32_t)((s_measured_freq_hz - TARGET_SAMPLE_FREQ_HZ) * 100));
-                            if (freq_error_d2 < 500) {  /* 5.00 Hz * 100 */
-                                ESP_LOGI(TAG, "✓ Sampling frequency OK (within ±5 Hz of 100 Hz target)");
+
+                            /* 单位必须写对：以前这里打印 freq*100 却标成 "Hz"、
+                             * 打印 elapsed/10000 却标成 "s"，于是串口上出现
+                             * "Frequency measured: 12419 Hz ... Time: 124 s"
+                             * 这种把 124.19 Hz / 12.4 s 放大 100 倍的鬼数字。
+                             * 现在用整数 + 明确小数位的形式打印，避免 %f 的开销。 */
+                            int32_t freq_d10 = (int32_t)(s_measured_freq_hz * 10);
+                            int32_t freq_err_d10 = (int32_t)(fabsf(s_measured_freq_hz
+                                                                   - TARGET_SAMPLE_FREQ_HZ) * 10);
+                            ESP_LOGI(TAG, "Frequency measured: %" PRId32 ".%" PRId32
+                                          " Hz over %" PRId32 ".%" PRId32 " s"
+                                          " (%" PRIu32 " samples, target %d Hz)",
+                                     freq_d10 / 10, freq_d10 % 10,
+                                     (int32_t)(elapsed_us / 1000000),
+                                     (int32_t)((elapsed_us / 100000) % 10),
+                                     s_freq_sample_count, TARGET_SAMPLE_FREQ_HZ);
+
+                            if (freq_err_d10 < 50) {   /* 5.0 Hz = 50 × 0.1 Hz */
+                                ESP_LOGI(TAG, "✓ Sampling frequency OK (within ±5 Hz of %d Hz target)",
+                                         TARGET_SAMPLE_FREQ_HZ);
                             } else {
-                                ESP_LOGW(TAG, "✗ Sampling frequency OUT OF RANGE (±5 Hz of 100 Hz target)");
+                                ESP_LOGW(TAG, "✗ Sampling frequency OUT OF RANGE (±5 Hz of %d Hz target)"
+                                              " — see the [TICK] line above for late/missed counts",
+                                         TARGET_SAMPLE_FREQ_HZ);
                             }
                         }
                         s_freq_measuring = false;
@@ -5529,11 +6459,11 @@ static void sampler_task(void *arg)
                                 ESP_LOGI(TAG, "[Jump] All %d groups complete!", JUMP_TOTAL_GROUPS);
                                 complete_jump_protocol_locked();
                             } else {
-                                /* Close current group file and open next group file */
-                                if (s_jump_data_file) {
-                                    fclose(s_jump_data_file);
-                                    s_jump_data_file = NULL;
-                                }
+                                /* Close current group file and open next group file
+                                 * （csv_fclose 会归还静态 stdio 缓冲槽位；此刻
+                                 *   s_data_file 是它的别名，一并清掉避免悬空） */
+                                csv_fclose(&s_jump_data_file);
+                                s_data_file = NULL;
                                 
                                 snprintf(s_jump_file_path, sizeof(s_jump_file_path),
                                          BSP_SD_MOUNT_POINT "/jump_%d.csv",
@@ -5545,6 +6475,7 @@ static void sampler_task(void *arg)
                                     complete_jump_protocol_locked();
                                     break;
                                 }
+                                csv_io_attach(s_jump_data_file);
                                 
                                 fprintf(s_jump_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
                                 fflush(s_jump_data_file);
@@ -5626,7 +6557,10 @@ static void sampler_task(void *arg)
                                 ESP_LOGI(TAG, "[Fall] All %d groups complete!", FALL_TOTAL_GROUPS);
                                 complete_fall_protocol_locked();
                             } else {
-                                /* Create new file for next group */
+                                /* Create new file for next group（旧代码漏了 fclose：既泄漏 fd/FILE，
+                                 * 又会让静态 stdio 缓冲槽位一直占着，第 3 组就只能退回
+                                 * PSRAM 缓冲 → 又踩回 SDMMC 的 bounce buffer 老路） */
+                                csv_fclose(&s_data_file);
                                 snprintf(s_file_path, sizeof(s_file_path),
                                          BSP_SD_MOUNT_POINT "/fall_%d.csv",
                                          s_fall_group + 1);
@@ -5636,6 +6570,7 @@ static void sampler_task(void *arg)
                                     complete_fall_protocol_locked();
                                     break;
                                 }
+                                csv_io_attach(s_data_file);
                                 fprintf(s_data_file, "label,timestamp_ms,accel_x,accel_y,accel_z\n");
                                 fflush(s_data_file);
                                 /* Start next group's PREP phase */
@@ -5657,9 +6592,42 @@ static void sampler_task(void *arg)
             xSemaphoreGive(s_state_mutex);
         }
 
-        /* Drift-free timing: wait until absolute target time using esp_timer delay */
-        int64_t now_us = esp_timer_get_time();
-        int64_t delay_us = next_wake_us - now_us;
+        /* ---- 节拍：绝对时间累加，但**绝不追赶** ----
+         * 旧实现只做 next_wake_us += 10 ms，从不重新同步：一旦某个 tick 迟到
+         * （LVGL 上屏、DHCP 重启、SD 擦除……），后续循环就是
+         * 「delay_us <= 0 → 完全不等待」，把欠下的 tick 背靠背连打出来。
+         * 于是串口的 100 点平均频率看着还能看（"12419" 其实是 124.19 Hz），
+         * 而数据的真实时间分布是「一串贴在一起的点 + 一个空洞」；更糟的是
+         * CSV 时间戳是按 base + n*10 ms 合成的，空洞在数据里根本看不出来。
+         *
+         * 改成「前沿对齐」：
+         *   - 迟到 ≤ 1.5 个周期（正常调度抖动）：照常等到目标时刻，最多只
+         *     补一拍，不改变平均速率；
+         *   - 迟到 > 1.5 个周期：欠下的 tick 一律**丢弃**，把相位重新对齐到
+         *     「现在 + 一个周期」，并计入 tick_stat_missed。
+         * 宁可少几个点（并在日志里明确记下来），也不要制造假数据。 */
+        int64_t now_us    = esp_timer_get_time();
+        int64_t target_us = next_wake_us;
+        int64_t late_us   = now_us - target_us;   /* > 0 = 已经过了目标时刻 */
+
+        tick_stat_ticks++;
+        if (late_us > 0) {
+            tick_stat_catchup++;
+            if (late_us > tick_stat_max_late_us) {
+                tick_stat_max_late_us = (int32_t)late_us;
+            }
+            if (late_us > (int64_t)SAMPLE_PERIOD_MS * 1500) {
+                tick_stat_missed +=
+                    (uint32_t)(late_us / ((int64_t)SAMPLE_PERIOD_MS * 1000));
+                next_wake_us = now_us + (int64_t)SAMPLE_PERIOD_MS * 1000;
+                target_us    = next_wake_us;
+            }
+            if (late_us > (int64_t)SAMPLE_PERIOD_MS * 1000 / 2) {
+                tick_stat_late++;
+            }
+        }
+
+        int64_t delay_us = target_us - now_us;
         if (delay_us > 0) {
             /* Use precise us delay when < 2ms, otherwise use vTaskDelay */
             if (delay_us < 2000) {
@@ -5669,11 +6637,26 @@ static void sampler_task(void *arg)
             }
         }
         /* Advance to next period (phase accumulator — prevents drift) */
-        next_wake_us += (SAMPLE_PERIOD_MS * 1000);
+        next_wake_us += (int64_t)SAMPLE_PERIOD_MS * 1000;
 
-        /* Periodically refresh UI (every 10 samples = ~100ms) */
-        if (s_sample_count % 10 == 0) {
-            refresh_ui();
+        /* ---- 每 1 s 汇总一次「节拍质量」----
+         * 单位写清楚（Hz，一位小数），不再出现 Hz×100 冒充 Hz、0.01 s 冒充 s。 */
+        int64_t stat_now_us = esp_timer_get_time();
+        if (stat_now_us - tick_stat_start_us >= 1000000) {
+            int64_t span_us = stat_now_us - tick_stat_start_us;
+            int32_t freq_d10 = (int32_t)((int64_t)tick_stat_ticks * 10000000 / span_us);
+            ESP_LOGI(TAG, "[TICK] %" PRId32 ".%" PRId32 " Hz | ticks=%" PRIu32
+                          " late=%" PRIu32 " catchup=%" PRIu32 " missed=%" PRIu32
+                          " max_late=%" PRId32 "ms",
+                     freq_d10 / 10, freq_d10 % 10,
+                     tick_stat_ticks, tick_stat_late, tick_stat_catchup,
+                     tick_stat_missed, tick_stat_max_late_us / 1000);
+            tick_stat_start_us = stat_now_us;
+            tick_stat_ticks = 0;
+            tick_stat_late = 0;
+            tick_stat_catchup = 0;
+            tick_stat_missed = 0;
+            tick_stat_max_late_us = 0;
         }
     }
 }
@@ -5762,8 +6745,15 @@ void app_main(void)
     /* 7. Refresh UI once */
     refresh_ui();
 
-    /* 8. Start sampler task */
-    xTaskCreate(sampler_task, "sampler_task", 6144, NULL, 5, NULL);
+    /* 8. Start sampler task.
+     *    优先级 8：高于 task_poll(3)/uploader(4)/loop(3)/live(2)/housekeeping(2)，
+     *    保证 10 ms 到点时能立刻抢到 CPU。UX 上完全没代价 —— 采样本身只有
+     *    几十微秒，剩下的时间还是让给别的任务的。 */
+    xTaskCreate(sampler_task, "sampler_task", 6144, NULL, 8, NULL);
+
+    /* 8b. Housekeeping (UI 刷新 / 堆遥测 / WiFi 自愈) —— 从采样器里搬出来的
+     *     所有抖动源都在这里，优先级最低。 */
+    xTaskCreate(housekeeping_task, "housekeeping", 5120, NULL, 2, NULL);
 
     /* 9. Real-sensor upload queue + task (lower priority than sampler) */
     s_upload_queue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(upload_batch_t *));
