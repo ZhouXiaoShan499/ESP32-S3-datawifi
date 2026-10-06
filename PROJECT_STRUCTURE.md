@@ -188,6 +188,34 @@ main（始终可部署）
 6. **评审**：他人 review、讨论、按需修改。
 7. **合并**：通过后合并到 `main`，随后删除已合并的功能分支。
 
+#### 3.1.1 单人模式实施细则（本仓库当前形态）
+
+本仓库是**单人项目**（作者 `ZhouXiaoShan499`，0 fork / 0 watcher；历史上 3 个 PR #1/#2/#3 都是作者
+自己开的，`review_comments` 为空），所以上面第 4 / 5 步按下面的口径执行 —— **保留 PR 的工程价值**
+（合并前的 CI 绿灯 + 一份可检索的验收证据 + 按功能粒度回滚），**去掉**「等别人 approve」这种在单人
+仓库里不可能发生的环节。
+
+| 步骤 | 单人模式下的要求 |
+|------|------------------|
+| 1 ~ 3 | 不变：`feature/<名>` 分支、Conventional Commit、`git push -u origin <分支>` |
+| 4. 发起 PR | **保留**。`main` 没有分支保护，直推在技术上可行；但 `ci.yml` 的触发面是 `push: [main]` + `pull_request` + `workflow_dispatch` ——**推功能分支本身不跑 CI**，只有开了 PR 才能在**合并前**拿到绿灯。跳过 PR 等于让 `main` 只剩事后验证（2026-10-05 那次合并就是事后验证：`ci.yml` 是本轮才进 `main` 的，run #1 在合并之后才跑） |
+| 5. 评审 | **改为作者自审**：合并前自己过一遍 `git diff main...HEAD` 的完整 diff，并按 `.github/pull_request_template.md` 的三段式把验收证据写进 PR 描述。**不要求**他人 approve，也不要求评论数 |
+| 6. 合并 | 必需状态检查 `server 自测（FastAPI 接收服务）` 绿了再合。两种方式任选：GitHub 上 `Merge pull request`，或本地 `git merge --ff-only <分支>` 再 `git push`（后者树更干净，2026-10-05 就是这么合的） |
+| 7. 删除功能分支 | `git push origin --delete <分支>` + `git branch -d <分支>`。内容已在 `main`，回滚用 `git revert`，所以功能分支**不必长期保留**（留久了只会让「哪些分支还有价值」越来越难判断） |
+
+**例外白名单**（满足其一可以直推 `main`，不必开 PR）：
+
+1. 只改 `*.md` / `.gitignore` 的纯 `docs:` / `chore:` 提交 —— 这类改动不可能让服务端自测变红，套 PR 是纯开销。
+2. **现场热修**（板子停摆、服务端挡在手头活上）：允许先推，但事后必须补记录（补进 work log 或补一个 PR 描述）；
+   因为 `push: [main]` 仍会跑一次 CI，红了要自己认。
+3. **PR 通道本身不可用**（历史上有过「push / PR 因环境网络限制未完成」的记录）：退化为在功能分支上手动跑一次
+   CI —— GitHub 网页 Actions → CI → Run workflow（ref 选该分支），或 `gh workflow run CI --ref <分支>`。
+
+**门禁现状（写清以免误信）**：`main` 目前 `protected: false`、无必需状态检查；`secret-scan（gitleaks）`
+是 `continue-on-error: true` 的**早期预警**，不是拦门检查（原因见 `.github/workflows/ci.yml` 的注释：
+`main/Kconfig.projbuild` 的历史版本里有过旧凭据）。所以这条「绿灯」靠约定维持，**不靠平台强制** ——
+这也是为什么它必须写进文档、并且必须便宜到能被长期执行。
+
 ### 3.2 提交信息规范（Conventional Commits）
 
 格式：
@@ -238,11 +266,27 @@ git commit -m "feat(<scope>): <描述>"
 # 3. 推送到远程
 git push -u origin feature/<功能名>
 
-# 4. 在 GitHub/GitLab 上发起 Pull Request 并完成评审、合并
+# 4. 发起 Pull Request（需要 github.com 可访问；单人模式 = 作者自审 + 等 CI 绿，见 §3.1.1）
+#    - 网页：https://github.com/ZhouXiaoShan499/ESP32-S3-datawifi/compare/main...feature/<功能名>
+#    - 或 gh CLI：gh pr create --base main --head feature/<功能名> --fill
+#    描述按 .github/pull_request_template.md 的三段式填：改动摘要 / 验证证据 / 未验证项与风险
 
-# 5. 合并后清理本地分支
+# 4b. PR 通道不可用时的退化路径：在功能分支上手动跑一次 CI
+#    网页 Actions → CI → Run workflow，ref 选 feature/<功能名>
+gh workflow run CI --ref feature/<功能名>
+
+# 5. 合并（等 `server 自测（FastAPI 接收服务）` 变绿之后）
+#    方式 A：GitHub 上点 Merge pull request（会留一个 merge 提交）
+#    方式 B：本地 fast-forward（树更干净；仅当分支是 main 的线性后继时可用）
 git checkout main && git pull
+git merge --ff-only feature/<功能名>
+git push origin main
+
+# 6. 清理分支（本地 + 远端）
 git branch -d feature/<功能名>
+git push origin --delete feature/<功能名>
+
+# 例外：纯 docs:/chore: 改动与现场热修可以直接在 main 上提交并推送（见 §3.1.1 白名单）
 ```
 
 ### 3.5 注意事项
@@ -250,3 +294,5 @@ git branch -d feature/<功能名>
 - **不提交敏感/本地配置**：如 `sdkconfig`（含真实 WiFi 密码、服务器 IP）、`server/data/`（运行库）。这些已由 `.gitignore` 排除，仓库中只保留占位默认值（见 `Kconfig.projbuild` 与 `sdkconfig.defaults`）。
 - **提交粒度**：与业务分层对应，避免一个提交混杂多个层次/多个无关改动，便于逐条 review 与回滚。
 - **提交信息**：用祈使句、英文（与本仓库历史一致），`subject` 简洁描述「做了什么」，必要时在正文补充「为什么」。
+- **红灯不推 `main`**：`server 自测` 红了就别推（`main` 没有分支保护拦不住你，但远端一旦变红，别人拿到 `git pull` 就是坏状态）。例外白名单里的直推也必须先在本机把这 5 个自测跑绿 —— 见 §3.1.1。
+- **门禁是约定，不是平台强制**：`main` 的 `protected: false`，`secret-scan（gitleaks）` 是 `continue-on-error: true` 的预警；不要因为「CI 没红」就默认敏感信息一定干净，`gitleaks` 全历史扫描的结论要单独看。
