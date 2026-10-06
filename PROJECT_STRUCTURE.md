@@ -158,65 +158,83 @@ data_capture_sim/                  # 仓库根目录
 
 ---
 
-## 三、GitHub Flow 提交方法
+## 三、GitHub Flow 提交方法（手把手版）
 
-本项目采用 **GitHub Flow** 工作流 + **Conventional Commits** 提交规范。
+> 这一章专门写给**刚接触 Git / GitHub 的人**。如果你已经熟练使用 GitHub Flow，可以直接跳到
+> §3.4 常用命令看具体命令。
 
 ### 3.1 核心流程
 
+GitHub Flow 说到底就是在 Git 和 GitHub 上**建分支 → 改代码 → 发 PR → 合回去**。在开始之前，用 30 秒搞懂三个词：
+
+| 概念 | 大白话解释 | 对应到本仓库 |
+|------|-----------|-------------|
+| **Git** | 一个"存档"工具，帮你记住文件每一次改了什么。就像打游戏的**存档点**——改坏了随时读档回去 | 你电脑上的 `data_capture_sim` 文件夹 |
+| **GitHub** | 一个"云端网盘"。你把本地的存档同步到上面，换电脑也能拉回来 | `github.com/ZhouXiaoShan499/ESP32-S3-datawifi` |
+| **分支（branch）** | 同一个人可以开多条"故事线"。`main` 分支 = **正式版**（永远能正常工作），你每次改东西都从 `main` 拉一条新分支去改，改好测完再合回去 | 比如你之前改拍照功能，开的就是 `feature/manual-capture-task-web-3d` |
+
+#### 3.1.1 GitHub Flow 7 步图解
+
 ```
-main（始终可部署）
+main（正式版——永远能正常工作）
    │
-   ├── 1. 拉出功能分支 ──▶ feature/<功能名>
-   │                          │
-   │                          ├── 2. 小步提交（Conventional Commits）
-   │                          ├── 3. 推送到远程 (git push)
-   │                          ├── 4. 发起 Pull Request
-   │                          ├── 5. 评审 / 讨论 / 修改
-   │                          └── 6. 合并回 main
+   ├── 第 ① 步：从 main 拉出新分支 ──▶ feature/<功能名>（你的"草稿纸"）
+   │                                       │
+   │                                       ├── 第 ② 步：在分支上小步提交（每改一点就存一次档）
+   │                                       ├── 第 ③ 步：推送到 GitHub（备份到云端）
+   │                                       ├── 第 ④ 步：发 PR（申请把草稿合回正式版 → 自动跑测试）
+   │                                       ├── 第 ⑤ 步：自己检查一遍 + 等测试全绿
+   │                                       └── 第 ⑥ 步：合并回 main
    │
-   └── 7. 删除功能分支
+   └── 第 ⑦ 步：删掉分支（内容已经在 main 里了，留着浪费）
 ```
 
-1. **从 `main` 创建分支**：`main` 分支始终保持可部署状态，任何新功能都从 `main` 拉出新分支，不直接在 `main` 上开发。
-2. **分支命名**：用描述性前缀，如 `feature/<描述>`、`bugfix/<描述>`、`docs/<描述>`。历史上用过
-   `feature/real-sensor-upload-web`、`feature/psram-upload-fix-web-ui`；本次按需采集任务功能使用
-   `feature/manual-capture-task-web-3d`。
-3. **小步提交**：频繁、原子化提交，每次提交只做一件事，便于 review 与回滚。
-4. **推送**：将分支推送到远程仓库（`origin`）。
-5. **Pull Request**：发起 PR 请求合并到 `main`，附上改动说明。
-6. **评审**：他人 review、讨论、按需修改。
-7. **合并**：通过后合并到 `main`，随后删除已合并的功能分支。
+**每一步在干什么（用大白话）：**
 
-#### 3.1.1 单人模式实施细则（本仓库当前形态）
+1. **从 `main` 拉出新分支** —— 任何时候要改东西，用 `git checkout -b feature/xxx` 开一条新分支。**永远不要直接在 `main` 上改**——就像你不会直接在画展上涂改，一定先在草稿纸上画。`main` 就是那个"画展"（正式版），新分支是你的"草稿纸"。
 
-本仓库是**单人项目**（作者 `ZhouXiaoShan499`，0 fork / 0 watcher；历史上 3 个 PR #1/#2/#3 都是作者
-自己开的，`review_comments` 为空），所以上面第 4 / 5 步按下面的口径执行 —— **保留 PR 的工程价值**
-（合并前的 CI 绿灯 + 一份可检索的验收证据 + 按功能粒度回滚），**去掉**「等别人 approve」这种在单人
-仓库里不可能发生的环节。
+2. **给分支起个好名字** —— 格式：`<类型>/<简短描述>`。比如 `feature/拍照功能`、`bugfix/修复上传失败`、`docs/补充文档`。本仓库之前用过：`feature/real-sensor-upload-web`、`feature/manual-capture-task-web-3d`。一眼就知道这个分支在干什么。
 
-| 步骤 | 单人模式下的要求 |
-|------|------------------|
-| 1 ~ 3 | 不变：`feature/<名>` 分支、Conventional Commit、`git push -u origin <分支>` |
-| 4. 发起 PR | **保留**。`main` 没有分支保护，直推在技术上可行；但 `ci.yml` 的触发面是 `push: [main]` + `pull_request` + `workflow_dispatch` ——**推功能分支本身不跑 CI**，只有开了 PR 才能在**合并前**拿到绿灯。跳过 PR 等于让 `main` 只剩事后验证（2026-10-05 那次合并就是事后验证：`ci.yml` 是本轮才进 `main` 的，run #1 在合并之后才跑） |
-| 5. 评审 | **改为作者自审**：合并前自己过一遍 `git diff main...HEAD` 的完整 diff，并按 `.github/pull_request_template.md` 的三段式把验收证据写进 PR 描述。**不要求**他人 approve，也不要求评论数 |
-| 6. 合并 | 必需状态检查 `server 自测（FastAPI 接收服务）` 绿了再合。两种方式任选：GitHub 上 `Merge pull request`，或本地 `git merge --ff-only <分支>` 再 `git push`（后者树更干净，2026-10-05 就是这么合的） |
-| 7. 删除功能分支 | `git push origin --delete <分支>` + `git branch -d <分支>`。内容已在 `main`，回滚用 `git revert`，所以功能分支**不必长期保留**（留久了只会让「哪些分支还有价值」越来越难判断） |
+3. **小步提交** —— 不要攒一大堆改动一起提交。每改完一个小功能就 `git commit` 一次。好处：万一改坏了，能精确回退到最近一次正常的存档，而不是整个下午全白干。每次提交写清楚"这次干了什么"（怎么写见 §3.3）。
 
-**例外白名单**（满足其一可以直推 `main`，不必开 PR）：
+4. **推到 GitHub** —— `git push` 把本地的改动同步到 GitHub。等于在云端留个备份，换电脑也不怕；同时也是给下一步"发 PR"做准备（GitHub 网页上看不到你本地的分支，必须推上去才行）。
 
-1. 只改 `*.md` / `.gitignore` 的纯 `docs:` / `chore:` 提交 —— 这类改动不可能让服务端自测变红，套 PR 是纯开销。
-2. **现场热修**（板子停摆、服务端挡在手头活上）：允许先推，但事后必须补记录（补进 work log 或补一个 PR 描述）；
-   因为 `push: [main]` 仍会跑一次 CI，红了要自己认。
-3. **PR 通道本身不可用**（历史上有过「push / PR 因环境网络限制未完成」的记录）：退化为在功能分支上手动跑一次
-   CI —— GitHub 网页 Actions → CI → Run workflow（ref 选该分支），或 `gh workflow run CI --ref <分支>`。
+5. **发 Pull Request（PR）** —— 在 GitHub 网页上点按钮创建一个 PR，意思是"我改好了，申请合并到 `main`"。**PR 最重要的功能：它会自动触发 CI（Continuous Integration，持续集成）**——等于有个机器人帮你跑一遍全部测试，确认你没把东西改坏。**这是在合并之前就能发现问题的唯一途径。**
 
-**门禁现状（写清以免误信）**：`main` 目前 `protected: false`、无必需状态检查；`secret-scan（gitleaks）`
-是 `continue-on-error: true` 的**早期预警**，不是拦门检查（原因见 `.github/workflows/ci.yml` 的注释：
-`main/Kconfig.projbuild` 的历史版本里有过旧凭据）。所以这条「绿灯」靠约定维持，**不靠平台强制** ——
-这也是为什么它必须写进文档、并且必须便宜到能被长期执行。
+6. **检查 + 等绿灯** —— 团队开发时这步是让别人 review 你的代码。本仓库只有你一个人，所以改成**你自己认真看一遍改了什么**，并把测试结果写进 PR 描述。然后等 GitHub 上的 CI 跑完、显示绿色 ✅——绿了才能合并（具体规则见 §3.1.2）。
 
-### 3.2 提交信息规范（Conventional Commits）
+7. **合并 + 删分支** —— CI 全绿、自己确认没问题 → 点 Merge 合并到 `main`。分支的内容已经在 `main` 里了，删掉它保持仓库整洁。万一后悔了，用 `git revert` 就能撤销，不需要留分支。
+
+#### 3.1.2 本仓库的简化版（只有你一个人开发）
+
+本仓库只有你一个人（作者 `ZhouXiaoShan499`，0 个 fork / watcher），历史上 3 个 PR 都是你自己开的、
+没人评论过。所以上面第 ⑤ 步「等别人审查」改成「**你自己认真看一遍就够了**」。
+下面是简化版的 7 步：
+
+| 步骤 | 你实际要做什么 |
+|------|---------------|
+| ① 建分支 | 从 `main` 拉一条新分支，起个能看懂的名字 |
+| ② 提交 | 小步 commit，写好信息 |
+| ③ 推送 | `git push -u origin <分支名>` |
+| ④ 发 PR | **要发。因为 CI 只在 PR 上跑（推分支本身不跑），不发 PR = 没有合并前的绿灯。**描述按模板填：改了啥 / 怎么验证的 / 有什么风险（模板见 `.github/pull_request_template.md`） |
+| ⑤ 检查 | 你自己过一遍 `git diff main...HEAD`，把测试结果贴进 PR 描述。不需要别人 approve |
+| ⑥ 合并 | 等 CI 那个绿色 ✅（`server 自测`）亮了就合。两种方式随便选：GitHub 网页上点 Merge，或者本地 `git merge --ff-only <分支>` 再 `git push` |
+| ⑦ 删分支 | 合并完就删：`git push origin --delete <分支>` + `git branch -d <分支>`。内容已经在 `main` 里了，需要回滚用 `git revert` |
+
+**什么情况下可以跳过 PR，直接把改动推到 `main`：**
+
+- ✏️ **只改文档**（`*.md`、`.gitignore` 这种纯文本，不涉及代码）—— 比如改 README、补注释。这类改动不可能让测试变红，走 PR 流水线纯属浪费时间。
+- 🔥 **紧急修 bug**（板子挂了、服务停了，等不了 PR 那 2 分钟）—— 先推上去让东西跑起来，**但事后一定要补记录**：在 work log 里写清楚发生了什么、怎么修的、为什么来不及走 PR。
+- 🌐 **GitHub 打不开**（历史上确实遇到过 `push` / PR 都因为网络问题失败的情况）—— 退而求其次：在功能分支上手动跑 CI（GitHub 网页 → Actions → CI → Run workflow → 选你的分支），跑绿了再合。
+
+> ⚠️ **一个重要的现实**：`main` 分支目前**没有任何强制保护**（`protected: false`），CI 里的 `secret-scan`
+> 也是早期预警而不是拦截门（不展开，知道就行）。所以上面说的"等 CI 绿了再合"靠的是**你自觉遵守约定**，
+> 而不是平台逼你。这也是为什么这个规则必须写得足够简单——复杂的东西没人会长期坚持。
+
+### 3.2 提交信息怎么写（Conventional Commits）
+
+**为什么要统一格式？** 想象三个月后回头看 `git log`，满屏都是「改了点东西」「修复」「update」——你完全不知道
+每条 commit 干了什么。Conventional Commits 用固定格式 `<类型>(<范围>): <一句话说清干了什么>` 让你一眼看懂。
 
 格式：
 
@@ -224,11 +242,17 @@ main（始终可部署）
 <type>(<scope>): <subject>
 ```
 
-| 字段 | 说明 | 示例 |
-|------|------|------|
-| `type` | 提交类型 | `feat`（新功能）、`fix`（修复）、`docs`（文档）、`refactor`（重构）、`test`（测试）、`build`（构建）、`chore`（杂项） |
-| `scope` | 可选，影响范围 | `server`、`esp32`、`main`、`ui` |
-| `subject` | 简短描述（祈使句，约 50 字符内） | `add FastAPI receiver` |
+| 字段 | 说明 | 怎么写 |
+|------|------|--------|
+| `type` | 类型——这次提交属于哪一类 | 从下面选：`feat` 新功能、`fix` 修 bug、`docs` 只改文档、`refactor` 重构（改结构不改功能）、`test` 测试、`build` 构建/依赖、`chore` 杂项（`.gitignore`、清理临时文件等） |
+| `scope` | （可选）改了哪个模块 | `server`（服务端）、`esp32`（板端）、`ui`（前端页面）、`main`（主程序） |
+| `subject` | 一句话说清干了什么 | 用英文祈使句（动词开头），50 个字符以内 |
+
+> ✅ 好例子：`feat(server): add photo upload endpoint with JPEG validation`
+> — 一眼看懂：服务端加了个照片上传接口。
+>
+> ❌ 坏例子：`update code`、`fix bug`、`改了一下`
+> — 三个月后完全不知道这行在干什么。
 
 ### 3.3 本项目的实际提交示例
 
@@ -252,47 +276,90 @@ main（始终可部署）
 | `docs: document manual capture task, web buttons and 3D view` | 文档 | README / PROJECT_STRUCTURE / `docs/manual_capture_task.md`。 |
 | `docs: add work log for manual capture task session` | 文档 | `docs/manual_capture_task_work_log.md`：需求 → 交付 → 验证 → 遗留的过程记录。 |
 
-### 3.4 常用命令
+### 3.4 常用命令（手把手教程）
 
-```bash
-# 1. 从 main 拉出新分支
-git checkout main && git pull
-git checkout -b feature/<功能名>
+> 下面是本仓库实际用到的命令。每一段都标了「这步在干什么」，你可以直接复制粘贴。
 
-# 2. 小步提交（按范围拆分）
-git add <相关文件>
-git commit -m "feat(<scope>): <描述>"
+#### 开一个功能分支
 
-# 3. 推送到远程
-git push -u origin feature/<功能名>
-
-# 4. 发起 Pull Request（需要 github.com 可访问；单人模式 = 作者自审 + 等 CI 绿，见 §3.1.1）
-#    - 网页：https://github.com/ZhouXiaoShan499/ESP32-S3-datawifi/compare/main...feature/<功能名>
-#    - 或 gh CLI：gh pr create --base main --head feature/<功能名> --fill
-#    描述按 .github/pull_request_template.md 的三段式填：改动摘要 / 验证证据 / 未验证项与风险
-
-# 4b. PR 通道不可用时的退化路径：在功能分支上手动跑一次 CI
-#    网页 Actions → CI → Run workflow，ref 选 feature/<功能名>
-gh workflow run CI --ref feature/<功能名>
-
-# 5. 合并（等 `server 自测（FastAPI 接收服务）` 变绿之后）
-#    方式 A：GitHub 上点 Merge pull request（会留一个 merge 提交）
-#    方式 B：本地 fast-forward（树更干净；仅当分支是 main 的线性后继时可用）
-git checkout main && git pull
-git merge --ff-only feature/<功能名>
-git push origin main
-
-# 6. 清理分支（本地 + 远端）
-git branch -d feature/<功能名>
-git push origin --delete feature/<功能名>
-
-# 例外：纯 docs:/chore: 改动与现场热修可以直接在 main 上提交并推送（见 §3.1.1 白名单）
+```
+# 这步在干什么：基于最新的 main 创建一个新分支，名字用 <类型>/<描述>
+git checkout main          # 切换到 main 分支（正式版）
+git pull                   # 拉取最新的 main（万一远端有别人更新）
+git checkout -b feature/<功能名>  # 创建并切换到新分支
 ```
 
-### 3.5 注意事项
+#### 改代码 + 提交
 
-- **不提交敏感/本地配置**：如 `sdkconfig`（含真实 WiFi 密码、服务器 IP）、`server/data/`（运行库）。这些已由 `.gitignore` 排除，仓库中只保留占位默认值（见 `Kconfig.projbuild` 与 `sdkconfig.defaults`）。
-- **提交粒度**：与业务分层对应，避免一个提交混杂多个层次/多个无关改动，便于逐条 review 与回滚。
-- **提交信息**：用祈使句、英文（与本仓库历史一致），`subject` 简洁描述「做了什么」，必要时在正文补充「为什么」。
-- **红灯不推 `main`**：`server 自测` 红了就别推（`main` 没有分支保护拦不住你，但远端一旦变红，别人拿到 `git pull` 就是坏状态）。例外白名单里的直推也必须先在本机把这 5 个自测跑绿 —— 见 §3.1.1。
-- **门禁是约定，不是平台强制**：`main` 的 `protected: false`，`secret-scan（gitleaks）` 是 `continue-on-error: true` 的预警；不要因为「CI 没红」就默认敏感信息一定干净，`gitleaks` 全历史扫描的结论要单独看。
+```
+# 这步在干什么：把你改的文件加入"待提交列表"，然后提交
+git add <你改的文件...>    # 把文件加入暂存区（可以一次加多个，用空格隔开）
+git commit -m "feat(server): add photo upload"   # 提交，-m 后面是提交信息（按 §3.2 的格式写）
+```
+
+#### 推送到 GitHub
+
+```
+# 这步在干什么：把本地的新分支推送到 GitHub（备份 + 为发 PR 做准备）
+git push -u origin feature/<功能名>   # -u = 把本地分支和远端分支关联起来，以后直接 git push 就行
+```
+
+#### 发 PR（Pull Request）
+
+```
+# 方式 A：用浏览器打开（最简单）
+https://github.com/ZhouXiaoShan499/ESP32-S3-datawifi/compare/main...feature/<功能名>
+
+# 方式 B：用命令行（需要先安装 GitHub CLI）
+gh pr create --base main --head feature/<功能名> --fill
+```
+
+PR 描述按 `.github/pull_request_template.md` 的三段式填：
+1. **改了啥**（一句话）
+2. **怎么验证的**（贴测试结果、烧录日志、串口截图）
+3. **有什么风险**（没做的事、可能踩的坑、怎么回滚）
+
+#### 如果 GitHub 打不开（备选方案）
+
+```
+# 这步在干什么：在功能分支上手动跑一次 CI，不用经过 PR
+# 方法：打开 GitHub 网页 → Actions → CI → Run workflow → ref 选你的分支
+# 或者用命令行：
+gh workflow run CI --ref feature/<功能名>
+```
+
+#### 合并到 main
+
+```
+# 这步在干什么：等 CI 那个绿色 ✅ 亮了之后，把分支合进 main
+# 方法 A：在 GitHub 网页上点绿色的 "Merge pull request" 按钮（简单）
+# 方法 B：在本地合（提交历史更干净——分支是 main 的直线延伸时才用）
+
+git checkout main          # 切回 main
+git pull                   # 拉最新
+git merge --ff-only feature/<功能名>  # 快进合并（不生成多余的 merge 提交）
+git push origin main       # 把合并后的 main 推到 GitHub
+```
+
+#### 删掉已合并的分支
+
+```
+# 这步在干什么：分支内容已经全在 main 里了，删掉保持整洁
+git branch -d feature/<功能名>              # 删本地分支
+git push origin --delete feature/<功能名>   # 删远端分支
+```
+
+#### 例外：只改文档可以跳过 PR
+
+如果你只改了 `*.md` 或 `.gitignore`（纯文档），可以直接在 `main` 上提交推送，不用走分支+PR 的流程。
+（但提交信息仍然要按 §3.2 的格式写。）
+
+### 3.5 注意事项（4 条最重要的）
+
+- 🔐 **密码、密钥、本地配置绝对不能提交**：`sdkconfig` 里的 WiFi 密码、服务器 IP，`server/data/` 里的运行库——这些已经被 `.gitignore` 排除了。如果你不确定一个文件该不该提交，先 `git status` 看看它在不在忽略列表里。**一旦提交了真实密码并推到 GitHub，全世界都能看到**（GitHub 是公开仓库）。
+
+- ✂️ **一次只做一件事**：一个 commit 只改一个层次（服务端 / 板端 / 前端 / 文档）。别把一个 bug 修复和一段新功能塞在同一个 commit 里——以后想单独回滚其中一个就做不到了。
+
+- ✍️ **提交信息用英文祈使句**：`feat(server): add upload timeout`，不要写 `改了一下上传`。格式见 §3.2。这个仓库从第一天起就是英文提交信息，保持一致比"今天写中文更方便"更重要——三个月后的你会感谢现在的自己。
+
+- 🟢 **CI 红了别推 `main`**：虽然 `main` 没有强制保护、技术上可以直接推，但一旦远端 `main` 红了，所有 `git pull` 的人拿到的都是坏版本。先修分支、让 CI 变绿，再合。例外：紧急修 bug 可以先推，但事后必须补记录。
