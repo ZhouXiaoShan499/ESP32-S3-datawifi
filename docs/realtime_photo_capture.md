@@ -162,7 +162,7 @@ DVP 控制器在 `STREAMON` 之后是按 VSYNC **连续**采样的。我们 `DQB
   就是串口上那条 `[photo] dropping bad frame flags=0x41`。
 
 「每帧都 `open→STREAMON→DQBUF→STREAMOFF→close`」等于把这枚骰子每帧掷一次 ——
-在直播（500 ms 一次）与本地预览（50 ms 一次）下必然随机命中。
+在直播（250 ms 一次）与本地预览（50 ms 一次）下必然随机命中。
 
 **改法（板端已实施）**：
 

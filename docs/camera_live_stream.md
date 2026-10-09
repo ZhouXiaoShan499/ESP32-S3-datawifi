@@ -3,7 +3,7 @@
 > 对应 Web 监控页「摄像头实时画面」卡片 + 板端 **长按 Button A（2 s）** 三态切换：
 > **关 → Web 直播 → 本地 LCD 预览 → 关**。
 > 本地预览也可用 Web 下发 **`kind=preview`** 任务单独切换（页面「切换本地预览」按钮）。
-> - **Web 直播**：把板端相机画面连续推到页面，得到 ~1-2 fps 的实时画面；
+> - **Web 直播**：把板端相机画面连续推到页面，得到 ~2-4 fps 的实时画面；
 > - **本地 LCD 预览**：板端把每帧 JPEG 软解成 RGB565，直接画在 240×240 屏上。
 >
 > 两者都在**不打断 IMU 采样、不暂停周期上报、不刷爆数据库/磁盘**的前提下进行。
@@ -18,7 +18,7 @@
 板端：长按 Button A(2s) ──▶ button_a_long_press_cb → live_streaming_toggle()
                                    │ 置 s_live_streaming = true，建 live_stream_task
                                    ▼
-        live_stream_task 循环（每 ~500 ms 一轮）：
+        live_stream_task 循环（每 ~250 ms 一轮）：
           app_camera_capture_jpeg_live()（持久会话上 DQBUF 一帧 JPEG 640×480，
                                           只在取帧期间持 s_camera_mutex）
                       │
@@ -31,7 +31,7 @@
                       │ GET /api/v1/live?device_id=…        （active / seq / age_ms …）
 浏览器 /ui/ ──────────┤
                       │ GET /api/v1/live/frame?device_id=…&seq=N （<img src>，no-store）
-                      └▶ 「摄像头实时画面」卡片（refreshLive()，每轮 poll() 调一次）
+                      └▶ 「摄像头实时画面」卡片（refreshLive()，独立节拍 + 每轮 poll() 各调一次）
 ```
 
 | 环节 | 实现 | 关键点 |
@@ -52,16 +52,16 @@
 | 方案 | 结果 |
 |------|------|
 | MJPEG 连续流（`multipart/x-mixed-replace`） | 需要在板端保持一路长连接 HTTP 服务或长连接上传；本项目的 HTTP 只有 client 角色（`esp_http_client`），要额外起 httpd 与端口，和「板端 → 服务端」单向架构相悖 |
-| **JPEG 单帧循环（本项目采用）** | 复用按需拍照那条已跑通的 `open→DQBUF→拷贝→POST` 路径，没有新协议；代价是帧率 = 一次采集+上传的耗时 + `LIVE_FRAME_INTERVAL_MS`，实测约 1-2 fps |
+| **JPEG 单帧循环（本项目采用）** | 复用按需拍照那条已跑通的 `open→DQBUF→拷贝→POST` 路径，没有新协议；代价是帧率 = 一次采集+上传的耗时 + `LIVE_FRAME_INTERVAL_MS`，实测约 2-4 fps |
 
-取舍明确：这是「监控画面的实时感」，不是「流畅视频」。想提高帧率可调小
-`LIVE_FRAME_INTERVAL_MS`（板端 `main.c`），但会挤占 WiFi/采样带宽。
+取舍明确：这是「监控画面的实时感」，不是「流畅视频」。当前 `LIVE_FRAME_INTERVAL_MS` = 250 ms
+（板端 `main.c`）：摄像头移动时页面要跟手，所以把它从 500 压到 250；再往下压会挤占 WiFi/采样带宽。
 
 ### 为什么服务端只留内存、不落盘
 
-- 直播是连续流：1-2 fps × 每帧几十 KB，一天 ≈ 数 GB，落盘会立刻吃满磁盘；
+- 直播是连续流：2-4 fps × 每帧几十 KB，一天 ≈ 数 GB，落盘会立刻吃满磁盘；
 - 逐帧入库还会让 `photos` 表与任务链路（幂等、`request_id`、删除）失去意义；
-- 「最新一帧」对实时画面完全够用，丢帧也无所谓（下一帧 500 ms 后就到），
+- 「最新一帧」对实时画面完全够用，丢帧也无所谓（下一帧 250 ms 后就到），
   于是刻意不做逐帧 ACK/重试/幂等 —— 这也是它与 `/api/v1/photos` 最本质的区别。
 
 ---
@@ -70,7 +70,7 @@
 
 | 符号 | 作用 |
 |------|------|
-| `LIVE_API_PATH` / `LIVE_FRAME_INTERVAL_MS` / `LIVE_HTTP_TIMEOUT_MS` / `LIVE_FAIL_LIMIT` / `LIVE_TASK_STACK` / `LIVE_TASK_PRIORITY` | 直播参数（500 ms 节拍、8 s 单帧超时、连续 5 次失败自动停、8 KB 栈、优先级 2） |
+| `LIVE_API_PATH` / `LIVE_FRAME_INTERVAL_MS` / `LIVE_HTTP_TIMEOUT_MS` / `LIVE_FAIL_LIMIT` / `LIVE_TASK_STACK` / `LIVE_TASK_PRIORITY` | 直播参数（250 ms 节拍、8 s 单帧超时、连续 5 次失败自动停、8 KB 栈、优先级 2） |
 | `s_live_streaming` / `s_live_frames` / `s_live_last_status` | 推流标志、已发送帧数（LCD 显示）、最近一帧 HTTP 状态 |
 | `s_camera_mutex` | 相机串行化（在 `app_camera_init()` 里创建，`app_camera_capture_jpeg_ex()` 内获取/归还，成功与失败路径都归还） |
 | `live_post_frame()` | 流式 POST 一帧到 `/api/v1/live`，返回是否 2xx，并回传状态码 |
@@ -139,7 +139,7 @@ _live_seq = 0          # 全局单调序号（页面用它判断「有新帧了�
 | 元素 / 函数 | 说明 |
 |-------------|------|
 | 卡片「摄像头实时画面」 | 大图（4:3，`object-fit: contain`）+ 徽章 + 元信息（seq / 分辨率 / 单帧大小 / 帧龄 / 板端拍摄时刻 / 来源 IP） |
-| `refreshLive()` | 在每轮 800 ms `poll()` 里调用（不 `await`，内部 500 ms 最小间隔 + busy 保护）：`GET /api/v1/live` → `seq` 变了才刷新 `GET /api/v1/live/frame` 的 `<img src>` |
+| `refreshLive()` | 由**独立节拍** `liveTickLoop()` 驱动（推流中 `LIVE_TICK_MS=250` ms、空闲退到 `LIVE_IDLE_TICK_MS=1` s；主 `poll()` 里也顺手调一次做设备切换/刷新的即时反应；内部 250 ms 最小间隔 + busy 保护，不 `await`）：`GET /api/v1/live` → `seq` 变了才刷新 `GET /api/v1/live/frame` 的 `<img src>` |
 | `renderLiveOff()` | 未推流 / 查询失败 / 无帧时的统一出口：占位提示 + 隐藏 `<img>` |
 | `liveMetaText()` | 状态 → 多行元信息（CSS `white-space: pre-line`） |
 | 未选设备时 | 自动回退到「正在推流的那台」设备（板端可能还没上传过 IMU 数据，下拉里暂时没有它） |
@@ -217,7 +217,7 @@ python server/e2e_live_check.py
 
 ## 七、已知限制
 
-- 帧率受「一次 V4L2 采集 + 一帧 HTTP 上传」限制，实测约 1-2 fps；不是视频编码流。
+- 帧率受「一次 V4L2 采集 + 一帧 HTTP 上传」限制，实测约 2-4 fps；不是视频编码流。
 - 本地 LCD 预览是「软解 JPEG」：640×480 解到 1/2 再中心裁剪，单帧解码约几十 ms，
   实测约 5-10 fps；预览会占用更多 CPU（优先级 2，仍低于采样/上传）。
 - 服务端内存里每台设备常驻一帧（≤ 512 KiB/设备），多设备长时间运行不会增长，但

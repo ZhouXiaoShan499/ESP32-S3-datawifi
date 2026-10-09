@@ -43,7 +43,7 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
 
 摄像头实时直播（live camera）—— 对应板端长按 Button A 的「实时画面」：
   * 板端侧：长按 Button A 开启后，live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」
-    （约 1-2 fps，body 即 JPEG 字节，带 device_id/ts_ms/w/h 查询参数），再长按一次停止。
+    （约 2-4 fps，body 即 JPEG 字节，带 device_id/ts_ms/w/h 查询参数），再长按一次停止。
   * 服务端：**只在内存里保留每台设备的最新一帧**（不落盘、不进 photos 表、不建任务），
     Web 侧 GET /api/v1/live 看状态、GET /api/v1/live/frame 取最新一帧 JPEG，
     <img> 按 seq 轮询即形成实时画面。直播是连续流，刻意不做逐帧 ACK/幂等：
@@ -195,7 +195,7 @@ EPOCH_SANE_MS = 1_600_000_000_000   # 2020-09-13；低于它视为「板端时�
 LIVE_TIMEOUT_S = float(os.environ.get("SENSOR_LIVE_TIMEOUT_S", "5"))   # 无新帧超过该秒数 = 已停止
 LIVE_MAX_FRAME_BYTES = MAX_PHOTO_BYTES          # 单帧上限沿用拍照（512 KiB）
 LIVE_JPEG_MAGIC = PHOTO_JPEG_MAGIC              # 同样用 JPEG SOI 拒绝非图片 body
-LIVE_DEFAULT_FPS = 2.0                          # 板端 LIVE_FRAME_INTERVAL_MS=500 的名义帧率
+LIVE_DEFAULT_FPS = 4.0                          # 板端 LIVE_FRAME_INTERVAL_MS=250 的名义帧率
 # 内存里最多保留几台设备的帧、多久没新帧就彻底丢掉。
 # 不设上限的后果是**内存单调增长**：每条最多 LIVE_MAX_FRAME_BYTES（512 KiB），
 # 任何能访问 POST /api/v1/live 的客户端都能用随机 device_id 把它灌满；
@@ -290,6 +290,25 @@ app = FastAPI(
 _UI_DIR = os.path.join(_BASE_DIR, "static")
 os.makedirs(_UI_DIR, exist_ok=True)
 app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+
+# ---------------------------------------------------------------------------
+# AI Agent 路由（自然语言 → 意图 → 受限工具调用）
+#   * agent 包与 main.py 同级于 server/，运行期按**顶层包 agent** 导入
+#     （与 server/test_*.py 里 `import main` 同一 sys.path 约定）；
+#     从仓库根目录以 server.agent 布局导入时也兼容。
+#   * 纯附加能力：注册失败只打印一行告警，主接收服务照常启动。
+# ---------------------------------------------------------------------------
+try:
+    try:
+        from agent.api import router as _agent_router
+    except ImportError:
+        from server.agent.api import router as _agent_router
+    app.include_router(_agent_router)
+    _AGENT_PATHS = sorted(r.path for r in _agent_router.routes)   # 自测/排障用
+    print("[sensor-server] AI Agent 已挂载: " + " · ".join(_AGENT_PATHS))
+except Exception as _agent_exc:                       # noqa: BLE001
+    print(f"[sensor-server] [agent] AI Agent 路由注册失败"
+          f"（该功能不可用，主服务不受影响）: {_agent_exc}")
 
 # sqlite 连接：多线程下为每个请求单独建连接，见 get_db()
 _db_init_lock = threading.Lock()
@@ -1764,7 +1783,7 @@ def delete_photo(photo_id: str):
 #   GET  /api/v1/live/frame 最新一帧 JPEG 字节（Web 的 <img src> 直接指向本接口）
 #
 # 与 /api/v1/photos 的区别：照片是「一次事件」，要入库、要幂等、要能删；
-# 直播是「连续流」，只保留最新一帧 —— 丢帧无所谓（下一帧 500 ms 后就到），
+# 直播是「连续流」，只保留最新一帧 —— 丢帧无所谓（下一帧 250 ms 后就到），
 # 因此这里刻意不写数据库（否则 1-2 fps × 多设备会瞬间把库和磁盘刷爆）。
 # ---------------------------------------------------------------------------
 def _live_entry_view(entry, now=None):
