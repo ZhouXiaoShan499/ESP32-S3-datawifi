@@ -387,3 +387,85 @@ $log | Select-String -Pattern 'http=(\d+)'            # 非 201 → 问题在服
    一步区分出「请求发出但失败」与「请求根本没发出」
 4. **配置必须可复现**：修改被 gitignore 的文件后，务必同步到受版本控制的
    `*.defaults`，否则修复只是「本机偶然生效」
+
+---
+
+## 补记 · 2026-10-08：`[csv] write failed … errno=5` 的红字其实是「重试即恢复」被误报
+
+### 现象
+
+带 CSV 录制（Button A）且同时开直播时，串口反复出现成对的两行：
+
+```
+E (…) imu_logger: [csv] write failed #1/20 errno=5 ferror=0 file=/sdcard/DATA_….csv samples=…
+                  | dma_free=591 dma_largest=432 int_largest=432
+I (…) imu_logger: [HEAP] csv write failed  free=… min=… int_largest=432 | dma_free=1519 dma_largest=1472 dma_min=55 | psram=…
+W (…) imu_logger: [csv] write recovered after 1 failed tick(s)
+```
+
+逐项读：
+
+| 线索 | 含义 |
+|------|------|
+| `errno=5` | `EIO`。SD 写失败被 newlib 映射成的值 |
+| `ferror=0` | **决定性**：错误标志已被 `clearerr()` 清掉 → 失败点在 `fflush()`，不是 `fprintf()` |
+| `samples=` 只前进一点点 | 失败节奏与定时刷盘间隔（`CSV_FLUSH_INTERVAL_MS=500`）一致 |
+| `dma_free`/`dma_largest` 掉到几百~1.5 KB、`dma_min=55` | 内部 DMA 子堆瞬时见底 |
+| 紧随其后的 `recovered` | **数据一条没丢**：同一 tick 内重试就写成功了 |
+
+### 根因链
+
+定时刷盘交出去的是一段**非 512 B 整数倍**的 CSV 尾巴。FatFs 的直通写只认
+「偏移扇区对齐 + 长度 ≥512」，尾巴那一个不满扇区只能走 `FATFS.win` 窗口缓冲；
+窗口在 PSRAM（`CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y`），而 ESP32-S3 的 SDMMC
+**不能对 PSRAM DMA**，于是 `sdmmc_write_sectors()` 必须临时申请 512 B
+`MALLOC_CAP_DMA` 的 bounce buffer。相机（直播/预览，每帧 16 KiB 连续内部 DMA）
+正占着内部 DMA 堆时这次申请失败 → `ESP_ERR_NO_MEM` → FatFs `FR_DISK_ERR`
+→ `fflush()` 返回 EOF、`errno=5`。
+
+**它是瞬时且自愈的**：`sampler_task` 在同一 tick 内 `clearerr()` + `vTaskDelay(1)` + 重试，
+等一拍（相机 DMA 让出）再申请就成功 —— 所以每次红字后面必跟一条 `recovered`。
+
+### 真正的代码缺陷（本次修复）
+
+重试循环**第一次失败就置 `csv_write_failed = true`**，哪怕后续重试成功：
+
+```c
+for (int attempt = 0; attempt < CSV_FLUSH_RETRY; attempt++) {
+    if (fflush(write_file) == 0) break;
+    csv_write_failed = true;      /* ← 重试若成功，这一票"失败"也已经记下了 */
+    clearerr(write_file); vTaskDelay(1);
+}
+```
+
+这与紧邻注释写的「偶发的堆碎片就靠这个挺过去，**只有持续失败才会计入 fail_streak**」
+正好相反：一次「重试即恢复」既打了一条 E 级红字、又计了一次 `csv_fail_streak`。
+
+改动（`main/main.c`，`sampler_task`）：
+
+- **只有 `CSV_FLUSH_RETRY` 次重试全部用尽**才置 `csv_write_failed`（真失败，行为不变：
+  逐条 ERROR + 连续 `CSV_WRITE_FAIL_LIMIT` 次停采集）；
+- 重试成功只累加 `csv_flush_retried`，并在**会话结束**（采样闸门 `gate_open`
+  下降沿）时汇总一行 WARN，既不刷屏也不完全静默；
+- 失败统计与复位逻辑（`csv_flush_retried = 0`）随新会话一起重置。
+
+### 为什么不直接改 `sdkconfig`
+
+两个「看似对症」的旋钮都被项目现有结论否掉（见 `sdkconfig.defaults` §40-44 / §74-78）：
+
+| 方案 | 否决理由（已实测/已推理） |
+|------|--------------------------|
+| `CONFIG_FATFS_ALLOC_PREFER_EXTRAM` y → n | 每个打开文件的 4096 B 缓存 + 4096 B 窗口搬到内部 RAM（两个文件 ≈ 12 KiB 常驻），与本板「相机每次 STREAMON 要一块 **16 KiB 连续内部 DMA**」的主要矛盾直接冲突 |
+| `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 32768 → 65536 | 实测会把最大连续内部块从 29696 压到 26624，反而更容易让相机 `VIDIOC_STREAMON failed: errno=12` |
+
+也就是说：**主路径本来就是零 bounce**（4096 B 整数倍、扇区对齐的整块下发走直通 DMA），
+需要 bounce 的只有定时刷盘的尾巴；而这条尾巴是「按时间刷盘」换来 500 ms 掉电丢失窗口的代价。
+用「偶发且自愈的 SD 重试」去换「相机拍照直接失败」不划算，故不动配置。
+
+### 验证
+
+| 项 | 结果 |
+|----|------|
+| 编译 | `build_idf.bat` → `build_log.txt` 末尾 `BUILD_EXIT=0`；`[4/9] Building … main.c.obj` 正常，仅剩既有的 `_IO/_IOR/_IOW redefined` 告警，无新增 |
+| 产物 | `data_capture_sim.bin = 0x172890 / 0x177000`（1% free，未超分区） |
+| 真机（待复跑） | 期望：`[csv] write failed … errno=5` 归零；会话结束最多一行 `[csv] session end: N flush(es) needed an in-tick retry …`；`[csv] write recovered …` 也随之消失（同 tick 恢复不再计 streak）。若连汇总行都没有 → 说明该轮 DMA 碎片未到触发点，是更好结果 |

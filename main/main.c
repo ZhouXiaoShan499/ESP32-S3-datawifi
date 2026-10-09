@@ -288,10 +288,19 @@
  *   1) 每个 CSV FILE* 挂一块**静态 .bss 的 4096 B 内部 RAM 缓冲**（天然的
  *      内部、DMA-capable、64 B 对齐）。stdio 攒满 4096 B 再下发，FatFs 直接
  *      从内部 RAM 走 Sdmmc 的直通 DMA 路径（一条 CMD25 写 8 个扇区），
- *      **一次 bounce 申请都不需要**，SD 命令数还少 8 倍。
+ *      缓冲满触发的那次下发**一次 bounce 申请都不需要**，SD 命令数还少 8 倍。
  *   2) 把「每点 fflush」改成**按时间刷盘**：单扇区写的尾延迟（SD 卡内部
  *      GC/磨损均衡时可达 50~200 ms）远大于 10 ms 的采样周期，它本身就是
  *      采样抖动源之一。每秒 100 次写降到 ~2 次。
+ *
+ *  仍然要留一个「瞬时失败」的口子（也就是下面 3）：定时刷盘交出去的是一段
+ *  **非 512 B 整数倍**的尾巴（CSV 每行长度不定）。FatFs 的直通写只认
+ *  「偏移扇区对齐 + 长度 ≥512」，尾巴那个不满扇区只能走 FATFS.win 窗口
+ *  缓冲（同样在 PSRAM）⇒ 依旧需要一次 512 B 的 MALLOC_CAP_DMA bounce。
+ *  相机（直播/预览）正占着内部 DMA 堆时这次申请会失败 → errno=5(EIO)：
+ *  **它是瞬时且自愈的**，等一拍（相机 DMA 让出）再申请就好，所以下单点重试
+ *  成功不应当算失败 —— 只有全部重试用尽才置 csv_write_failed 并计入
+ *  csv_fail_streak，否则「每 500 ms 一次重试即恢复」会写成满屏红色 ERROR。
  * ================================================================ */
 #define CSV_IO_BUF_SIZE        4096    /* 必须 ≥512 且为 512 的整数倍 */
 #define CSV_IO_BUF_COUNT       2       /* 同时最多两个 CSV 文件：数据文件 + calibration.csv
@@ -299,7 +308,8 @@
                                         *  见 start_stand/jump_protocol_locked 里的 s_data_file = ...） */
 #define CSV_FLUSH_INTERVAL_MS  500     /* 按时间刷盘间隔：掉电最多丢 500 ms（协议阶段切换点仍立即刷） */
 #define CSV_WRITE_FAIL_LIMIT   20      /* 连续这么多个采样周期写失败才停采集（20×10 ms = 200 ms） */
-#define CSV_FLUSH_RETRY        3       /* 一次刷盘失败时在同一 tick 内立刻重试的次数 */
+#define CSV_FLUSH_RETRY        3       /* 刷盘失败时在同一 tick 内重试的次数（重试成功
+                                        * 即视为自愈的瞬时碎片，不算失败，见下） */
 
 /* Device identity / server URL come from Kconfig (see Kconfig.projbuild).
  * Fallbacks keep the code compiling if the config header is stale -- keep them
@@ -5820,9 +5830,12 @@ static void sampler_task(void *arg)
      * CSV 刷盘节流 + 写失败容忍（见「CSV 落盘缓冲 / 刷盘策略」）
      *   csv_flush_next_us : 下一次按时间刷盘的目标时刻
      *   csv_fail_streak   : 连续「一个采样周期都没写成功」的次数
+     *   csv_flush_retried : 「同一个 tick 内重试一次就写成功」的次数（自愈的
+     *                       瞬时内部 DMA 碎片，不算失败，只在会话结束汇总）
      * ---------------------------------------------------------------- */
     int64_t  csv_flush_next_us = 0;
     uint32_t csv_fail_streak = 0;
+    uint32_t csv_flush_retried = 0;
 
     /* ----------------------------------------------------------------
      * 节拍遥测（每 1 s 一行 [TICK]）：把「100 Hz」从"信以为真"变成可观测。
@@ -5869,6 +5882,18 @@ static void sampler_task(void *arg)
                 /* 新会话：立刻允许第一次刷盘，并清掉上个会话残留的失败计数 */
                 csv_flush_next_us = 0;
                 csv_fail_streak = 0;
+                csv_flush_retried = 0;
+            } else if (!gate_open && gate_was_open) {
+                /* 会话结束：把「靠同 tick 重试自愈」的瞬时 SD 写失败汇总一行。
+                 * 它们是自愈的（数据一条没丢），所以不打 E 级、不计 fail_streak；
+                 * 但全静默又会让人以为 SD 从未抖动过，故这里留个可观测点。 */
+                if (csv_flush_retried > 0) {
+                    ESP_LOGW(TAG, "[csv] session end: %u flush(es) needed an in-tick "
+                                  "retry (transient internal-DMA fragmentation for the "
+                                  "512 B SD bounce buffer)",
+                             (unsigned)csv_flush_retried);
+                    csv_flush_retried = 0;
+                }
             }
             gate_was_open = gate_open;
 
@@ -5962,18 +5987,35 @@ static void sampler_task(void *arg)
                         if (now_us_flush >= csv_flush_next_us) {
                             csv_flush_next_us = now_us_flush
                                 + (int64_t)CSV_FLUSH_INTERVAL_MS * 1000;
-                            for (int attempt = 0; attempt < CSV_FLUSH_RETRY; attempt++) {
+                            int  flush_tries = 0;
+                            bool flush_ok    = false;
+                            for (; flush_tries < CSV_FLUSH_RETRY; flush_tries++) {
                                 if (fflush(write_file) == 0) {
+                                    flush_ok = true;
                                     break;
                                 }
-                                csv_write_failed = true;
                                 /* 错误标志是粘的：不清掉后面每次都会立刻失败。
                                  * 清掉并立刻重试（= 同一个 tick 里再申请一次
                                  * bounce buffer）；因为这一次什么都没真正写出
-                                 * 去，重试不会产生重复行。偶发的堆碎片就靠这个
-                                 * 挺过去，只有持续失败才会计入 fail_streak。 */
+                                 * 去，重试不会产生重复行。 */
                                 clearerr(write_file);
-                                vTaskDelay(1);
+                                if (flush_tries + 1 < CSV_FLUSH_RETRY) {
+                                    vTaskDelay(1);   /* 让一拍，等相机 DMA 释放 */
+                                }
+                            }
+                            if (!flush_ok) {
+                                /* 全部重试都用尽，这才是真失败：交给下面的
+                                 * fail_streak / ERROR 日志（含 dma_free/dma_min
+                                 * 现场）处理。 */
+                                csv_write_failed = true;
+                            } else if (flush_tries > 0) {
+                                /* 重试一次才成功 = 自愈的瞬时 DMA 碎片：数据没丢、
+                                 * 也不该计入 fail_streak。旧代码在这里对「第
+                                 * 一次失败」就置 csv_write_failed，于是一次
+                                 * 「重试即恢复」也被打成满屏红色 ERROR，与本段
+                                 * 「只有持续失败才会计入」的本意相反。现在只
+                                 * 统计次数，会话结束时汇总一行。 */
+                                csv_flush_retried++;
                             }
                         }
                     }
