@@ -3,3 +3,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 # 仅自测 test_receive.py 需要（FastAPI TestClient 底层走 httpx）
 httpx>=0.27
+
+# 可选：仅 AI Agent 接真实 LLM 时需要（agent/nlu.py → OpenAI 兼容协议，Ollama 亦可）。
+# 不装也不影响服务与自测 —— 缺库/无 key 时 agent 自动回退本地关键词解析。
+# openai>=1.0

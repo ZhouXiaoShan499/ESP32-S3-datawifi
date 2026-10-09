@@ -291,6 +291,25 @@ _UI_DIR = os.path.join(_BASE_DIR, "static")
 os.makedirs(_UI_DIR, exist_ok=True)
 app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
 
+# ---------------------------------------------------------------------------
+# AI Agent 路由（自然语言 → 意图 → 受限工具调用）
+#   * agent 包与 main.py 同级于 server/，运行期按**顶层包 agent** 导入
+#     （与 server/test_*.py 里 `import main` 同一 sys.path 约定）；
+#     从仓库根目录以 server.agent 布局导入时也兼容。
+#   * 纯附加能力：注册失败只打印一行告警，主接收服务照常启动。
+# ---------------------------------------------------------------------------
+try:
+    try:
+        from agent.api import router as _agent_router
+    except ImportError:
+        from server.agent.api import router as _agent_router
+    app.include_router(_agent_router)
+    _AGENT_PATHS = sorted(r.path for r in _agent_router.routes)   # 自测/排障用
+    print("[sensor-server] AI Agent 已挂载: " + " · ".join(_AGENT_PATHS))
+except Exception as _agent_exc:                       # noqa: BLE001
+    print(f"[sensor-server] [agent] AI Agent 路由注册失败"
+          f"（该功能不可用，主服务不受影响）: {_agent_exc}")
+
 # sqlite 连接：多线程下为每个请求单独建连接，见 get_db()
 _db_init_lock = threading.Lock()
 _initialized = False

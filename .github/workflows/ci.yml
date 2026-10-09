@@ -30,7 +30,7 @@ jobs:
       - name: 语法检查
         run: python -m compileall -q server
 
-      # 四个自测脚本各自用独立临时库（server/data/ 已在 .gitignore 里），
+      # 五个自测脚本各自用独立临时库（server/data/ 已在 .gitignore 里），
       # 互不干扰；任何一个失败都直接让 job 红。
       - name: 接收 / 校验 / 存储 / 查询（test_receive.py）
         run: python server/test_receive.py
@@ -40,6 +40,11 @@ jobs:
 
       - name: 闭环事件链路（test_events.py）
         run: python server/test_events.py
+
+      # AI Agent：不需要 openai 库、不联网（测试内部强制 LLM 不可达，
+      # 走本地关键词回退），覆盖防幻觉 / 权限白名单 / 澄清闭环 / 包导入布局。
+      - name: AI Agent 自然语言链路（test_agent.py）
+        run: python server/test_agent.py
 
       - name: 真实网络端到端（e2e_server_check.py，自起 uvicorn 子进程）
         run: python server/e2e_server_check.py
