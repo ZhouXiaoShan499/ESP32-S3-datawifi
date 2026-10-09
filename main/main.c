@@ -9,8 +9,8 @@
  *    as JSON and POSTs them to a local FastAPI receiver via esp_http_client
  *  - Button A start/stop SD card CSV logging (from data_capture_sim)
  *  - Button A long press (2s): cycles camera mode — Web live streaming (captures
- *    a JPEG every ~500 ms and POSTs it to /api/v1/live, the server keeps only
- *    the latest frame per device for the Web "摄像头实时画面" card, ~1-2 fps)
+ *    a JPEG every ~250 ms and POSTs it to /api/v1/live, the server keeps only
+ *    the latest frame per device for the Web "摄像头实时画面" card, ~2-4 fps)
  *    → local LCD preview (decodes each JPEG and draws it on the 240x240 screen)
  *    → off.
  *  - LVGL real-time display (from data_capture_sim)
@@ -209,7 +209,7 @@
  *   CAMERA_DQBUF_TIMEOUT_MS  : 单帧拍照的 DQBUF 上限（宁等 3 s，也别让「拍一张
  *                              照片」失败）。
  *   CAMERA_DQBUF_TIMEOUT_LIVE_MS : 直播 / 本地预览的上限（坏帧就快速失败重试，
- *                              不把 500 ms 的推流节拍拖死）。
+ *                              不把 250 ms 的推流节拍拖死）。
  *   CAMERA_SESSION_IDLE_MS   : 这么久没人取帧就关会话（STREAMOFF + munmap + close）。 */
 #define CAMERA_BUFFER_COUNT          3
 #define CAMERA_FRAME_SKIP_MAX        8
@@ -258,10 +258,13 @@
 /* 摄像头实时直播（长按 Button A 切换）config。
  * 开启后 live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」，
  * 服务端只在内存里保留每台设备的最新一帧（不落盘、不入 photos 表），
- * Web 页「摄像头实时画面」卡片按 seq 轮询取图，形成 ~1-2 fps 的实时画面。
+ * Web 页「摄像头实时画面」卡片按 seq 轮询取图，形成 ~2-4 fps 的实时画面。
  * 再长按一次停止；不占用采样器、不暂停周期上报，与按需单帧拍照共用相机（加锁串行）。 */
 #define LIVE_API_PATH            "/api/v1/live"
-#define LIVE_FRAME_INTERVAL_MS   500      /* 帧间最小间隔（Wi-Fi 下实际约 1-2 fps） */
+/* 帧间最小间隔：一轮 = 拍摄 + 上传 + 本延时，实测每轮约 400-550 ms（≈2-4 fps）。
+ * 从 500 压到 250 是为了让摄像头移动时 Web 端画面跟得上；任务优先级只有 2
+ * （低于 sampler(8)/uploader(4)/task_poll(3)），提速不会抢周期上报的 CPU。 */
+#define LIVE_FRAME_INTERVAL_MS   250      /* 帧间最小间隔（Wi-Fi 下实际约 2-4 fps） */
 #define LIVE_HTTP_TIMEOUT_MS     8000     /* 单帧上传上限（比单帧拍照短，避免拖慢节拍） */
 #define LIVE_FAIL_LIMIT          5        /* 连续失败上限 → 自动停止推流并记日志 */
 #define LIVE_TASK_STACK          8192     /* HTTP + 一帧 JPEG 拷贝 + LVGL 刷新 */

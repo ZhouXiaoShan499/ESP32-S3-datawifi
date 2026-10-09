@@ -166,7 +166,7 @@ s_wifi_connected == true              → 正常，清零计数
                                         而 DHCP 客户端一直是停着的）
 ```
 
-另外 `esp_wifi_set_ps(WIFI_PS_NONE)` 关掉了 modem sleep：本项目持续取样 + 周期上传 + 500 ms 推流，
+另外 `esp_wifi_set_ps(WIFI_PS_NONE)` 关掉了 modem sleep：本项目持续取样 + 周期上传 + 250 ms 推流，
 省电没意义，而默认 modem sleep 会让 RTT 抖动到 200 ms 以上（同网段另一台 ESP 实测 ping 225~256 ms）。
 
 ## 五、复现/验证步骤

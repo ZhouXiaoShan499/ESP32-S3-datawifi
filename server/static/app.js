@@ -16,8 +16,8 @@
  *      按需采集任务（参数表单 → 创建 → 跟踪 → 时间戳/upload_id 回显 → 无回执提示）、
  *      实时拍照（拍一张照片 → kind=camera 任务 → 板端单帧 JPEG 上传 → 画廊缩略图/
  *      原图/逐张删除）、
- *      摄像头实时画面（板端长按 Button A 推流 → POST /api/v1/live → 本页按 seq 轮询
- *      最新一帧 <img>，约 1-2 fps；超时无新帧自动显示「未推流」）、
+ *      摄像头实时画面（板端长按 Button A 推流 → POST /api/v1/live → 本页独立 250 ms
+ *      节拍按 seq 轮询最新一帧 <img>，约 2-4 fps；超时无新帧自动显示「未推流」）、
  *      周期上报控制（暂停 N 秒 / 提前恢复 → kind=pause|resume 任务 → 板端 applied 生效）、
  *      手动批次与周期批次对照、三维姿态视图。
  */
@@ -33,9 +33,13 @@ const CHART_COLORS = { ax: '#cf222e', ay: '#1a7f37', az: '#2563eb' };
 /* 照片画廊：一次拉最近 N 张（对应 GET /api/v1/photos?limit=），点删除走 DELETE */
 const PHOTO_LIMIT = 12;
 /* 摄像头实时画面（直播）：板端长按 Button A 推流，服务端只在内存里保留最新一帧。
-   本页按 seq 轮询 GET /api/v1/live/frame，两次取图之间留最小间隔，避免图片请求
-   拖慢 800 ms 的主轮询（板端实际约 1-2 fps）。 */
-const LIVE_POLL_MIN_MS = 500;
+   本页用**独立节拍**（liveTickLoop）轮询 GET /api/v1/live：新帧一到就尽快换
+   <img src>，不再被 800 ms 的主轮询拖带（板端约 250 ms/帧，见 main.c
+   LIVE_FRAME_INTERVAL_MS，摄像头移动时这一条决定了画面跟手程度）。
+   LIVE_POLL_MIN_MS 是两次取图的最小间隔，防止图片请求堆积。 */
+const LIVE_POLL_MIN_MS = 250;
+const LIVE_TICK_MS = 250;       // 推流中：独立节拍周期（与板端帧间隔对齐）
+const LIVE_IDLE_TICK_MS = 1000; // 未推流：退到 1 s，避免空转时白白高频打 /api/v1/live
 
 /* 闭环事件（板端按键触发）：这些常量必须和上面的常量放在一起。
    注意 poll() 在本文件靠前的位置（约 570 行）就被立刻调用了一次，而事件相关的
@@ -493,8 +497,11 @@ async function poll() {
     }
     rebuildSelect(devs);
 
-    // 3') 摄像头实时画面：每轮都试一次（内部有 500 ms 最小间隔 + busy 保护），
-    //     不 await —— 图片/状态请求再慢也不该拖住 800 ms 的主轮询和数据面板。
+    // 3') 摄像头实时画面：主轮询里也顺手试一次（内部有 LIVE_POLL_MIN_MS 最小
+    //     间隔 + busy 保护，与下面的独立定时器重复调用无副作用，还顺带覆盖了
+    //     切设备 / 点「刷新」后的即时反应）。真正的高频取图由文件末尾的
+    //     setInterval(refreshLive, LIVE_TICK_MS) 负责。不 await —— 图片/状态请求
+    //     再慢也不该拖住 800 ms 的主轮询和数据面板。
     refreshLive();
 
     // 3'') 闭环事件：板端按键触发的事件要"立刻"在页面上看到，
@@ -579,6 +586,20 @@ if ($.chartWin) $.chartWin.textContent = String(CHART_WINDOW_S);
 // 立即轮询一次，再周期轮询
 poll();
 setInterval(poll, POLL_MS);
+
+// 直播画面独立节拍：与 800 ms 主轮询解耦 —— 摄像头移动时，板端一有新帧
+// （seq 变化）就能在 ≤ LIVE_TICK_MS 内换 <img src>，不用干等下一轮主轮询。
+// 推流中按 LIVE_TICK_MS(250 ms) 跑；没推流时退到 LIVE_IDLE_TICK_MS(1 s)，
+// 避免空闲时白白 4 次/秒打 /api/v1/live。refreshLive 内部另有 busy + 最小间隔
+// 双重保护，不会重入或堆积请求。
+// 注意：这里只用 setTimeout 排一拍、不在脚本求值阶段读 LIVE —— const LIVE 在
+// 本文件靠后的直播小节里定义，同步读会命中 TDZ（与文件顶部那段警告同一个坑）。
+function liveTickLoop() {
+  Promise.resolve(refreshLive()).finally(() => {
+    setTimeout(liveTickLoop, LIVE.active ? LIVE_TICK_MS : LIVE_IDLE_TICK_MS);
+  });
+}
+setTimeout(liveTickLoop, LIVE_TICK_MS);
 
 // 页面加载时先画一次空波形，避免 canvas 区域空白
 drawChart([]);
@@ -1076,16 +1097,16 @@ async function refreshControl() {
 /* ------------------------------------------------------------------ *
  *  摄像头实时画面（直播：板端长按 Button A 推流）
  *
- *  链路：板端长按 Button A（2 s）→ live_stream_task 每 ~500 ms 拍一帧
+ *  链路：板端长按 Button A（2 s）→ live_stream_task 每 ~250 ms 拍一帧
  *  640×480 JPEG 并 POST /api/v1/live?device_id=…&ts_ms=…&w=…&h=… →
- *  服务端只把最新一帧留在内存（不落盘、不入库、不建任务）→ 本页每轮
- *  poll() 调 refreshLive()：GET /api/v1/live 看状态，seq 变了才去
- *  GET /api/v1/live/frame 刷新 <img>（额外带 &seq= 防缓存）。
+ *  服务端只把最新一帧留在内存（不落盘、不入库、不建任务）→ 本页由独立节拍
+ *  liveTickLoop() 调 refreshLive()（推流中 250 ms、空闲 1 s）：GET /api/v1/live
+ *  看状态，seq 变了才去 GET /api/v1/live/frame 刷新 <img>（额外带 &seq= 防缓存）。
  *  active=false（超过 timeout_s 没有新帧）= 板端已停止推流 / 断网 / 掉电：
  *  画面保留最后一帧并标记「已停止」，而不是报错。
  * ------------------------------------------------------------------ */
 
-const LIVE = { busy: false, lastAt: 0, lastSeq: -1, device: '' };
+const LIVE = { busy: false, lastAt: 0, lastSeq: -1, device: '', active: false };
 
 /** 未推流 / 查询失败 / 无帧时统一走这里：占位提示 + 隐藏 <img> + 徽章与元信息 */
 function renderLiveOff(text, meta, badgeText) {
@@ -1115,7 +1136,8 @@ function liveMetaText(st, dev) {
     '\n名义帧率：约 ' + (st.nominal_fps ?? '—') + ' fps（阈值 ' + st.timeout_s + ' s 无帧即视为停止）';
 }
 
-/** 每轮 poll() 调用（不 await）：只取最新一帧，没有新帧就不动 <img> */
+/** 独立节拍 liveTickLoop() 与主轮询都会调用（不 await）：只取最新一帧，
+ *  没有新帧就不动 <img>；同时把 LIVE.active 回写，供节拍在 250 ms / 1 s 间切换。 */
 async function refreshLive() {
   const img = $.liveImg;
   if (!img) return;
@@ -1137,6 +1159,7 @@ async function refreshLive() {
       const hot = (st.devices || []).find((d) => d.active) ||
                   (st.devices || [])[0] || null;
       if (!hot) {
+        LIVE.active = false;
         renderLiveOff();
         if ($.liveInfo) $.liveInfo.textContent = '· 暂无设备推流';
         return;
@@ -1151,6 +1174,7 @@ async function refreshLive() {
 
     if ($.liveTimeoutS && st.timeout_s) $.liveTimeoutS.textContent = String(st.timeout_s);
     if ($.liveInfo) $.liveInfo.textContent = '· ' + dev;
+    LIVE.active = !!st.active;   // 决定独立节拍用 250 ms（推流中）还是 1 s（空闲）
 
     const meta = liveMetaText(st, dev);
     if (!st.seq) {      // 该设备从未推过流（服务端内存里没有它的帧）
@@ -1175,6 +1199,7 @@ async function refreshLive() {
         : '已停止（保留最后一帧）';
     }
   } catch (e) {
+    LIVE.active = false;
     renderLiveOff('—（直播状态查询失败：' + e.message + '）', '—', '查询失败');
   } finally {
     LIVE.busy = false;

@@ -309,10 +309,10 @@
     板端<b>长按 Button A（2 s）</b>开始推流：<code>live_stream_task</code> 循环「拍一帧
     <b>640×480 JPEG</b>（esp_video/DVP，原始字节直传）→
     <code>POST /api/v1/live?device_id=…&amp;ts_ms=…&amp;w=…&amp;h=…</code>」，
-    约 <b>1-2 fps</b>；再长按一次停止（LCD 状态栏会显示 <code>Live:ON/OFF</code>）。<br>
+    约 <b>2-4 fps</b>；再长按一次停止（LCD 状态栏会显示 <code>Live:ON/OFF</code>）。<br>
     服务端<b>只在内存里保留每台设备的最新一帧</b>（不落盘、不进 <code>photos</code> 表、不建任务），
-    本卡片按 <code>GET /api/v1/live</code> 的 <code>seq</code> 轮询 <code>GET /api/v1/live/frame</code>
-    刷新 <code>&lt;img&gt;</code>，即得到实时画面。直播是连续流：<b>丢一帧下一帧立刻补上</b>，
+    本卡片以<b>独立 250 ms 节拍</b>按 <code>GET /api/v1/live</code> 的 <code>seq</code> 轮询
+    <code>GET /api/v1/live/frame</code> 刷新 <code>&lt;img&gt;</code>，即得到实时画面。直播是连续流：<b>丢一帧下一帧立刻补上</b>，
     不做逐帧 ACK；超过 <span id="liveTimeoutS">5</span> s 没有新帧即视为「未推流」（板端按停止 /
     断网 / 掉电），画面停在最后一帧而不是报错。<br>
     直播与「拍一张照片」共用相机，板端用互斥锁串行化（单帧拍照最多等多一帧的时间）；
