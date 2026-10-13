@@ -3,8 +3,11 @@
 真实网络端到端自检：以子进程方式真正启动服务（uvicorn），
 再用标准库 urllib 通过真实 HTTP 上传并查询。
 
-另含一项「ASGI 冷启动」自检：用全新临时库 + `uvicorn main:app`（不走 serve()）
-验证建表挂在 lifespan 上（漏挂时全新库的第一个请求就是 500 no such table）。
+另含两项独立子进程自检：
+  1) 「ASGI 冷启动」：用全新临时库 + `uvicorn main:app`（不走 serve()）验证建表挂在
+     lifespan 上（漏挂时全新库的第一个请求就是 500 no such table）；
+  2) 「Agent 不阻塞事件循环」：`/agent/chat` 轮询设备证据期间，其它请求（如
+     /api/v1/health）必须照常被服务 —— 回归点是同步阻塞调用直接跑在 async def 里。
 
 运行：python server/e2e_server_check.py   （需已安装 fastapi + uvicorn）
 """
@@ -13,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -48,15 +52,24 @@ _ASGI_DB = os.path.join(_HERE, "data", "e2e_asgi_cold.db")
 ASGI_PORT = "8014"
 ASGI_BASE = f"http://127.0.0.1:{ASGI_PORT}"
 
+# 「Agent 不阻塞事件循环」自检专用：独立端口 + 独立库 + 压短的采集轮询超时
+# （见 check_agent_chat_not_blocking）。
+_AGENT_DB = os.path.join(_HERE, "data", "e2e_agent_nonblock.db")
+AGENT_PORT = "8015"
+AGENT_BASE = f"http://127.0.0.1:{AGENT_PORT}"
+# 采集工具等证据的轮询超时压到 8 s：够长，足以暴露「轮询期间事件循环被独占」；
+# 够短，自测不用干等默认的 60 s。
+AGENT_POLL_S = 8
 
-def request(method, url, data=None):
+
+def request(method, url, data=None, timeout=5):
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(
         url, data=body, method=method,
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
@@ -108,8 +121,109 @@ def check_asgi_cold_start():
             proc.kill()
 
 
+def check_agent_chat_not_blocking():
+    """`/agent/chat` 执行期间，其它请求必须照常被服务（事件循环不被独占）。
+
+    回归点：`agent/api.py` 的 agent_chat 是 `async def`，但它调用的
+    `nlu.parse()` / `router_.route()` 都是**同步阻塞**调用 —— 后者进到工具里就是
+    `time.sleep` 死等设备证据（采集默认 60 s / 拍照 30 s / 控制 30 s，见
+    `agent/tools/*.py`）。直接调用会独占 uvicorn 的事件循环：期间连
+    `/api/v1/health` 都超时，设备端 `/api/v1/tasks/next` 同样领不到任务，于是刚
+    创建的任务自己走到过期，接口最终返回「采集timeout: expired before device
+    upload」。修法是把这两个阻塞调用交给 `run_in_threadpool`。
+
+    本自检不需要真机：没有设备回证据时工具照样要轮询到超时，这段时间正好是
+    「事件循环必须保持可用」的观测窗口。
+    """
+    _remove_db_files(_AGENT_DB)
+
+    env = dict(os.environ)
+    env["SENSOR_DB"] = _AGENT_DB
+    env["SENSOR_HOST"] = "127.0.0.1"
+    env["SENSOR_PORT"] = AGENT_PORT
+    env["AGENT_CAPTURE_TIMEOUT_S"] = str(AGENT_POLL_S)
+    env.pop("SENSOR_TOKEN", None)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(_HERE, "main.py")],
+        cwd=_HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        up = False
+        for _ in range(60):
+            if proc.poll() is not None:
+                raise SystemExit("agent 自检服务提前退出:\n"
+                                 + (proc.stdout.read() if proc.stdout else ""))
+            try:
+                st, _ = request("GET", AGENT_BASE + "/api/v1/health")
+                if st == 200:
+                    up = True
+                    break
+            except Exception:
+                time.sleep(0.2)
+        assert up, "agent 自检服务未就绪"
+
+        # 后台线程发一条「要采集」的指令；主线程同时不停探 health。
+        holder = {}
+
+        def _chat():
+            try:
+                holder["result"] = request(
+                    "POST", AGENT_BASE + "/api/v1/agent/chat",
+                    {"message": "帮我采集一次数据",
+                     "device_id": "esp32s3-eye-0001"},
+                    # 客户端超时必须**大于**工具的轮询超时，否则阻塞/未阻塞都只会
+                    # 看到 "timed out"，掩盖真正要断言的 health 探针结果。
+                    timeout=AGENT_POLL_S + 20)
+            except Exception as e:               # noqa: BLE001
+                holder["error"] = e
+
+        th = threading.Thread(target=_chat, daemon=True)
+        th.start()
+
+        samples = []
+        deadline = time.time() + AGENT_POLL_S + 10
+        while time.time() < deadline and th.is_alive():
+            t0 = time.time()
+            try:
+                st, _ = request("GET", AGENT_BASE + "/api/v1/health")
+            except Exception as e:               # noqa: BLE001
+                st = repr(e)
+            samples.append((round(time.time() - t0, 2), st))
+            time.sleep(0.5)
+
+        th.join(timeout=AGENT_POLL_S + 15)
+        assert not th.is_alive(), "agent 请求没有在轮询超时后返回"
+        assert "error" not in holder, holder.get("error")
+        st, body = holder["result"]
+        assert st == 200, (st, body)
+
+        # 窗口内**每一次**探针都必须立刻拿到 200；任何一次超时/异常都是事件循环被
+        # 独占（修复前实测：agent 请求 60.2 s 期间 health 连续 12 次 3 s 超时）。
+        assert samples, "没有采到并发探针样本（agent 请求瞬间就返回了？）"
+        bad = [s for s in samples if s[1] != 200]
+        assert not bad, "agent 轮询期间服务端失去响应（事件循环被阻塞）: %s" % bad
+        slow = [s for s in samples if s[0] > 2.0]
+        assert not slow, "agent 轮询期间 health 响应变慢（疑似事件循环被占）: %s" % slow
+
+        # 没有真机回证据 → 仍然不许编造成功（与 test_agent.py 同一约束）
+        assert body["status"] in ("no_evidence", "failure"), body
+        assert body.get("evidence") is None, body
+        print("[PASS] /agent/chat 轮询期间 health 全程 200（%d 次探针，最慢 %.2fs），"
+              "事件循环未被阻塞；且无真机时不返回 success"
+              % (len(samples), max(dt for dt, _ in samples)))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        _remove_db_files(_AGENT_DB)
+
+
 def main():
     check_asgi_cold_start()
+    check_agent_chat_not_blocking()
 
     env = dict(os.environ)
     env["SENSOR_DB"] = _E2E_DB

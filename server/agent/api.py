@@ -4,6 +4,7 @@ import json, logging, uuid, threading, time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("agent.api")
@@ -91,13 +92,22 @@ async def agent_chat(request: Request):
         if req.device_id:
             sess["last_device_id"] = req.device_id
 
-    # NLU 解析
+    # NLU 解析与路由执行都改到工作线程里跑 —— 这两步都是**同步阻塞**调用：
+    #   - nlu.parse() 同步调 LLM（超时 30s，见 config.AGENT_CONFIG[...]["timeout_s"]）；
+    #   - router_.route() 里各工具要同步轮询设备证据，全是 time.sleep 死等
+    #     （采集 60s / 拍照 30s / 控制 30s，见 tools/capture.py 等）。
+    # 直接把它们放在 async def 里会独占 uvicorn 的事件循环：轮询期间**所有**请求
+    # 都得不到响应，连 /api/v1/health 都会超时，设备端的 /api/v1/tasks/next 同样领
+    # 不到任务 —— 于是刚创建的任务只能自己走到过期，接口最终返回
+    # 「采集timeout: expired before device upload」（实测：agent 请求 60.2s 期间
+    # health 连续 12 次 3s 超时，agent 一返回 0.19s 内立刻恢复 200）。
+    # run_in_threadpool 把这两个阻塞调用挪出事件循环，其它请求照常被服务。
     nlu = get_nlu_parser()
-    parsed = nlu.parse(req.message, context=sess)
+    parsed = await run_in_threadpool(nlu.parse, req.message, sess)
 
     # 路由执行
     router_ = get_router()
-    result = router_.route(parsed, context=sess)
+    result = await run_in_threadpool(router_.route, parsed, sess)
 
     # 歧义时暂存意图，以便 clarify 继续
     if result.status.value == "ambiguous":
@@ -154,7 +164,7 @@ async def agent_clarify(request: Request):
     # 保证「选择即执行」，不把用户卡在追问里。
     from .nlu import get_nlu_parser
 
-    chosen = get_nlu_parser().parse(req.choice, context=sess)
+    chosen = await run_in_threadpool(get_nlu_parser().parse, req.choice, sess)
     params = dict(pending.get("parameters") or {})
     params.update(chosen.get("parameters") or {})
     new_parsed = {
@@ -162,8 +172,9 @@ async def agent_clarify(request: Request):
         "parameters": params,
         "confidence": 0.9,
         "ambiguous": False}
+    # 与 /chat 同理：route() 里是同步阻塞的工具轮询，不能占着事件循环。
     router_ = get_router()
-    result = router_.route(new_parsed, context=sess)
+    result = await run_in_threadpool(router_.route, new_parsed, sess)
 
     return JSONResponse({
         "session_id": req.session_id,
