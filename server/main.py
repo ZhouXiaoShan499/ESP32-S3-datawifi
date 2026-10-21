@@ -169,6 +169,15 @@ PHOTO_JPEG_MAGIC = b"\xff\xd8\xff"    # JPEG SOI + 首个 marker，用于拒绝�
 PHOTO_MAX_NOTE_LEN = 200
 PHOTO_ID_RE = re.compile(r"^\d{1,18}$")
 
+# 数据采集历史（GET /api/v1/uploads*）：uploads 一行 = 一批采集数据
+# （周期上报一批 / 手动采集一批）。/api/v1/latest 只回答「最近一批」，
+# 这两个接口回答「历史上都采过哪些批、每批采到了什么」。
+UPLOAD_DEFAULT_LIMIT = 20              # 列表默认返回批次数
+UPLOAD_MAX_LIMIT = 200
+UPLOAD_SAMPLE_DEFAULT_LIMIT = 2000     # 单批样本默认返回条数（板端单批上限 600 点）
+UPLOAD_SAMPLE_MAX_LIMIT = 5000
+UPLOAD_ID_RE = re.compile(r"^\d{1,18}$")
+
 # request_id 允许的字符集（uuid4().hex 天然满足，也兼容自定 id）
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
@@ -3038,6 +3047,175 @@ def latest(request: Request):
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 数据采集历史：uploads 一行 = 一批采集数据
+#   GET /api/v1/uploads       批次列表（新→旧，可分页、可按 trigger 过滤）
+#   GET /api/v1/uploads/{id}  单批详情（元数据 + 该批样本点）
+# 与 /api/v1/latest 的区别：latest 只回答「最近一批」，这里回答
+# 「历史上都采过哪些批、每批采到的原始采样点是什么」（监控页「历史记录」分区用）。
+# ---------------------------------------------------------------------------
+def _upload_view(row):
+    """uploads 行 → 展示用 dict：去掉体积最大的 payload，补两个格式化时间串。"""
+    up = dict(row)
+    up.pop("payload", None)
+    up["received_at_str"] = _fmt_time(up.get("received_at"))
+    up["ts_ms_str"] = _fmt_epoch_ms(up.get("ts_ms"))
+    return up
+
+
+@app.get("/api/v1/uploads")
+def list_uploads(request: Request):
+    """数据采集历史：一批一行，按 id 倒序（新的在前）。
+
+    ?device_id=（可选，按设备过滤）· ?trigger=manual|periodic（可选，按触发方式过滤）
+    ?limit=（可选，默认 20，范围 1-200）· ?offset=（可选，默认 0）
+    返回 total（满足条件的总批次数）+ 当前页 uploads 元数据（不含原始 payload）。
+    """
+    qp = request.query_params
+    device_id = (qp.get("device_id") or "").strip()
+    trigger = (qp.get("trigger") or "").strip()
+    if trigger and trigger not in ("manual", "periodic"):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'trigger' (expected manual or periodic)"},
+        )
+    try:
+        limit = (int(qp.get("limit"))
+                 if qp.get("limit") not in (None, "") else UPLOAD_DEFAULT_LIMIT)
+        offset = (int(qp.get("offset"))
+                  if qp.get("offset") not in (None, "") else 0)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'limit' or 'offset' (expect integers)"},
+        )
+    if limit < 1 or limit > UPLOAD_MAX_LIMIT:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"invalid 'limit' (expect 1-{UPLOAD_MAX_LIMIT})"},
+        )
+    if offset < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'offset' (expect >= 0)"},
+        )
+
+    conn = _connect()
+    try:
+        conds, args = [], []
+        if device_id:
+            conds.append("device_id=?")
+            args.append(device_id)
+        if trigger:
+            conds.append("trigger=?")
+            args.append(trigger)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        total = conn.execute(
+            "SELECT COUNT(*) FROM uploads" + where, args
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT * FROM uploads" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            args + [limit, offset],
+        ).fetchall()
+    finally:
+        conn.close()
+    return JSONResponse(
+        status_code=200,
+        content={
+            "code": "OK", "ok": True,
+            "count": len(rows), "total": total,
+            "limit": limit, "offset": offset,
+            "device_id": device_id or None,
+            "trigger": trigger or None,
+            "uploads": [_upload_view(r) for r in rows],
+        },
+    )
+
+
+@app.get("/api/v1/uploads/{upload_id}")
+def get_upload(upload_id: str, request: Request):
+    """单批详情：元数据 + 该批样本点（按 seq 升序）。
+
+    ?limit=（可选，默认 2000，范围 1-5000）· ?offset=（可选，默认 0）
+    每个样本额外带 t_abs_ms = 批次起点 ts_ms + 批内偏移 t_ms：页面直接拿它当
+    绝对时间轴画波形，CSV 导出也用它，省得每个调用方各加一次。
+    upload_id 非法/不存在 → 404（与 /api/v1/photos/{id} 同口径）。
+    """
+    if not UPLOAD_ID_RE.match(upload_id or ""):
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "ok": False,
+                     "error": f"unknown upload id: {upload_id}"},
+        )
+    qp = request.query_params
+    try:
+        limit = (int(qp.get("limit"))
+                 if qp.get("limit") not in (None, "") else UPLOAD_SAMPLE_DEFAULT_LIMIT)
+        offset = (int(qp.get("offset"))
+                  if qp.get("offset") not in (None, "") else 0)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'limit' or 'offset' (expect integers)"},
+        )
+    if limit < 1 or limit > UPLOAD_SAMPLE_MAX_LIMIT:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": f"invalid 'limit' (expect 1-{UPLOAD_SAMPLE_MAX_LIMIT})"},
+        )
+    if offset < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "INVALID", "ok": False,
+                     "error": "invalid 'offset' (expect >= 0)"},
+        )
+
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM uploads WHERE id=?", (int(upload_id),)
+        ).fetchone()
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "ok": False,
+                         "error": f"unknown upload id: {upload_id}"},
+            )
+        up = _upload_view(row)
+        rows = conn.execute(
+            "SELECT seq, t_ms, ax, ay, az FROM samples"
+            " WHERE upload_id=? ORDER BY seq ASC LIMIT ? OFFSET ?",
+            (up["id"], limit, offset),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    base = up.get("ts_ms") or 0
+    samples = []
+    for r in rows:
+        s = dict(r)
+        s["t_abs_ms"] = base + (s.get("t_ms") or 0)
+        samples.append(s)
+    total = up.get("sample_count") or 0
+    return JSONResponse(
+        status_code=200,
+        content={
+            "code": "OK", "ok": True, "found": True,
+            "upload": up,
+            "sample_count": total,
+            "count": len(samples), "limit": limit, "offset": offset,
+            "truncated": (offset + len(samples)) < total,
+            "samples": samples,
+        },
+    )
 
 
 @app.get("/api/v1/window")

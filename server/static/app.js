@@ -132,6 +132,26 @@ const $ = {
   eventConfirmBtn: el('eventConfirmBtn'),
   eventStatusLine: el('eventStatusLine'),
   eventHistoryBody: el('eventHistoryBody'),
+  histTrigger: el('histTrigger'),
+  histLimit: el('histLimit'),
+  histPrevBtn: el('histPrevBtn'),
+  histNextBtn: el('histNextBtn'),
+  histRefreshBtn: el('histRefreshBtn'),
+  histInfo: el('histInfo'),
+  histBadge: el('histBadge'),
+  histBody: el('histBody'),
+  histDetailCard: el('histDetailCard'),
+  histDetailTitle: el('histDetailTitle'),
+  histDetailGrid: el('histDetailGrid'),
+  histCsvBtn: el('histCsvBtn'),
+  histCloseBtn: el('histCloseBtn'),
+  histChart: el('histChart'),
+  histChartUnit: el('histChartUnit'),
+  histChartCount: el('histChartCount'),
+  histSamplePrevBtn: el('histSamplePrevBtn'),
+  histSampleNextBtn: el('histSampleNextBtn'),
+  histSampleInfo: el('histSampleInfo'),
+  histSampleBody: el('histSampleBody'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '',
@@ -347,11 +367,24 @@ function drawChartEmpty(ctx, w, h, box, text) {
 /**
  * 画 ax/ay/az 三条滚动曲线。
  * points: [{t: 绝对 epoch ms, ax, ay, az}, ...]（按 t 升序）
- * X 轴固定为 [tEnd - CHART_WINDOW_S, tEnd] 的滚动窗口，tEnd = 最后一个点的时间。
+ * X 轴为 [tEnd - spanS, tEnd] 的窗口，tEnd = 最后一个点的时间。
+ *
+ * opts（可选，全给默认值就是原来的「最近 30 s 实时波形」）：
+ *   canvas   目标画布（默认 #chart）
+ *   countEl  右上角「N 点」元素（默认 #chartCount）
+ *   spanS    窗口秒数（默认 CHART_WINDOW_S = 30）
+ *   tickS    X 轴刻度间隔秒数（默认 5）
+ *   xLabel   (秒偏移) => 刻度文案，默认 "now" / "-5s" 这种
+ * 「历史记录」里看单批数据时复用本函数（独立画布 + 按该批时长铺满 X 轴）。
  */
-function drawChart(points) {
-  const cv = $.chart;
+function drawChart(points, opts) {
+  opts = opts || {};
+  const cv = opts.canvas || $.chart;
   if (!cv || !cv.getContext) return;
+  const countEl = (opts.countEl !== undefined) ? opts.countEl : $.chartCount;
+  const spanS = opts.spanS || CHART_WINDOW_S;
+  const tickS = opts.tickS || 5;
+  const xLabel = opts.xLabel || ((s) => (s === 0 ? 'now' : '-' + s + 's'));
   const ctx = cv.getContext('2d');
   const { w, h } = fitCanvas(cv, ctx);
   ctx.clearRect(0, 0, w, h);
@@ -366,8 +399,8 @@ function drawChart(points) {
   ctx.lineWidth = 1;
   ctx.strokeRect(box.x + 0.5, box.y + 0.5, box.w - 1, box.h - 1);
 
-  if ($.chartCount) {
-    $.chartCount.textContent = (points ? points.length : 0) + ' 点';
+  if (countEl) {
+    countEl.textContent = (points ? points.length : 0) + ' 点';
   }
 
   if (!points || points.length === 0) {
@@ -375,7 +408,7 @@ function drawChart(points) {
     return;
   }
 
-  const spanMs = CHART_WINDOW_S * 1000;
+  const spanMs = spanS * 1000;
   const tEnd = points[points.length - 1].t;
   const tStart = tEnd - spanMs;
 
@@ -410,10 +443,10 @@ function drawChart(points) {
     ctx.fillText(v.toFixed(1), box.x - 6, y);
   }
 
-  // 纵向网格 + X 刻度（每 5 s 一格，最右为 now）
+  // 纵向网格 + X 刻度（默认每 5 s 一格，最右为 now；单批视图按该批时长给刻度）
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
-  for (let s = 0; s <= CHART_WINDOW_S; s += 5) {
+  for (let s = 0; s <= spanS + 1e-9; s += tickS) {
     const x = xOf(tEnd - s * 1000);
     ctx.strokeStyle = '#eef1f5';
     ctx.beginPath();
@@ -421,7 +454,7 @@ function drawChart(points) {
     ctx.lineTo(x + 0.5, box.y + box.h);
     ctx.stroke();
     ctx.fillStyle = '#6b7280';
-    ctx.fillText(s === 0 ? 'now' : '-' + s + 's', x, box.y + box.h + 6);
+    ctx.fillText(xLabel(s), x, box.y + box.h + 6);
   }
 
   // 三条曲线（裁剪到绘图区，防止越界绘制）
@@ -538,6 +571,10 @@ async function poll() {
     // 不 await：侧栏慢或失败都不该拖住 800 ms 的主轮询。
     pollTicks++;
     if (pollTicks === 1 || pollTicks % SIDE_REFRESH_EVERY === 0) refreshSidePanels();
+
+    // 「历史记录」分区可见时顺手跟一次列表（新批次自动出现）；不可见就不打这个接口。
+    // activeTab 定义在本文件末尾，但这行在 await 之后才执行，脚本求值早已结束，不会命中 TDZ。
+    if (activeTab === 'history' && pollTicks % SIDE_REFRESH_EVERY === 0) refreshHistory();
   } catch (e) {
     renderStatus('⚠ ' + e.message, 'error');
   } finally {
@@ -1533,7 +1570,9 @@ $.previewBtn.addEventListener('click', () => togglePreview());
 // 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
   stopTaskWatch();
+  HIST.offset = 0;                 // 历史记录回到第一页（换设备了）
   setTimeout(refreshSidePanels, 900);
+  setTimeout(refreshHistory, 900);
 });
 
 // 设备列表首次加载后按钮才可用；这里先放开，点击时会校验是否已选设备
@@ -1547,24 +1586,31 @@ refreshSidePanels();
 
 // 便于自动化验证：用 /ui/?autocapture=1 打开页面即触发一次采集（等价于点按钮），
 // 无需人工点击也能核对「建任务 → 板端领取 → 带 request_id 回传」这条链路。
+// 这几个自动参数同时会把分区切到对应那一页，否则动作发生在隐藏面板里，人看不到结果。
+// （switchTab 用 setTimeout 推迟到脚本求值结束：TABS/activeTab 定义在文件末尾，
+//   这行同步执行会命中 TDZ；initTabs 在求值阶段跑完，0 ms 回调随后覆盖它。）
 try {
   const params = new URLSearchParams(window.location.search);
   if (params.get('autocapture') === '1') {
+    setTimeout(() => switchTab('task'), 0);
     setTimeout(captureOnce, 1200);
   }
   // ?autophoto=1：打开页面即触发一次拍照（等价于点「拍一张照片」），
   // 用于自动核对「建 camera 任务 → 板端拍照上传 → 画廊出现新照片」这条链路。
   if (params.get('autophoto') === '1') {
+    setTimeout(() => switchTab('camera'), 0);
     setTimeout(capturePhoto, 1200);
   }
   // ?autopause=1[&pause=90]：打开页面即触发一次「暂停周期」（等价于点按钮），
   // 用于自动核对「建 pause 任务 → 板端 applied → device_control 置停止中」这条链路。
   if (params.get('autopause') === '1') {
+    setTimeout(() => switchTab('control'), 0);
     const dur = Number(params.get('pause') || TASK_LIMITS.pauseDefault);
     setTimeout(() => createTask('pause', { duration_s: dur }), 1200);
   }
   // ?autoresume=1：打开页面即触发一次「恢复周期」（提前结束暂停窗口）
   if (params.get('autoresume') === '1') {
+    setTimeout(() => switchTab('control'), 0);
     setTimeout(() => createTask('resume'), 1200);
   }
 } catch (e) {
@@ -1909,4 +1955,457 @@ function sceneInit() {
 
 sceneInit();
 
+/* ------------------------------------------------------------------ *
+ *  数据采集历史（一行 = uploads 表里的一批数据；点开看这一批的原始采样点）
+ *
+ *  与「采集任务」分区的区别：任务表记的是「你让板端做的事」（下发/回执/完成），
+ *  这里记的是「板端真的传回来的数据批次」—— 点数、批次起点、触发方式、来源 IP，
+ *  以及每批的原始采样点和 CSV 导出。数据源就是 /api/v1/upload 写进去的
+ *  uploads / samples 两张表，不额外落盘、不新增存储。
+ *
+ *  接口：GET /api/v1/uploads（列表，分页 + trigger 过滤）
+ *        GET /api/v1/uploads/{id}（单批元数据 + 该批样本，带 t_abs_ms）
+ *  样本量级：板端单批 ≤600 点（TASK_MAX_SAMPLES），详情一次取回（上限 5000），
+ *  前端按 50 条分页显示，不再为翻页多开接口。
+ * ------------------------------------------------------------------ */
+
+const HIST = {
+  limit: 20,        // 列表每页批次数（与 histLimit 下拉同步）
+  offset: 0,        // 列表偏移（分页游标）
+  total: 0,         // 满足条件的总批次数
+  trigger: '',      // '' = 全部 / manual / periodic
+  busy: false,      // 防重入（主轮询与手动刷新可能同时触发）
+  openId: '',       // 当前打开的批次号（列表里高亮该行）
+  detail: null,     // { upload, samples, truncated }
+  page: 0,          // 详情里样本表的页码
+  pageSize: 50,     // 详情里每页显示多少条样本
+};
+
+const HIST_SAMPLE_LIMIT = 5000;    // 单批样本取回上限（与服务端 UPLOAD_SAMPLE_MAX_LIMIT 同值）
+const HIST_TRIGGER_CN = { manual: 'manual（按需采集）', periodic: 'periodic（周期上报）' };
+
+/** 列表查询串：设备跟随顶部设备下拉；未选设备时列全部设备的批次 */
+function histQuery() {
+  const q = [];
+  if (state.current) q.push('device_id=' + encodeURIComponent(state.current));
+  if (HIST.trigger) q.push('trigger=' + encodeURIComponent(HIST.trigger));
+  q.push('limit=' + HIST.limit);
+  q.push('offset=' + Math.max(0, HIST.offset));
+  return '/api/v1/uploads?' + q.join('&');
+}
+
+/** 拉列表并渲染（失败也要说清楚原因，而不是留一个空表） */
+async function refreshHistory() {
+  if (HIST.busy) return;
+  HIST.busy = true;
+  try {
+    const data = await apiGet(histQuery());
+    HIST.total = data.total || 0;
+    HIST.offset = data.offset || 0;
+    HIST.limit = data.limit || HIST.limit;
+    renderHistoryList(data.uploads || []);
+  } catch (e) {
+    histSetBodyText('—（历史数据查询失败：' + e.message + '）');
+    if ($.histInfo) $.histInfo.textContent = '· 查询失败';
+    if ($.histBadge) { $.histBadge.className = 'badge err'; $.histBadge.textContent = '读取失败'; }
+  } finally {
+    HIST.busy = false;
+  }
+}
+
+/** 列表空表 / 出错时的占位行 */
+function histSetBodyText(text) {
+  const tr = document.createElement('tr');
+  const td = document.createElement('td');
+  td.colSpan = 8;
+  td.textContent = text;
+  tr.appendChild(td);
+  $.histBody.innerHTML = '';
+  $.histBody.appendChild(tr);
+}
+
+/** 列表渲染：批号 / 接收时间 / 批次起点 / 点数 / 触发方式 / request_id / 来源 / 操作。
+ *  所有文本走 textContent —— source / ip 等字段是上报方可控的自由文本。 */
+function renderHistoryList(list) {
+  if (!list.length) {
+    histSetBodyText(state.current
+      ? '—（该设备还没有采集记录；板端上传一批数据后这里就会出现）'
+      : '—（还没有任何采集记录；设备开始上报后这里就会出现）');
+  } else {
+    const body = $.histBody;
+    body.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (const u of list) {
+      const open = String(u.id) === String(HIST.openId);
+      const tr = document.createElement('tr');
+      if (open) tr.className = 'hist-open';
+      const cells = [
+        ['#' + u.id, 'upload_id=' + u.id],
+        [u.received_at_str || '—', 'received_at=' + (u.received_at ?? '')],
+        [u.ts_ms_str || '—', 'ts_ms=' + (u.ts_ms ?? '')],
+        [(u.sample_count ?? '—') + ' 点', ''],
+        [HIST_TRIGGER_CN[u.trigger] || (u.trigger || '—'), ''],
+        [shortRid(u.request_id), u.request_id || '（周期批次不带任务号）'],
+        [(u.source || '—') + (u.ip ? ' · ' + u.ip : ''),
+         'source=' + (u.source || '—') + ' unit=' + (u.unit || '—') + ' ip=' + (u.ip || '—')],
+      ];
+      for (const [text, title] of cells) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        if (title) td.title = title;
+        tr.appendChild(td);
+      }
+      const tdBtn = document.createElement('td');
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.dataset.uploadId = String(u.id);
+      btn.textContent = open ? '刷新样本' : '查看样本';
+      tdBtn.appendChild(btn);
+      tr.appendChild(tdBtn);
+      frag.appendChild(tr);
+    }
+    body.appendChild(frag);
+  }
+
+  if ($.histInfo) {
+    $.histInfo.textContent = '· ' + (state.current || '全部设备') +
+      ' · 共 ' + HIST.total + ' 批' +
+      (HIST.total ? ' · 当前显示第 ' + (HIST.offset + 1) + '-' +
+                    (HIST.offset + list.length) + ' 批' : '') +
+      (HIST.trigger ? ' · 只看 ' + HIST.trigger : '');
+  }
+  if ($.histBadge) {
+    $.histBadge.className = 'badge ' + (HIST.total ? 'ok' : 'off');
+    $.histBadge.textContent = HIST.total + ' 批';
+  }
+  $.histPrevBtn.disabled = HIST.offset <= 0;
+  $.histNextBtn.disabled = (HIST.offset + HIST.limit) >= HIST.total;
+}
+
+/** 打开某一批：元数据 + 原始波形 + 样本表（前端分页） */
+async function openUploadDetail(id) {
+  const sid = String(id || '');
+  if (!/^\d+$/.test(sid)) return;
+  HIST.openId = sid;
+  HIST.page = 0;
+  HIST.detail = null;
+  $.histDetailCard.classList.remove('hidden');
+  $.histDetailTitle.textContent = '· 批次 #' + sid + '（加载中…）';
+  $.histDetailGrid.innerHTML = '';
+  $.histCsvBtn.disabled = true;
+  $.histSampleBody.innerHTML = '<tr><td colspan="6">加载中…</td></tr>';
+  $.histSampleInfo.textContent = '';
+  $.histSamplePrevBtn.disabled = true;
+  $.histSampleNextBtn.disabled = true;
+  try {
+    const data = await apiGet('/api/v1/uploads/' + encodeURIComponent(sid) +
+                              '?limit=' + HIST_SAMPLE_LIMIT);
+    HIST.detail = {
+      upload: data.upload || {},
+      samples: data.samples || [],
+      truncated: !!data.truncated,
+    };
+    renderUploadDetail();
+  } catch (e) {
+    $.histDetailTitle.textContent = '· 批次 #' + sid;
+    $.histSampleBody.innerHTML = '';
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.textContent = '—（读取失败：' + e.message + '）';
+    tr.appendChild(td);
+    $.histSampleBody.appendChild(tr);
+    renderStatus('⚠ 读取历史批次 #' + sid + ' 失败：' + e.message, 'error');
+  }
+  refreshHistory();     // 让列表跟上（行高亮 / 按钮文案）
+}
+
+/** 详情里的一个「k / v」单元格（与页面上其它卡片同一套样式） */
+function histKv(label, value, title) {
+  const wrap = document.createElement('div');
+  wrap.className = 'kv';
+  const k = document.createElement('span');
+  k.className = 'k';
+  k.textContent = label;
+  const v = document.createElement('span');
+  v.className = 'v';
+  v.textContent = value;
+  if (title) v.title = title;
+  wrap.appendChild(k);
+  wrap.appendChild(v);
+  return wrap;
+}
+
+/** 单批 X 轴的刻度步长：目标 6 格，取「好看的」数值 */
+function histTickStep(target) {
+  const steps = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600];
+  for (const s of steps) {
+    if (s >= target) return s;
+  }
+  return 600;
+}
+
+function renderUploadDetail() {
+  const d = HIST.detail;
+  if (!d) return;
+  const up = d.upload;
+  const samples = d.samples;
+
+  $.histDetailTitle.textContent = '· 批次 #' + up.id + ' · ' + (up.device_id || '—') +
+    ' · 共 ' + samples.length + ' 点';
+
+  const grid = $.histDetailGrid;
+  grid.innerHTML = '';
+  grid.appendChild(histKv('设备 ID', up.device_id || '—'));
+  grid.appendChild(histKv('数据源 / 单位', (up.source || '—') + ' (' + (up.unit || '—') + ')'));
+  grid.appendChild(histKv('本批样本数', (up.sample_count ?? '—') + ' 点'));
+  grid.appendChild(histKv('批次起点 ts_ms', up.ts_ms_str || '—', 'ts_ms=' + (up.ts_ms ?? '')));
+  grid.appendChild(histKv('服务端接收时间', up.received_at_str || '—',
+                          'received_at=' + (up.received_at ?? '')));
+  grid.appendChild(histKv('触发方式 trigger', HIST_TRIGGER_CN[up.trigger] || (up.trigger || '—')));
+  grid.appendChild(histKv('任务号 request_id', up.request_id || '—（周期批次不带任务号）'));
+  grid.appendChild(histKv('来源', (up.ip || '—') + ' · upload_id=' + up.id));
+
+  // 波形用这一批的时长铺满 X 轴（实时波形那套固定 30 s 窗口不适合看单批）
+  if ($.histChartUnit) $.histChartUnit.textContent = up.unit || 'm/s^2';
+  const points = samples.map((s) => ({ t: s.t_abs_ms, ax: s.ax, ay: s.ay, az: s.az }));
+  if (points.length >= 2) {
+    const spanS = Math.max(0.05, (points[points.length - 1].t - points[0].t) / 1000);
+    drawChart(points, {
+      canvas: $.histChart,
+      countEl: $.histChartCount,
+      spanS: spanS,
+      tickS: histTickStep(spanS / 6),
+      xLabel: (s) => Math.max(0, spanS - s).toFixed(1) + 's',
+    });
+  } else {
+    drawChart(points, { canvas: $.histChart, countEl: $.histChartCount });
+  }
+
+  $.histCsvBtn.disabled = !samples.length;
+  renderUploadSamples();
+}
+
+/** 详情里的样本表：前端按 pageSize 分页（单批通常 ≤600 条） */
+function renderUploadSamples() {
+  const d = HIST.detail;
+  if (!d) return;
+  const total = d.samples.length;
+  const pages = Math.max(1, Math.ceil(total / HIST.pageSize));
+  HIST.page = Math.min(Math.max(0, HIST.page), pages - 1);
+  const start = HIST.page * HIST.pageSize;
+  const rows = d.samples.slice(start, start + HIST.pageSize);
+  const body = $.histSampleBody;
+  body.innerHTML = '';
+
+  if (!total) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.textContent = '—（这一批没有样本点）';
+    tr.appendChild(td);
+    body.appendChild(tr);
+  } else {
+    const frag = document.createDocumentFragment();
+    for (const s of rows) {
+      const tr = document.createElement('tr');
+      for (const v of [s.seq, s.t_ms, s.t_abs_ms, fmtNum(s.ax), fmtNum(s.ay), fmtNum(s.az)]) {
+        const td = document.createElement('td');
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      frag.appendChild(tr);
+    }
+    body.appendChild(frag);
+  }
+  $.histSampleInfo.textContent = total
+    ? '· 第 ' + (start + 1) + '-' + (start + rows.length) + ' 条 / 共 ' + total + ' 条' +
+      (d.truncated ? '（服务端只返回了前 ' + total + ' 条）' : '')
+    : '';
+  $.histSamplePrevBtn.disabled = HIST.page <= 0;
+  $.histSampleNextBtn.disabled = HIST.page >= pages - 1;
+}
+
+function closeUploadDetail() {
+  HIST.detail = null;
+  HIST.openId = '';
+  $.histDetailCard.classList.add('hidden');
+  refreshHistory();     // 清掉行高亮与「刷新样本」文案
+}
+
+/** 导出这一批为 CSV：列名与板端 SD 卡 CSV 对齐，label 填触发方式 */
+function histDownloadCsv() {
+  const d = HIST.detail;
+  if (!d || !d.samples.length) return;
+  const up = d.upload || {};
+  const lines = [
+    '# device_id=' + (up.device_id || '') + ' upload_id=' + (up.id || '') +
+      ' source=' + (up.source || '') + ' unit=' + (up.unit || '') +
+      ' trigger=' + (up.trigger || ''),
+    '# ts_ms=' + (up.ts_ms || '') + ' received_at=' + (up.received_at_str || ''),
+    'label,timestamp_ms,accel_x,accel_y,accel_z',
+  ];
+  for (const s of d.samples) {
+    lines.push([up.trigger || '', s.t_abs_ms, s.ax, s.ay, s.az].join(','));
+  }
+  // BOM：Windows 双击打开 CSV 时 Excel 才不会把中文/数字搞乱
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'imu_' + String(up.device_id || 'device').replace(/[^\w.-]+/g, '_') +
+               '_batch' + (up.id || '') + '_' + String(up.ts_ms || '') + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// ---- 历史记录分区的控件 ----
+$.histTrigger.addEventListener('change', () => {
+  HIST.trigger = $.histTrigger.value;
+  HIST.offset = 0;
+  refreshHistory();
+});
+$.histLimit.addEventListener('change', () => {
+  HIST.limit = Number($.histLimit.value) || 20;
+  HIST.offset = 0;
+  refreshHistory();
+});
+$.histPrevBtn.addEventListener('click', () => {
+  HIST.offset = Math.max(0, HIST.offset - HIST.limit);
+  refreshHistory();
+});
+$.histNextBtn.addEventListener('click', () => {
+  HIST.offset += HIST.limit;
+  refreshHistory();
+});
+$.histRefreshBtn.addEventListener('click', () => refreshHistory());
+$.histCloseBtn.addEventListener('click', () => closeUploadDetail());
+$.histCsvBtn.addEventListener('click', () => histDownloadCsv());
+$.histSamplePrevBtn.addEventListener('click', () => { HIST.page--; renderUploadSamples(); });
+$.histSampleNextBtn.addEventListener('click', () => { HIST.page++; renderUploadSamples(); });
+
+// 「查看样本」按钮是每行动态生成的，用事件委托接（避免每次渲染绑 N 个监听）
+$.histBody.addEventListener('click', (ev) => {
+  const btn = (ev.target && ev.target.closest) ? ev.target.closest('button[data-upload-id]') : null;
+  if (btn) openUploadDetail(btn.dataset.uploadId);
+});
+
+/* ------------------------------------------------------------------ *
+ *  功能分区（同一页面内切换，避免 9 张卡片竖着堆成一长条）
+ *
+ *  6 个分区按钮 ↔ 6 个 .tab-panel：按钮 data-tab="x" 对应面板 id="panel-x"。
+ *  所有卡片/控件的元素 id 都没改，隐藏只是给面板加/去 .active；DOM 一直在，
+ *  所以 800 ms 主轮询照常把数据写进"看不见"的卡片，切过去看到的就是最新的。
+ *
+ *  两个必须注意的点：
+ *   1) canvas 在 display:none 的父节点里 clientWidth = 0，fitCanvas 会退回 900px
+ *      兜底宽度 —— 所以切回「实时数据」时要按真实尺寸重画一次（refreshTab 做）。
+ *   2) 顶层 const/let（LIVE / SCENE / TABS 等）在脚本求值阶段处于 TDZ，本模块的
+ *      同步代码只碰 DOM；所有刷新调用都发生在初始化之后或事件回调里。
+ * ------------------------------------------------------------------ */
+
+const TABS = ['data', 'history', 'task', 'control', 'camera', 'event'];
+const TAB_KEY = 'imu_web_tab';    // localStorage：记住上次停留的分区，下次打开还停在那页
+let activeTab = 'data';
+
+/** 切换分区。opts.silent 不写 hash；opts.noRefresh 不补刷数据（首屏用，避免重复打接口） */
+function switchTab(id, opts) {
+  opts = opts || {};
+  if (TABS.indexOf(id) < 0) id = 'data';
+  activeTab = id;
+
+  TABS.forEach((t) => {
+    const panel = el('panel-' + t);
+    if (panel) panel.classList.toggle('active', t === id);
+    const btn = el('tab-' + t);
+    if (btn) {
+      btn.setAttribute('aria-selected', t === id ? 'true' : 'false');
+      btn.tabIndex = (t === id) ? 0 : -1;     // 只有当前分区留在 Tab 键序列里
+    }
+  });
+
+  if (!opts.silent) {
+    try { window.location.hash = 'tab=' + id; } catch (e) { /* 某些环境忽略 */ }
+  }
+  try { window.localStorage.setItem(TAB_KEY, id); } catch (e) { /* 隐私模式忽略 */ }
+  if (!opts.noRefresh) refreshTab(id);
+}
+
+/** 切过去时补刷一次：数据不用等下一轮 800 ms 轮询；canvas 按真实尺寸重画 */
+function refreshTab(id) {
+  if (id === 'data') {
+    drawChart(state.lastPoints || []);
+    drawScene3D(state.lastPoints || []);
+  } else if (id === 'history') {
+    refreshHistory();          // 采集历史列表（新批次 / 换设备 / 换过滤条件）
+  } else if (id === 'task') {
+    refreshLatestTask();       // 任务卡片 + 任务历史表（同一次 /api/v1/tasks 请求）
+  } else if (id === 'control') {
+    refreshControl();          // device_control 真相源
+    renderCompare();           // 手动批次 vs 周期批次
+  } else if (id === 'camera') {
+    refreshLive();             // 直播最新一帧
+    refreshGallery();          // 照片画廊
+  } else if (id === 'event') {
+    refreshEvents(true);       // 闭环事件卡片 + 流水表
+  }
+}
+
+/** #tab=camera 这类深链（也便于自动化自检直达某个分区；只认已知分区名） */
+function tabFromHash() {
+  try {
+    const m = /(?:^#|&)tab=([a-z]+)/.exec(window.location.hash || '');
+    if (m && TABS.indexOf(m[1]) >= 0) return m[1];
+  } catch (e) { /* 忽略 */ }
+  return '';
+}
+
+// 分区条：点击切换；左右方向键在分区之间移动（WAI-ARIA tabs 的惯例操作）
+document.querySelectorAll('#tabNav .tab').forEach((btn) => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  btn.addEventListener('keydown', (ev) => {
+    const step = ev.key === 'ArrowRight' ? 1 : (ev.key === 'ArrowLeft' ? -1 : 0);
+    if (!step) return;
+    ev.preventDefault();
+    const next = TABS[(TABS.indexOf(btn.dataset.tab) + step + TABS.length) % TABS.length];
+    switchTab(next);
+    const nextBtn = el('tab-' + next);
+    if (nextBtn) nextBtn.focus();
+  });
+});
+
+// 浏览器前进 / 后退（只变 hash，不会重新加载页面）
+window.addEventListener('hashchange', () => {
+  const t = tabFromHash();
+  if (t && t !== activeTab) switchTab(t);
+});
+
+/** ?upload=<批号>：直达某一批历史数据的详情（可分享的链接，也便于自动化自检） */
+function uploadFromQuery() {
+  try {
+    const v = new URLSearchParams(window.location.search).get('upload') || '';
+    return /^\d+$/.test(v) ? v : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 首屏分区优先级：URL hash（#tab=camera）> ?upload=（历史详情）> 上次停留的分区 > 默认「实时数据」。
+// noRefresh：首屏数据由下面的 poll() / refreshSidePanels() 统一拉取，别重复打接口。
+(function initTabs() {
+  const autoUpload = uploadFromQuery();
+  let t = tabFromHash();
+  if (!t && autoUpload) t = 'history';
+  if (!t) {
+    try {
+      const saved = window.localStorage.getItem(TAB_KEY);
+      if (saved && TABS.indexOf(saved) >= 0) t = saved;
+    } catch (e) { /* 忽略 */ }
+  }
+  switchTab(t || 'data', { silent: true, noRefresh: true });
+  // 等首屏设备列表落地再打开详情（列表要按设备过滤，晚了才不会先闪一次「全部设备」）
+  if (autoUpload) setTimeout(() => openUploadDetail(autoUpload), 800);
+})();
 

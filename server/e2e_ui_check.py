@@ -20,6 +20,10 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
     画廊出现缩略图/尺寸/删除按钮、任务卡片显示关联照片；DELETE 后画廊回到空态、计数归零
     （第七/八/九次 dump）
 
+  * 数据采集历史（第 12/13 次 dump）：#tab=history 列出 uploads 表每一批（批号 / 点数 /
+    触发方式 / request_id / 来源），?upload=<批号> 深链展开该批的全部原始样本 + 波形 +
+    CSV 导出按钮
+
 运行：python server/e2e_ui_check.py
   未找到浏览器时打印 [SKIP] 并以 0 退出；可用 EDGE_PATH 指定浏览器可执行文件。
 """
@@ -200,6 +204,15 @@ def any_text(dom, elem_id):
     """取出任意标签（span / p / td …）且带指定 id 的元素文本。"""
     m = re.search(r'<(\w+)[^>]*id="%s"[^>]*>(.*?)</\1>' % elem_id, dom, re.S)
     return m.group(2).strip() if m else ""
+
+
+def elem_class(dom, elem_id):
+    """取某个元素的 class 属性（用来判断 5 个分区面板里当前显示的是哪一个）。"""
+    m = re.search(r'<[a-z]+[^>]*\bid="%s"[^>]*>' % elem_id, dom)
+    if not m:
+        return ""
+    c = re.search(r'\bclass="([^"]*)"', m.group(0))
+    return c.group(1) if c else ""
 
 
 def tbody_rows(dom, elem_id):
@@ -554,6 +567,47 @@ def main_run():
           "已回应" in field(dom11, "eventStatus"), field(dom11, "eventStatus"))
     check("event card records who responded",
           "板端按键" in field(dom11, "eventResponded"), field(dom11, "eventResponded"))
+
+    # 20) 数据采集历史（新增分区）：列表一行 = uploads 表一批；
+    #     ?upload=<批号> 深链直接展开这一批的原始采样点 + 波形 + CSV 导出。
+    st, body = get_json("/api/v1/uploads?device_id=" + DEV)
+    check("uploads api lists the seeded batches",
+          st == 200 and body["total"] >= 2 and body["uploads"][0]["id"] >= 1,
+          "total=%s" % body.get("total"))
+    up_id = body["uploads"][0]["id"]
+    up_points = body["uploads"][0]["sample_count"]
+
+    dom12 = dump_dom(browser, BASE + "/ui/#tab=history")
+    check("history tab is the active panel",
+          "tab-panel active" in elem_class(dom12, "panel-history"),
+          elem_class(dom12, "panel-history"))
+    check("history tab hides the other panels",
+          "active" not in elem_class(dom12, "panel-data"),
+          elem_class(dom12, "panel-data"))
+    check("history table lists the batches",
+          ("#%d" % up_id) in tbody_html(dom12, "histBody"),
+          tbody_html(dom12, "histBody")[:200])
+    check("history row offers 查看样本",
+          ('data-upload-id="%d"' % up_id) in tbody_html(dom12, "histBody"),
+          tbody_html(dom12, "histBody")[:200])
+    check("history info shows the batch count",
+          ("共 %d 批" % body["total"]) in field(dom12, "histInfo"),
+          field(dom12, "histInfo"))
+
+    dom13 = dump_dom(browser, BASE + "/ui/?upload=%d" % up_id)
+    check("?upload= deep link opens the batch detail",
+          "hidden" not in elem_class(dom13, "histDetailCard"),
+          elem_class(dom13, "histDetailCard"))
+    check("batch detail renders every sample of the batch",
+          tbody_rows(dom13, "histSampleBody") == up_points,
+          "%s vs %s" % (tbody_rows(dom13, "histSampleBody"), up_points))
+    check("batch waveform canvas drew the batch",
+          field(dom13, "histChartCount") == ("%d 点" % up_points),
+          field(dom13, "histChartCount"))
+    check("batch detail offers the CSV export",
+          'id="histCsvBtn" type="button" disabled' not in dom13
+          and 'id="histCsvBtn"' in dom13,
+          "histCsvBtn")
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 

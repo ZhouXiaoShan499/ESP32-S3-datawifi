@@ -94,11 +94,11 @@ data_capture_sim/                  # 仓库根目录
 | `test_photos.py` | 拍照链路自测（临时库 + 临时照片目录）：JPEG 上传校验/落盘/取图/列表/404+410/删除/camera 任务收尾/幂等，16 项断言。 |
 | `test_events.py` | 闭环事件自测（临时库）：触发校验/板端重试幂等/状态机单向性（accept→ack、cancel→cancelled、confirm→completed）/终态不可回退/超 TTL 惰性过期/列表过滤与分页/设备侧鉴权/health 汇总，23 项断言。 |
 | `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等，pause/resume 的 `/applied` 收尾与 `/devices` 暂停标注，以及闭环事件「触发 → 幂等重试 → 轮询 → 回应 → 确认完成 → 终态不可回退」9 项），23 项断言。 |
-| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（11 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、参数表单带板端上限且任务真用该参数、任务卡片 `upload_id` 与时间戳、任务历史倒序、manual/periodic 对照区、无回执提示出现与消失、控制卡片「停止中/上报中」与控制任务渲染、闭环事件卡片的 request_id/待处理状态/徽章/流水行与「板端回应后转已回应」），90 项断言；未装浏览器时打印 SKIP。 |
+| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（13 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图 `|a|`、参数表单带板端上限且任务真用该参数、任务卡片 `upload_id` 与时间戳、任务历史倒序、manual/periodic 对照区、无回执提示出现与消失、控制卡片「停止中/上报中」与控制任务渲染、闭环事件卡片的 request_id/待处理状态/徽章/流水行与「板端回应后转已回应」、**历史记录分区的批次列表与 `?upload=<批号>` 单批详情**），100 项断言；未装浏览器时打印 SKIP。 |
 | `e2e_live_check.py` | 摄像头直播自检（临时库 + 真实 uvicorn，`SENSOR_LIVE_TIMEOUT_S=1`）：推帧 201/单调 `seq`、状态 `active/尺寸/帧龄`、`/live/frame` 原样取回、只保留最新一帧、错误路径（400/413/404）、**不落盘不入库**（`photos` 总数 0 + 照片目录为空）、超时后 `active=false` 但仍可取最后一帧；有 Edge/Chrome 时再 dump 两次 DOM，断言实时卡片 `<img>`、「推流中 · 640×480」徽章与超时后的「已停止（保留最后一帧）」，28 项断言。 |
 | `e2e_device_check.py` | 真机（上板）脚本化验收：起真实服务（默认 `0.0.0.0:8000`），等板端周期上报出现后跑「建任务 → 领取 → ack → 采集窗口内周期上报为 0 → completed + upload_id → 周期恢复 → 历史可见」+「暂停周期（板端 applied → device_control 停止中 → 观察窗内 0 新周期批次 → 暂停中手动采集仍可用）→ 恢复周期」28 项断言；板端不在场时打印 `[SKIP]` 并以 0 退出。 |
-| `static/index.html` | 监控页面结构（设备下拉、**采集参数表单**、**暂停时长 + 暂停周期/恢复周期按钮**、数据卡片、样本表、波形画布、任务卡片（含无回执提示）、**周期上报控制卡片**、**手动/周期对照表**、**任务历史表**、**摄像头实时画面卡片（大图 + 徽章 + 元信息）**、拍照画廊、三维视图画布）。 |
-| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图 / 暂停状态 / **直播状态与最新一帧** / **闭环事件**）、`createTask(kind)` 统一建任务入口（采集 / 暂停 / 恢复）、状态跟踪（时间戳 / upload_id / 无回执推断）、控制卡片渲染、对照区与任务历史渲染、`refreshLive()` 按 `seq` 刷新直播 `<img>`、`refreshEvents()` + `respondEvent()` 渲染闭环事件卡片与流水、照片画廊渲染、Canvas 2D 手写正交投影渲染。 |
+| `static/index.html` | 监控页面结构（顶部常驻设备下拉 + 仅刷新、**6 个功能分区按钮（实时数据 / 历史记录 / 采集任务 / 周期控制 / 摄像头 / 事件闭环）**、采集参数表单、暂停时长 + 暂停周期/恢复周期按钮、数据卡片、样本表、波形画布、**历史记录批次表 + 单批详情（波形 + 样本表 + CSV 导出）**、任务卡片（含无回执提示）、周期上报控制卡片、手动/周期对照表、任务历史表、摄像头实时画面卡片（大图 + 徽章 + 元信息）、拍照画廊、三维视图画布）。 |
+| `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图 / 暂停状态 / **直播状态与最新一帧** / **闭环事件**）、`createTask(kind)` 统一建任务入口（采集 / 暂停 / 恢复）、状态跟踪（时间戳 / upload_id / 无回执推断）、控制卡片渲染、对照区与任务历史渲染、`refreshLive()` 按 `seq` 刷新直播 `<img>`、`refreshEvents()` + `respondEvent()` 渲染闭环事件卡片与流水、照片画廊渲染、**`refreshHistory()` + `openUploadDetail()` 渲染数据采集历史与单批样本（含 `?upload=<批号>` 深链与 CSV 导出）**、`switchTab()` 分区切换（hash + localStorage 记忆、切回时按真实尺寸重绘 canvas）、Canvas 2D 手写正交投影渲染。 |
 
 #### 服务端数据库（SQLite，六张表）
 
@@ -130,6 +130,8 @@ data_capture_sim/                  # 仓库根目录
 | `GET` | `/api/v1/health` | 服务健康状态 + 汇总统计（总批次 / 总样本 / 设备列表 / 最近上报）。 |
 | `GET` | `/api/v1/devices` | 设备列表（各设备的批次数、最近上报时间与 `periodic_paused`）。 |
 | `GET` | `/api/v1/latest?device_id=…` | 某设备最近一次上报（含首末样本，并带回 `trigger` / `request_id` 便于判断数据来源）。 |
+| `GET` | `/api/v1/uploads?device_id=…&limit=20&offset=0` | **数据采集历史**：一批一行（id 倒序），可按 `trigger=manual|periodic` 过滤；返回 `total` + 当前页元数据（不含体积最大的原始 `payload`），供页面「历史记录」分区的列表。 |
+| `GET` | `/api/v1/uploads/{id}?limit=2000` | **单批详情**：该批元数据 + 原始样本点（`seq` 升序，可 `offset` 翻页，上限 5000）；每点附 `t_abs_ms = ts_ms + t_ms`。未知/非法 id → 404。 |
 | `POST` | `/api/v1/tasks` | 创建任务（`kind=capture`/`pause`/`resume`；同 `device+source+kind` 已有未完成任务时复用，返回 `duplicate=true`；控制任务返回 `superseded` 计数）。 |
 | `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`）。 |
 | `GET` | `/api/v1/tasks/next?device_id=…` | 板端领取任务（原子 `UPDATE … WHERE status='submitted'`；声明在 `/tasks/{request_id}` 之前）。 |

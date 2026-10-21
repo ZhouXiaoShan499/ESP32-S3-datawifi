@@ -96,6 +96,8 @@
   th { color: var(--muted); font-weight: 600; }
   th:first-child, td:first-child { text-align: left; }
   tr:last-child td { border-bottom: none; }
+  /* 「历史记录」里当前打开的那一批：整行淡蓝底，方便对上详情卡片 */
+  tr.hist-open td { background: #eaf1ff; }
   .samples-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
   .chart-box { margin-top: 18px; }
   .chart-head {
@@ -104,7 +106,8 @@
   }
   .chart-title { font-weight: 600; color: var(--text); font-size: var(--fs-sm); }
   .chart-count { margin-left: auto; }
-  #chart {
+  /* 实时波形与「历史记录」里单批波形共用同一套样式 */
+  #chart, #histChart {
     display: block; width: 100%; height: 240px;
     border: 1px solid var(--border); border-radius: 6px; background: #fff;
   }
@@ -157,6 +160,24 @@
   }
   .live-meta b { color: var(--text); }
   .err-msg { color: var(--err); }
+
+  /* 功能分区：同一页面内切换，避免 9 张卡片竖着堆成一长条。
+     .tab-panel 默认隐藏，只有 .active 的那个显示（.hidden 仍用于卡片自身的空态） */
+  .tabs {
+    display: flex; gap: 6px; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px; margin-bottom: 16px;
+    position: sticky; top: 8px; z-index: 10;
+  }
+  .tab {
+    border-color: transparent; background: transparent; color: var(--text);
+    font-weight: 600; padding: 7px 16px;
+  }
+  .tab:hover { background: #eaf1ff; }
+  .tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tab[aria-selected="true"]:hover { background: #1d4ed8; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
   footer { color: var(--muted); font-size: var(--fs-xs); margin-top: 8px; }
 </style>
 </head>
@@ -166,33 +187,41 @@
   <span class="poll-hint">自动轮询 · 每 0.8 秒</span>
 </header>
 
+<!-- 常驻顶栏：设备 / 刷新 / 最近刷新时间。任何分区下都要用，所以放在分区之外 -->
 <section class="controls">
   <label for="deviceSel">设备</label>
   <select id="deviceSel" disabled><option value="">加载中…</option></select>
   <button id="refreshBtn" type="button" disabled>仅刷新（不采集）</button>
-  <span class="sep"></span>
-  <label for="sourceSel">数据源</label>
-  <select id="sourceSel" title="必须与板端上报的 source 一致，否则任务校验失败">
-    <option value="qma6100p">qma6100p</option>
-  </select>
-  <label for="countInput">样本数</label>
-  <input type="number" id="countInput" min="1" max="600" step="10" value="100"
-         title="板端单次采集上限 600 点（TASK_MAX_SAMPLES）">
-  <label for="rateInput">采样率 Hz</label>
-  <input type="number" id="rateInput" min="10" max="100" step="10" value="100"
-         title="板端采集上限 100 Hz（TARGET_SAMPLE_FREQ_HZ）">
-  <label for="timeoutInput">有效期 s</label>
-  <input type="number" id="timeoutInput" min="5" max="600" step="5" value="60"
-         title="服务端允许 5-600 s">
-  <button id="captureBtn" type="button" class="primary" disabled>采集一次最新数据</button>
-  <span class="sep"></span>
-  <label for="pauseInput">暂停时长 s</label>
-  <input type="number" id="pauseInput" min="5" max="600" step="5" value="120"
-         title="到点板端自动恢复上报；服务端允许 5-600 s">
-  <button id="pauseBtn" type="button" disabled>暂停周期</button>
-  <button id="resumeBtn" type="button" disabled>恢复周期</button>
   <span id="lastPoll">—</span>
 </section>
+
+<!-- 功能分区按钮：点哪个就显示哪一组卡片，避免 9 张卡片竖着堆成一长条。
+     按钮顺序 = 用户看到的顺序；下面每个 .tab-panel 用 id 与按钮的 data-tab 对应，
+     面板在文件里的先后（沿用原卡片顺序）不影响显示，同一时刻只显示 1 个面板。 -->
+<nav class="tabs" id="tabNav" role="tablist" aria-label="功能分区">
+  <button id="tab-data" class="tab" type="button" role="tab" data-tab="data"
+          aria-controls="panel-data" aria-selected="true">实时数据</button>
+  <button id="tab-history" class="tab" type="button" role="tab" data-tab="history"
+          aria-controls="panel-history" aria-selected="false">历史记录</button>
+  <button id="tab-task" class="tab" type="button" role="tab" data-tab="task"
+          aria-controls="panel-task" aria-selected="false">采集任务</button>
+  <button id="tab-control" class="tab" type="button" role="tab" data-tab="control"
+          aria-controls="panel-control" aria-selected="false">周期控制</button>
+  <button id="tab-camera" class="tab" type="button" role="tab" data-tab="camera"
+          aria-controls="panel-camera" aria-selected="false">摄像头</button>
+  <button id="tab-event" class="tab" type="button" role="tab" data-tab="event"
+          aria-controls="panel-event" aria-selected="false">事件闭环</button>
+</nav>
+
+<div id="statusBar"></div>
+
+<section id="noDeviceMsg" class="notice no-device hidden">
+  <span class="big">尚未发现任何设备</span>
+  暂无设备上报数据。请确认板端已连接 WiFi 并开始采集，或检查服务端数据库。
+</section>
+
+<!-- ===================== 分区：事件闭环 ===================== -->
+<div id="panel-event" class="tab-panel" role="tabpanel" aria-labelledby="tab-event">
 
 <section id="eventCard" class="card">
   <h2>闭环事件（板端按键触发）<span id="eventBadge" class="badge off">无事件</span></h2>
@@ -230,6 +259,28 @@
   </table>
 </section>
 
+</div>
+
+<!-- ===================== 分区：采集任务 ===================== -->
+<div id="panel-task" class="tab-panel" role="tabpanel" aria-labelledby="tab-task">
+
+<section class="controls">
+  <label for="sourceSel">数据源</label>
+  <select id="sourceSel" title="必须与板端上报的 source 一致，否则任务校验失败">
+    <option value="qma6100p">qma6100p</option>
+  </select>
+  <label for="countInput">样本数</label>
+  <input type="number" id="countInput" min="1" max="600" step="10" value="100"
+         title="板端单次采集上限 600 点（TASK_MAX_SAMPLES）">
+  <label for="rateInput">采样率 Hz</label>
+  <input type="number" id="rateInput" min="10" max="100" step="10" value="100"
+         title="板端采集上限 100 Hz（TARGET_SAMPLE_FREQ_HZ）">
+  <label for="timeoutInput">有效期 s</label>
+  <input type="number" id="timeoutInput" min="5" max="600" step="5" value="60"
+         title="服务端允许 5-600 s">
+  <button id="captureBtn" type="button" class="primary" disabled>采集一次最新数据</button>
+</section>
+
 <section id="taskCard" class="card">
   <h2>按需采集任务（手动触发）<span id="taskBadge" class="badge off">空闲</span></h2>
   <div class="grid">
@@ -243,6 +294,30 @@
     <div class="kv"><span class="k">关联数据 upload_id / 照片</span><span class="v" id="taskUploadId">—</span></div>
   </div>
   <p class="ack-warn hidden" id="taskAckHint"></p>
+</section>
+
+<section id="taskHistoryCard" class="card">
+  <h2>任务历史（最近 20 条）<span id="taskHistoryInfo" class="poll-hint"></span></h2>
+  <table>
+    <caption>该设备的任务流水（<code>/api/v1/tasks?device_id=…&amp;limit=20</code>，按创建时间倒序）</caption>
+    <thead>
+      <tr><th>创建时间</th><th>类型</th><th>request_id</th><th>点数 @ Hz</th><th>状态</th><th>upload_id</th><th>耗时</th></tr>
+    </thead>
+    <tbody id="taskHistoryBody"><tr><td colspan="7">—</td></tr></tbody>
+  </table>
+</section>
+
+</div>
+
+<!-- ===================== 分区：周期控制 ===================== -->
+<div id="panel-control" class="tab-panel" role="tabpanel" aria-labelledby="tab-control">
+
+<section class="controls">
+  <label for="pauseInput">暂停时长 s</label>
+  <input type="number" id="pauseInput" min="5" max="600" step="5" value="120"
+         title="到点板端自动恢复上报；服务端允许 5-600 s">
+  <button id="pauseBtn" type="button" disabled>暂停周期</button>
+  <button id="resumeBtn" type="button" disabled>恢复周期</button>
 </section>
 
 <section id="ctrlCard" class="card">
@@ -284,16 +359,10 @@
   </p>
 </section>
 
-<section id="taskHistoryCard" class="card">
-  <h2>任务历史（最近 20 条）<span id="taskHistoryInfo" class="poll-hint"></span></h2>
-  <table>
-    <caption>该设备的任务流水（<code>/api/v1/tasks?device_id=…&amp;limit=20</code>，按创建时间倒序）</caption>
-    <thead>
-      <tr><th>创建时间</th><th>类型</th><th>request_id</th><th>点数 @ Hz</th><th>状态</th><th>upload_id</th><th>耗时</th></tr>
-    </thead>
-    <tbody id="taskHistoryBody"><tr><td colspan="7">—</td></tr></tbody>
-  </table>
-</section>
+</div>
+
+<!-- ===================== 分区：摄像头 ===================== -->
+<div id="panel-camera" class="tab-panel" role="tabpanel" aria-labelledby="tab-camera">
 
 <section id="liveCard" class="card">
   <h2>摄像头实时画面（板端长按 Button A 推流）<span id="liveBadge" class="badge off">未推流</span>
@@ -347,12 +416,10 @@
   </p>
 </section>
 
-<section id="noDeviceMsg" class="notice no-device hidden">
-  <span class="big">尚未发现任何设备</span>
-  暂无设备上报数据。请确认板端已连接 WiFi 并开始采集，或检查服务端数据库。
-</section>
+</div>
 
-<div id="statusBar"></div>
+<!-- ===================== 分区：实时数据（默认显示） ===================== -->
+<div id="panel-data" class="tab-panel active" role="tabpanel" aria-labelledby="tab-data">
 
 <section id="noDataMsg" class="notice hidden">
   <span class="big">该设备暂无数据（NO DATA）</span>
@@ -414,9 +481,89 @@
   </p>
 </section>
 
+</div>
+
+<!-- ===================== 分区：历史记录（数据采集历史） ===================== -->
+<div id="panel-history" class="tab-panel" role="tabpanel" aria-labelledby="tab-history">
+
+<section class="controls">
+  <label for="histTrigger">触发方式</label>
+  <select id="histTrigger" title="periodic = 板端周期上报；manual = 按需采集任务">
+    <option value="">全部</option>
+    <option value="periodic">periodic（周期上报）</option>
+    <option value="manual">manual（按需采集）</option>
+  </select>
+  <label for="histLimit">每页</label>
+  <select id="histLimit">
+    <option value="10">10 批</option>
+    <option value="20" selected>20 批</option>
+    <option value="50">50 批</option>
+  </select>
+  <span class="sep"></span>
+  <button id="histPrevBtn" type="button" disabled>上一页</button>
+  <button id="histNextBtn" type="button" disabled>下一页</button>
+  <button id="histRefreshBtn" type="button" class="primary">刷新</button>
+  <span id="histInfo" class="poll-hint"></span>
+</section>
+
+<section class="card">
+  <h2>数据采集历史（一行 = 一批上传）<span id="histBadge" class="badge off">0 批</span></h2>
+  <table>
+    <caption>GET /api/v1/uploads?device_id=…&amp;limit=…&amp;offset=…（按批号倒序，新的在前）</caption>
+    <thead>
+      <tr><th>批号</th><th>服务端接收时间</th><th>批次起点 ts_ms</th><th>点数</th>
+          <th>触发方式</th><th>request_id</th><th>来源</th><th>操作</th></tr>
+    </thead>
+    <tbody id="histBody"><tr><td colspan="8">—</td></tr></tbody>
+  </table>
+  <p class="hint">
+    这里一行 = <code>uploads</code> 表里的一批数据：板端每完成一次周期上报或一次按需采集就多一行，
+    也就是「数据集」的账本。点「查看样本」可以看这一批的<b>原始采样点</b>、波形，或导出 CSV。<br>
+    与「采集任务」分区的区别：任务表记的是<b>你让板端做的事</b>（下发、回执、完成），
+    这里记的是<b>板端真的传回来的数据批次</b>（点数、起点时间、触发方式、来源 IP）。
+  </p>
+</section>
+
+<section id="histDetailCard" class="card hidden">
+  <h2>批次详情<span id="histDetailTitle" class="poll-hint"></span>
+      <span style="margin-left:auto"></span>
+      <button id="histCsvBtn" type="button" disabled>下载 CSV</button>
+      <button id="histCloseBtn" type="button">关闭</button></h2>
+  <div class="grid" id="histDetailGrid"></div>
+  <div class="chart-box">
+    <div class="chart-head">
+      <span class="chart-title">该批原始波形（ax / ay / az）</span>
+      <span class="chart-unit" id="histChartUnit">m/s^2</span>
+      <span class="chart-count" id="histChartCount">0 点</span>
+    </div>
+    <canvas id="histChart" width="900" height="240"></canvas>
+  </div>
+  <div class="controls" style="margin-top:12px">
+    <button id="histSamplePrevBtn" type="button" disabled>上一页样本</button>
+    <button id="histSampleNextBtn" type="button" disabled>下一页样本</button>
+    <span id="histSampleInfo" class="poll-hint"></span>
+  </div>
+  <table>
+    <thead>
+      <tr><th>seq</th><th>t(ms)</th><th>绝对时间 t_abs_ms</th><th>ax</th><th>ay</th><th>az</th></tr>
+    </thead>
+    <tbody id="histSampleBody"><tr><td colspan="6">—</td></tr></tbody>
+  </table>
+  <p class="hint">
+    样本来自 <code>GET /api/v1/uploads/{id}</code>（按 <code>seq</code> 升序）；
+    <code>t(ms)</code> 是板端批内相对时间，<code>t_abs_ms = 批次起点 ts_ms + t(ms)</code>。
+    CSV 用的是板端 SD 卡同一套列名（<code>label,timestamp_ms,accel_x,accel_y,accel_z</code>），
+    <code>label</code> 填这一批的触发方式，UTF-8 BOM 供 Excel 直接双击打开。
+  </p>
+</section>
+
+</div>
+
 <footer>
   查询接口：/api/v1/devices · /api/v1/latest?device_id=…（可加 &amp;trigger=manual|periodic） ·
   /api/v1/window?device_id=…&amp;seconds=30<br>
+ 历史数据：GET /api/v1/uploads?device_id=…&amp;limit=20&amp;offset=0（可加 &amp;trigger=manual|periodic） ·
+  GET /api/v1/uploads/{id}?limit=2000（单批样本，带 t_abs_ms）<br>
   任务接口：POST /api/v1/tasks · GET /api/v1/tasks?device_id=…&amp;limit=20 ·
   GET /api/v1/tasks/next?device_id=… · GET /api/v1/tasks/{request_id} ·
   POST /api/v1/tasks/{request_id}/applied · GET /api/v1/control?device_id=…<br>
