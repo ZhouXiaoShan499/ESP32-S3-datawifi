@@ -24,6 +24,9 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
     触发方式 / request_id / 来源），?upload=<批号> 深链展开该批的全部原始样本 + 波形 +
     CSV 导出按钮
 
+  * 语音助手（第 14 次 dump）：#tab=voice 可从分区按钮直达，页面同时提供文字输入、
+    开始/停止录音、停止任务、停止播报、清空重输与 request_id 时序日志。
+
 运行：python server/e2e_ui_check.py
   未找到浏览器时打印 [SKIP] 并以 0 退出；可用 EDGE_PATH 指定浏览器可执行文件。
 """
@@ -608,6 +611,28 @@ def main_run():
           'id="histCsvBtn" type="button" disabled' not in dom13
           and 'id="histCsvBtn"' in dom13,
           "histCsvBtn")
+
+    # 21) 语音助手：只验证静态控件与分区切换。headless 浏览器不一定有麦克风或
+    #     Web Speech 权限，所以不在 E2E 中伪造真实语音识别；识别状态在页面内
+    #     会明确显示「不支持/权限拒绝」，文字入口始终可用。
+    dom14 = dump_dom(browser, BASE + "/ui/#tab=voice")
+    check("voice tab is the active panel",
+          "tab-panel active" in elem_class(dom14, "panel-voice"),
+          elem_class(dom14, "panel-voice"))
+    check("voice tab exposes text and recording entry",
+          all(('id="%s"' % eid) in dom14 for eid in
+              ("voiceInput", "voiceRecordBtn", "voiceSendBtn")),
+          "voiceInput / voiceRecordBtn / voiceSendBtn")
+    check("voice assistant exposes stop, clear and speak-stop controls",
+          all(('id="%s"' % eid) in dom14 for eid in
+              ("voiceStopBtn", "voiceClearBtn", "voiceSpeakStopBtn")),
+          "voiceStopBtn / voiceClearBtn / voiceSpeakStopBtn")
+    check("voice assistant states its audio source and runtime",
+          "当前浏览器麦克风" in dom14 and "Web Speech API" in dom14,
+          field(dom14, "voiceSupport"))
+    check("voice assistant renders request-correlated timeline",
+          "request_id" in dom14 and 'id="voiceLogBody"' in dom14,
+          field(dom14, "voiceLogInfo"))
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 

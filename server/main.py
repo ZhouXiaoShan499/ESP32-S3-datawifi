@@ -1372,6 +1372,15 @@ def _check_task_match(request_id, data):
                          "error": f"unknown request_id: {request_id}"},
             )
         task = dict(row)
+        if (task.get("status") == "failed" and
+                task.get("error") == "cancelled by user"):
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "TASK_CANCELLED", "ok": False,
+                         "error": "task was cancelled by user",
+                         "request_id": request_id},
+            )
         # 控制任务（pause/resume）不产生观测数据，因此永远不应该收到带它 request_id
         # 的上传。板端若真这么干了，属于板端 bug，直接拒绝且不动任务状态。
         if task.get("kind") in TASK_CONTROL_KINDS:
@@ -1452,6 +1461,15 @@ def _check_photo_task_match(request_id, data):
             )
         task = dict(row)
         kind = task.get("kind") or TASK_KIND_CAPTURE
+        if (task.get("status") == "failed" and
+                task.get("error") == "cancelled by user"):
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"code": "TASK_CANCELLED", "ok": False,
+                         "error": "task was cancelled by user",
+                         "request_id": request_id},
+            )
         if kind != TASK_KIND_CAMERA:
             conn.rollback()
             return JSONResponse(

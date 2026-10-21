@@ -3,7 +3,7 @@
 import logging
 from typing import Dict, Any, Optional
 
-from .tools.base import ToolResult, ToolResultStatus
+from .tools.base import ToolResult, ToolResultStatus, cancelled_result
 from .tools.query_history import (
     QueryHistoryTool, QueryLatestTool, QueryDevicesTool, QueryHealthTool)
 from .tools.capture import StartCaptureTool
@@ -44,10 +44,15 @@ class IntentRouter:
         return self._tools[intent]
 
     def route(self, parsed: Dict[str, Any],
-              context: Optional[Dict[str, Any]] = None) -> ToolResult:
+              context: Optional[Dict[str, Any]] = None,
+              cancel_event: Any = None,
+              agent_request_id: str = "") -> ToolResult:
         """执行意图路由并运行工具。"""
         from .config import CONFIDENCE_THRESHOLD
         intent = parsed.get("intent", "")
+
+        if cancel_event is not None and cancel_event.is_set():
+            return cancelled_result(agent_request_id)
 
         # 歧义处理
         if parsed.get("ambiguous"):
@@ -80,9 +85,14 @@ class IntentRouter:
             last_did = context.get("last_device_id")
             if last_did and not params.get("device_id"):
                 params["device_id"] = last_did
+        if cancel_event is not None:
+            params["_cancel_event"] = cancel_event
+        if agent_request_id:
+            params["_agent_request_id"] = agent_request_id
 
         logger.info("Route intent=%s tool=%s params=%s",
-                    intent, tool.name, params)
+                    intent, tool.name,
+                    {k: v for k, v in params.items() if not k.startswith("_")})
         result = tool.run(params)
         return result
 

@@ -2,7 +2,10 @@
 """拍照工具 —— 创建 camera 任务并等待照片上传。"""
 import time, uuid
 from typing import Dict, Any
-from .base import BaseTool, ToolResult, ToolResultStatus, make_evidence
+from .base import (
+    BaseTool, ToolResult, ToolResultStatus, make_evidence,
+    cancellation_requested, cancelled_result, mark_device_task_cancelled,
+)
 
 
 class TakePhotoTool(BaseTool):
@@ -22,6 +25,10 @@ class TakePhotoTool(BaseTool):
         from ..config import PHOTO_POLL_TIMEOUT_S, PHOTO_POLL_INTERVAL_S
         main = _import_main()
         did = params.get("device_id", "").strip()
+        agent_request_id = params.get("_agent_request_id", "")
+        cancel_event = params.get("_cancel_event")
+        if cancellation_requested(params):
+            return cancelled_result(agent_request_id)
 
         payload = {"device_id": did, "kind": "camera"}
         ok, result = main.validate_task_request(payload)
@@ -75,7 +82,15 @@ class TakePhotoTool(BaseTool):
         poll_start = time.time()
         last_status = "submitted"
         while (time.time() - poll_start) < PHOTO_POLL_TIMEOUT_S:
-            time.sleep(PHOTO_POLL_INTERVAL_S)
+            if cancel_event is not None:
+                if cancel_event.wait(PHOTO_POLL_INTERVAL_S):
+                    mark_device_task_cancelled(main, request_id)
+                    return cancelled_result(agent_request_id)
+            else:
+                time.sleep(PHOTO_POLL_INTERVAL_S)
+            if cancellation_requested(params):
+                mark_device_task_cancelled(main, request_id)
+                return cancelled_result(agent_request_id)
             conn = main._connect()
             try:
                 main._expire_stale_tasks(conn)

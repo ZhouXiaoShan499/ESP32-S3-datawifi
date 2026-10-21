@@ -2,7 +2,10 @@
 """采集工具 —— 必须有设备真实完成证据才返回成功。"""
 import time, uuid
 from typing import Dict, Any
-from .base import BaseTool, ToolResult, ToolResultStatus, make_evidence
+from .base import (
+    BaseTool, ToolResult, ToolResultStatus, make_evidence,
+    cancellation_requested, cancelled_result, mark_device_task_cancelled,
+)
 
 
 class StartCaptureTool(BaseTool):
@@ -34,6 +37,10 @@ class StartCaptureTool(BaseTool):
         from ..config import CAPTURE_POLL_TIMEOUT_S, CAPTURE_POLL_INTERVAL_S
         main = _import_main()
         device_id = params.get("device_id", "").strip()
+        agent_request_id = params.get("_agent_request_id", "")
+        cancel_event = params.get("_cancel_event")
+        if cancellation_requested(params):
+            return cancelled_result(agent_request_id)
         sample_count = int(params.get("sample_count", 100))
         sample_rate_hz = int(params.get("sample_rate_hz", 100))
         payload = {"device_id": device_id, "kind": "capture",
@@ -93,7 +100,15 @@ class StartCaptureTool(BaseTool):
         poll_start = time.time()
         last_status = task.get("status", "submitted")
         while (time.time() - poll_start) < CAPTURE_POLL_TIMEOUT_S:
-            time.sleep(CAPTURE_POLL_INTERVAL_S)
+            if cancel_event is not None:
+                if cancel_event.wait(CAPTURE_POLL_INTERVAL_S):
+                    mark_device_task_cancelled(main, request_id)
+                    return cancelled_result(agent_request_id)
+            else:
+                time.sleep(CAPTURE_POLL_INTERVAL_S)
+            if cancellation_requested(params):
+                mark_device_task_cancelled(main, request_id)
+                return cancelled_result(agent_request_id)
             conn = main._connect()
             try:
                 main._expire_stale_tasks(conn)

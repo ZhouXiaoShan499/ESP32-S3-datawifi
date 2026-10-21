@@ -19,6 +19,7 @@ AI Agent（自然语言 → 意图 → 受限工具调用）自测。
 import os
 import subprocess
 import sys
+import threading
 import time
 
 # 中文输出固定 UTF-8：中文 Windows 下控制台/重定向默认 cp936，日志会变乱码
@@ -70,11 +71,13 @@ def ok(msg):
     print("[PASS] %s" % msg)
 
 
-def chat(client, message, device_id=""):
+def chat(client, message, device_id="", request_id=""):
     """POST /agent/chat，要求 200 并返回 JSON（404/500 都在这里炸出来）。"""
     body = {"message": message}
     if device_id:
         body["device_id"] = device_id
+    if request_id:
+        body["request_id"] = request_id
     r = client.post("/api/v1/agent/chat", json=body)
     assert r.status_code == 200, (r.status_code, r.text)
     return r.json()
@@ -115,10 +118,11 @@ def main_run():
     ok("LLM 不可达时回退关键词解析：%d 句话映射到正确意图" % len(expect))
 
     # 3) 正面用例：成功结果必须带 evidence
-    body = chat(client, "查看系统状态")
+    body = chat(client, "查看系统状态", request_id="test-health-0001")
     assert body["status"] == "success" and body["evidence"], body
     assert body["data"]["total_uploads"] == 0, body["data"]
-    ok("成功返回必带 evidence（空库 query_health 也是 success + 证据）")
+    assert body["request_id"] == "test-health-0001", body
+    ok("成功返回必带 evidence，且回显客户端 request_id")
 
     # 4) 空库下的查询类意图：不 500，如实说“没数据”
     for text in ("看看最新的数据", "查看设备列表", "有事件吗"):
@@ -167,6 +171,8 @@ def main_run():
                        json={"message": "   "}).status_code == 400
     assert client.post("/api/v1/agent/chat",
                        json={"message": 123}).status_code == 400
+    assert client.post("/api/v1/agent/chat",
+                       json={"message": "状态", "request_id": "x"}).status_code == 400
     assert client.post("/api/v1/agent/clarify",
                        json={"choice": "x"}).status_code == 400
     assert client.post("/api/v1/agent/clarify",
@@ -175,6 +181,83 @@ def main_run():
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400, r.text
     ok("入参校验：缺/空白 message、缺 session_id|choice、非法 JSON → 400")
+
+    # 7b) request_id 取消链：Event、取消接口和路由入口状态一致；
+    #     已取消的请求不会继续执行工具，也不会产生 evidence。
+    cancel_rid = "test-cancel-0001"
+    cancel_event = agent_api._register_request(cancel_rid)
+    assert cancel_event is not None
+    r = client.post("/api/v1/agent/cancel", json={"request_id": cancel_rid})
+    assert r.status_code == 200 and r.json()["cancelled"] is True, r.text
+    assert cancel_event.is_set()
+    cancelled = get_router().route(
+        {"intent": "query_health", "parameters": {}},
+        cancel_event=cancel_event, agent_request_id=cancel_rid)
+    assert cancelled.status is ToolResultStatus.CANCELLED, cancelled
+    assert cancelled.error == "cancelled" and cancelled.evidence is None, cancelled
+    agent_api._finish_request(cancel_rid)
+    r = client.post("/api/v1/agent/cancel", json={"request_id": cancel_rid})
+    assert r.status_code == 200 and r.json()["cancelled"] is False, r.text
+    assert client.post("/api/v1/agent/cancel",
+                       json={"request_id": "x"}).status_code == 400
+    agent_api._requests.pop(cancel_rid, None)
+
+    # 真实在飞请求：工具创建 task 后阻塞在 Event.wait；/cancel 应立即唤醒并
+    # 把尚未领取的设备任务标成 failed，HTTP 最终返回 cancelled 而不是等 3 s 超时。
+    inflight_rid = "test-inflight-0001"
+    conn = main._connect()
+    before_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    conn.close()
+    inflight = {}
+
+    def _run_inflight():
+        threaded_client = TestClient(main.app)
+        try:
+            inflight["body"] = chat(
+                threaded_client, "帮我采集一次数据", device_id=DEV,
+                request_id=inflight_rid)
+        except Exception as exc:                         # noqa: BLE001
+            inflight["error"] = repr(exc)
+        finally:
+            threaded_client.close()
+
+    worker = threading.Thread(target=_run_inflight, daemon=True)
+    worker.start()
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        conn = main._connect()
+        now_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        conn.close()
+        if now_tasks > before_tasks:
+            break
+        time.sleep(0.04)
+    assert now_tasks > before_tasks, "在飞采集任务没有及时创建"
+    r = client.post("/api/v1/agent/cancel", json={"request_id": inflight_rid})
+    assert r.status_code == 200 and r.json()["cancelled"] is True, r.text
+    worker.join(timeout=2)
+    assert not worker.is_alive(), "取消没有唤醒正在等待设备的 Agent 请求"
+    assert "error" not in inflight, inflight["error"]
+    assert inflight["body"]["status"] == "cancelled", inflight["body"]
+    conn = main._connect()
+    cancelled_task = conn.execute(
+        "SELECT request_id, status, error FROM tasks"
+        " ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    assert cancelled_task["status"] == "failed", dict(cancelled_task)
+    assert cancelled_task["error"] == "cancelled by user", dict(cancelled_task)
+    late_upload = client.post("/api/v1/upload", json={
+        "device_id": DEV, "source": "qma6100p", "unit": "m/s^2",
+        "ts_ms": int(time.time() * 1000),
+        "request_id": cancelled_task["request_id"],
+        "samples": [
+            {"i": i, "t_ms": i * 10, "ax": 0, "ay": 0, "az": 9.81}
+            for i in range(100)],
+    })
+    assert late_upload.status_code == 409, late_upload.text
+    assert late_upload.json()["code"] == "TASK_CANCELLED", late_upload.text
+    agent_api._requests.pop(inflight_rid, None)
+    ok("request_id 取消：Event 唤醒在飞 Agent，任务落库取消，迟到上传被 409 隔离")
 
     # 8) 防幻觉（核心，两条不变量）：
     #    a) 没有真机领任务并回传时，start_capture 只能 no_evidence；

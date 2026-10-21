@@ -152,6 +152,27 @@ const $ = {
   histSampleNextBtn: el('histSampleNextBtn'),
   histSampleInfo: el('histSampleInfo'),
   histSampleBody: el('histSampleBody'),
+  voiceBadge: el('voiceBadge'),
+  voiceStatus: el('voiceStatus'),
+  voiceThread: el('voiceThread'),
+  voiceInput: el('voiceInput'),
+  voiceRecordBtn: el('voiceRecordBtn'),
+  voiceSendBtn: el('voiceSendBtn'),
+  voiceStopBtn: el('voiceStopBtn'),
+  voiceClearBtn: el('voiceClearBtn'),
+  voiceOptions: el('voiceOptions'),
+  voiceStatusLine: el('voiceStatusLine'),
+  voiceStage: el('voiceStage'),
+  voiceRequestId: el('voiceRequestId'),
+  voiceTaskRid: el('voiceTaskRid'),
+  voiceLatency: el('voiceLatency'),
+  voiceRecognizer: el('voiceRecognizer'),
+  voiceSpeechState: el('voiceSpeechState'),
+  voiceAutoSpeak: el('voiceAutoSpeak'),
+  voiceSpeakStopBtn: el('voiceSpeakStopBtn'),
+  voiceSupport: el('voiceSupport'),
+  voiceLogInfo: el('voiceLogInfo'),
+  voiceLogBody: el('voiceLogBody'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '',
@@ -2293,6 +2314,607 @@ $.histBody.addEventListener('click', (ev) => {
 });
 
 /* ------------------------------------------------------------------ *
+ *  语音任务助手
+ *
+ *  文字和录音不是两条业务链路：录音只负责把浏览器识别结果填进输入框，
+ *  最终都走 POST /api/v1/agent/chat。每个请求带独立的 Agent request_id；
+ *  「停止」会 Abort 当前 fetch、停止识别/播报，并请求服务端取消仍在轮询的
+ *  设备任务。generation 单调递增，用来丢弃取消后才返回的迟到响应。
+ * ------------------------------------------------------------------ */
+
+const VOICE_SESSION_KEY = 'imu_voice_agent_session';
+const VOICE_LOG_MAX = 40;
+const SpeechRecognitionCtor = window.SpeechRecognition ||
+                              window.webkitSpeechRecognition || null;
+
+const VOICE = {
+  generation: 0,
+  busy: false,
+  requestId: '',
+  taskRequestId: '',
+  sessionId: '',
+  startedAt: 0,
+  firstFeedbackMs: null,
+  abortController: null,
+  recognition: null,
+  listening: false,
+  recognitionToken: 0,
+  recognitionError: '',
+  captureRequestId: '',
+  transcript: '',
+  interimLogged: false,
+  pendingOptions: [],
+  logs: [],
+};
+
+try {
+  VOICE.sessionId = window.sessionStorage.getItem(VOICE_SESSION_KEY) || '';
+} catch (e) {
+  VOICE.sessionId = '';
+}
+
+function voiceNewRequestId(prefix) {
+  let token = '';
+  try {
+    token = window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID()
+      : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+  } catch (e) {
+    token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  }
+  token = String(token).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 52);
+  return (prefix || 'voice') + '-' + token;
+}
+
+function voiceClock(epochMs) {
+  const d = new Date(epochMs || Date.now());
+  const p = (n, width) => String(n).padStart(width || 2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
+         '.' + p(d.getMilliseconds(), 3);
+}
+
+function voiceElapsedMs() {
+  return VOICE.startedAt ? Math.max(0, performance.now() - VOICE.startedAt) : null;
+}
+
+function voiceRefreshButtons() {
+  const synthBusy = !!(window.speechSynthesis && window.speechSynthesis.speaking);
+  if ($.voiceRecordBtn) {
+    $.voiceRecordBtn.disabled = VOICE.busy;
+    $.voiceRecordBtn.classList.toggle('recording', VOICE.listening);
+    $.voiceRecordBtn.setAttribute('aria-pressed', VOICE.listening ? 'true' : 'false');
+    $.voiceRecordBtn.textContent = VOICE.listening ? '■ 停止录音' : '🎙 开始录音';
+  }
+  if ($.voiceSendBtn) {
+    $.voiceSendBtn.disabled = VOICE.busy || !$.voiceInput ||
+                              !$.voiceInput.value.trim();
+  }
+  if ($.voiceStopBtn) {
+    $.voiceStopBtn.disabled = !VOICE.busy && !VOICE.listening && !synthBusy;
+  }
+  if ($.voiceSpeakStopBtn) {
+    $.voiceSpeakStopBtn.disabled = !synthBusy;
+  }
+}
+
+function voiceSetStage(label, cls, statusText) {
+  if ($.voiceBadge) {
+    $.voiceBadge.className = 'badge ' + (cls || 'off');
+    $.voiceBadge.textContent = label || '空闲';
+  }
+  if ($.voiceStage) $.voiceStage.textContent = label || '空闲';
+  if ($.voiceStatus && statusText !== undefined) $.voiceStatus.textContent = statusText;
+  if ($.voiceStatusLine && statusText !== undefined) {
+    $.voiceStatusLine.textContent = statusText || '';
+  }
+  voiceRefreshButtons();
+}
+
+function voiceSetLatency() {
+  if (!$.voiceLatency) return;
+  const parts = [];
+  if (VOICE.firstFeedbackMs !== null) {
+    parts.push('首反馈 ' + Math.round(VOICE.firstFeedbackMs) + ' ms');
+  }
+  if (VOICE.startedAt) {
+    parts.push('累计 ' + Math.round(voiceElapsedMs()) + ' ms');
+  }
+  $.voiceLatency.textContent = parts.length ? parts.join(' · ') : '—';
+}
+
+function voiceAddBubble(role, text) {
+  if (!$.voiceThread || !text) return;
+  const bubble = document.createElement('div');
+  bubble.className = 'voice-bubble ' + role;
+  bubble.textContent = text;
+  $.voiceThread.appendChild(bubble);
+  $.voiceThread.scrollTop = $.voiceThread.scrollHeight;
+}
+
+function voiceSetOptions(options) {
+  VOICE.pendingOptions = Array.isArray(options) ? options.slice() : [];
+  if (!$.voiceOptions) return;
+  $.voiceOptions.innerHTML = '';
+  VOICE.pendingOptions.forEach((choice) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = choice;
+    btn.addEventListener('click', () => voiceSubmit(choice, {
+      clarify: true,
+      inputSource: '澄清选项',
+    }));
+    $.voiceOptions.appendChild(btn);
+  });
+}
+
+function voiceRenderLog() {
+  if (!$.voiceLogBody) return;
+  if (!VOICE.logs.length) {
+    $.voiceLogBody.innerHTML = '<tr><td colspan="5">—（尚未发起语音或文字任务）</td></tr>';
+  } else {
+    $.voiceLogBody.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (const item of VOICE.logs) {
+      const tr = document.createElement('tr');
+      const values = [
+        voiceClock(item.at),
+        shortRid(item.requestId || '—'),
+        item.phase,
+        item.detail || '—',
+        item.elapsedMs === null || item.elapsedMs === undefined
+          ? '—' : Math.round(item.elapsedMs) + ' ms',
+      ];
+      values.forEach((value, idx) => {
+        const td = document.createElement('td');
+        td.textContent = value;
+        if (idx === 1 && item.requestId) td.title = item.requestId;
+        tr.appendChild(td);
+      });
+      frag.appendChild(tr);
+    }
+    $.voiceLogBody.appendChild(frag);
+  }
+  if ($.voiceLogInfo) {
+    $.voiceLogInfo.textContent = '· 已记录 ' + VOICE.logs.length + ' 条';
+  }
+}
+
+function voiceLog(phase, detail, requestId) {
+  VOICE.logs.unshift({
+    at: Date.now(),
+    requestId: requestId || VOICE.requestId || '',
+    phase: phase,
+    detail: detail || '',
+    elapsedMs: voiceElapsedMs(),
+  });
+  if (VOICE.logs.length > VOICE_LOG_MAX) VOICE.logs.length = VOICE_LOG_MAX;
+  voiceRenderLog();
+}
+
+function voicePersistSession() {
+  try {
+    if (VOICE.sessionId) {
+      window.sessionStorage.setItem(VOICE_SESSION_KEY, VOICE.sessionId);
+    } else {
+      window.sessionStorage.removeItem(VOICE_SESSION_KEY);
+    }
+  } catch (e) {
+    /* 隐私模式忽略 */
+  }
+}
+
+function voiceStopSpeech(silent) {
+  const hadSpeech = !!(window.speechSynthesis &&
+                       (window.speechSynthesis.speaking ||
+                        window.speechSynthesis.pending));
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  if ($.voiceSpeechState) $.voiceSpeechState.textContent = '已停止';
+  if (hadSpeech && !silent) {
+    voiceLog('播报停止', '用户停止浏览器语音合成');
+  }
+  voiceRefreshButtons();
+}
+
+function voiceSpeak(text) {
+  if (!text || !window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+    if ($.voiceSpeechState) $.voiceSpeechState.textContent = '当前浏览器不支持播报';
+    return;
+  }
+  voiceStopSpeech(true);
+  const speechText = String(text).replace(/[`*#]/g, '').trim();
+  if (!speechText) return;
+  const utter = new SpeechSynthesisUtterance(speechText);
+  utter.lang = 'zh-CN';
+  utter.rate = 1.02;
+  utter.onstart = () => {
+    if ($.voiceSpeechState) $.voiceSpeechState.textContent = '播报中';
+    voiceLog('播报开始', '浏览器语音合成');
+    voiceRefreshButtons();
+  };
+  utter.onend = () => {
+    if ($.voiceSpeechState) $.voiceSpeechState.textContent = '已完成';
+    voiceLog('播报完成', '浏览器语音合成');
+    voiceRefreshButtons();
+  };
+  utter.onerror = (ev) => {
+    if ($.voiceSpeechState) $.voiceSpeechState.textContent = '播报失败';
+    voiceLog('播报异常', ev.error || 'unknown');
+    voiceRefreshButtons();
+  };
+  if ($.voiceSpeechState) $.voiceSpeechState.textContent = '准备播报';
+  window.speechSynthesis.speak(utter);
+  voiceRefreshButtons();
+}
+
+function voiceStopRecognition(abort) {
+  const rec = VOICE.recognition;
+  VOICE.listening = false;
+  // graceful stop 仍允许浏览器补发最后一帧 final result 和 onend；
+  // abort 才递增 token，让已经切走/清空的回调彻底失效。
+  if (abort) VOICE.recognitionToken++;
+  if (rec) {
+    try {
+      if (abort) rec.abort(); else rec.stop();
+    } catch (e) {
+      /* 已经结束 */
+    }
+  }
+  voiceRefreshButtons();
+}
+
+function voiceStartRecognition() {
+  if (VOICE.busy) return;
+  if (!SpeechRecognitionCtor) {
+    voiceSetStage('不支持识别', 'warn',
+                  '当前浏览器不支持语音识别，请继续使用文字输入。');
+    voiceLog('识别不可用', '缺少 SpeechRecognition 或 webkitSpeechRecognition');
+    return;
+  }
+  if (VOICE.listening) {
+    voiceStopRecognition(false);
+    return;
+  }
+
+  VOICE.captureRequestId = VOICE.captureRequestId || voiceNewRequestId('speech');
+  VOICE.requestId = VOICE.captureRequestId;
+  if ($.voiceRequestId) {
+    $.voiceRequestId.textContent = shortRid(VOICE.requestId);
+    $.voiceRequestId.title = VOICE.requestId;
+  }
+  VOICE.transcript = '';
+  VOICE.interimLogged = false;
+  VOICE.recognitionError = '';
+  VOICE.recognitionToken++;
+  const token = VOICE.recognitionToken;
+  const rec = new SpeechRecognitionCtor();
+  VOICE.recognition = rec;
+  rec.lang = 'zh-CN';
+  rec.interimResults = true;
+  rec.continuous = false;
+  rec.maxAlternatives = 1;
+
+  rec.onstart = () => {
+    if (token !== VOICE.recognitionToken) return;
+    VOICE.listening = true;
+    voiceSetStage('录音 / 识别中', 'warn',
+                  '正在使用浏览器麦克风录音并识别，再点一次按钮可停止。');
+    voiceLog('录音开始', '音频源=浏览器麦克风；识别=Web Speech API',
+             VOICE.captureRequestId);
+    voiceRefreshButtons();
+  };
+
+  rec.onresult = (event) => {
+    if (token !== VOICE.recognitionToken) return;
+    let finalText = '';
+    let interimText = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const part = event.results[i];
+      if (part.isFinal) finalText += part[0].transcript;
+      else interimText += part[0].transcript;
+    }
+    if (finalText) {
+      VOICE.transcript += finalText;
+      voiceLog('识别结果', finalText.trim(), VOICE.captureRequestId);
+    } else if (interimText && !VOICE.interimLogged) {
+      VOICE.interimLogged = true;
+      voiceLog('识别中间结果', interimText.trim(), VOICE.captureRequestId);
+    }
+    if ($.voiceInput) {
+      $.voiceInput.value = (VOICE.transcript + interimText).trim();
+    }
+    voiceSetStage('识别中', 'warn',
+                  interimText ? '识别中：' + interimText.trim()
+                              : '已识别，等待录音结束。');
+    voiceRefreshButtons();
+  };
+
+  rec.onerror = (event) => {
+    if (token !== VOICE.recognitionToken) return;
+    VOICE.listening = false;
+    VOICE.recognitionError = event.error || 'unknown';
+    const message = event.error === 'not-allowed'
+      ? '麦克风权限被拒绝，请在浏览器地址栏允许麦克风后重试。'
+      : '语音识别失败（' + (event.error || 'unknown') + '），可改用文字输入。';
+    voiceSetStage('识别异常', 'err', message);
+    voiceLog('识别异常', event.error || 'unknown', VOICE.captureRequestId);
+    voiceRefreshButtons();
+  };
+
+  rec.onend = () => {
+    if (token !== VOICE.recognitionToken) return;
+    VOICE.listening = false;
+    VOICE.recognition = null;
+    if (VOICE.recognitionError) {
+      voiceRefreshButtons();
+      return;
+    }
+    const text = ($.voiceInput && $.voiceInput.value || VOICE.transcript).trim();
+    if (text) {
+      voiceSetStage('识别完成', 'ok',
+                    '识别文字已填入输入框；确认无误后点击“发送任务”。');
+      voiceLog('录音结束', '识别文字已进入输入框', VOICE.captureRequestId);
+    } else {
+      voiceSetStage('空闲', 'off',
+                    '没有识别到文字，请重试录音或直接输入文字。');
+      voiceLog('录音结束', '未得到识别文字', VOICE.captureRequestId);
+    }
+    voiceRefreshButtons();
+  };
+
+  try {
+    rec.start();
+  } catch (e) {
+    VOICE.listening = false;
+    voiceSetStage('识别异常', 'err', '无法启动麦克风：' + e.message);
+    voiceLog('识别异常', e.message, VOICE.captureRequestId);
+    voiceRefreshButtons();
+  }
+}
+
+async function voiceCancelOnServer(requestId) {
+  if (!requestId) return;
+  try {
+    await fetch('/api/v1/agent/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId }),
+      cache: 'no-store',
+    });
+  } catch (e) {
+    /* 用户已经回到空闲；网络失败不阻塞下一次输入 */
+  }
+}
+
+function voiceStopCurrent(reason) {
+  const requestId = VOICE.requestId;
+  const taskActive = VOICE.busy || VOICE.listening;
+  const speechActive = !!(window.speechSynthesis &&
+                          window.speechSynthesis.speaking);
+  VOICE.generation++;
+  VOICE.busy = false;
+  voiceStopRecognition(true);
+  voiceStopSpeech(true);
+  if (VOICE.abortController) {
+    try { VOICE.abortController.abort(); } catch (e) { /* 忽略 */ }
+    VOICE.abortController = null;
+  }
+  voiceSetOptions([]);
+  if (taskActive) {
+    voiceLog('任务取消', reason || '用户停止当前任务', requestId);
+    voiceAddBubble('system', '已停止当前任务与播报，迟到的结果会被忽略。可以重新输入。');
+  } else if (speechActive) {
+    voiceLog('播报停止', reason || '用户停止播报', requestId);
+    voiceAddBubble('system', '已停止播报。');
+  }
+  VOICE.firstFeedbackMs = null;
+  VOICE.startedAt = 0;
+  voiceSetLatency();
+  voiceSetStage('空闲', 'off', '已回到空闲，可重新输入或录音。');
+  voiceRefreshButtons();
+  if (taskActive && requestId) void voiceCancelOnServer(requestId);
+}
+
+function voiceClearAssistant() {
+  voiceStopCurrent('清空并重新输入');
+  VOICE.generation++;
+  VOICE.requestId = '';
+  VOICE.taskRequestId = '';
+  VOICE.sessionId = '';
+  VOICE.captureRequestId = '';
+  VOICE.transcript = '';
+  VOICE.logs = [];
+  VOICE.pendingOptions = [];
+  voicePersistSession();
+  if ($.voiceInput) $.voiceInput.value = '';
+  if ($.voiceThread) {
+    $.voiceThread.innerHTML = '';
+    voiceAddBubble('system',
+      '会话已清空。可以输入文字，或点击“开始录音”发起一次新任务。');
+  }
+  if ($.voiceRequestId) $.voiceRequestId.textContent = '—';
+  if ($.voiceTaskRid) $.voiceTaskRid.textContent = '—';
+  if ($.voiceLatency) $.voiceLatency.textContent = '—';
+  if ($.voiceSpeechState) $.voiceSpeechState.textContent = '空闲';
+  voiceSetOptions([]);
+  voiceRenderLog();
+  voiceSetStage('空闲', 'off', '会话已清空，等待新的文字或语音输入。');
+  voiceRefreshButtons();
+}
+
+async function voiceSubmit(text, options) {
+  options = options || {};
+  const message = String(text || '').trim();
+  if (!message) {
+    voiceSetStage('等待输入', 'warn', '请输入任务文字，或先点击“开始录音”。');
+    if ($.voiceInput) $.voiceInput.focus();
+    return;
+  }
+  if (VOICE.busy) {
+    voiceSetStage('任务进行中', 'warn',
+                  '当前任务仍在执行。先点“停止当前任务”，再输入下一条。');
+    return;
+  }
+  if (options.clarify && !VOICE.sessionId) {
+    voiceSetStage('澄清上下文失效', 'err', '没有待澄清会话，请重新输入任务。');
+    return;
+  }
+
+  voiceStopSpeech(true);
+  if (VOICE.listening) voiceStopRecognition(false);
+  const requestId = VOICE.captureRequestId || voiceNewRequestId('voice');
+  VOICE.captureRequestId = '';
+  VOICE.requestId = requestId;
+  VOICE.taskRequestId = '';
+  VOICE.generation++;
+  const generation = VOICE.generation;
+  const controller = new AbortController();
+  VOICE.abortController = controller;
+  VOICE.busy = true;
+  VOICE.startedAt = performance.now();
+  VOICE.firstFeedbackMs = null;
+  VOICE.abortController = controller;
+  voiceSetOptions([]);
+  if ($.voiceRequestId) {
+    $.voiceRequestId.textContent = shortRid(requestId);
+    $.voiceRequestId.title = requestId;
+  }
+  if ($.voiceTaskRid) $.voiceTaskRid.textContent = '—';
+  voiceAddBubble('user', message);
+  voiceLog('输入完成', (options.inputSource || '文字输入') +
+           ' · ' + message, requestId);
+  voiceSetStage('任务执行中', 'warn',
+                '已收到输入，正在解析意图并等待任务结果…');
+  VOICE.firstFeedbackMs = voiceElapsedMs();
+  voiceLog('首次反馈', '界面进入“任务执行中”', requestId);
+  voiceSetLatency();
+  voiceRefreshButtons();
+
+  const endpoint = options.clarify ? '/api/v1/agent/clarify' : '/api/v1/agent/chat';
+  const body = options.clarify
+    ? { session_id: VOICE.sessionId, choice: message, request_id: requestId }
+    : { message: message, session_id: VOICE.sessionId,
+        device_id: state.current || '', request_id: requestId };
+
+  try {
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      throw new Error('无法连接 Agent 服务：' + e.message);
+    }
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (generation !== VOICE.generation) return;
+    if (!res.ok) {
+      throw new Error((data && data.error) || ('接口返回 ' + res.status));
+    }
+    if (!data) throw new Error('Agent 响应不是合法 JSON');
+
+    if (data.session_id) {
+      VOICE.sessionId = data.session_id;
+      voicePersistSession();
+    }
+    if (data.request_id && data.request_id !== requestId) {
+      voiceLog('请求号异常', '响应 request_id=' + data.request_id, requestId);
+    }
+
+    const status = data.status || 'failure';
+    const reply = data.message || 'Agent 未返回消息。';
+    const task = data.data && data.data.task ? data.data.task : null;
+    const taskRequestId = (task && task.request_id) ||
+                          (data.data && data.data.task_request_id) || '';
+    if (taskRequestId) {
+      VOICE.taskRequestId = taskRequestId;
+      if ($.voiceTaskRid) {
+        $.voiceTaskRid.textContent = shortRid(taskRequestId);
+        $.voiceTaskRid.title = taskRequestId;
+      }
+    }
+
+    if (data.type === 'clarification' || status === 'ambiguous') {
+      voiceSetStage('需要澄清', 'warn', '请选择一项，或重新输入更明确的任务。');
+      voiceSetOptions(data.options || []);
+    } else if (status === 'cancelled') {
+      voiceSetStage('已取消', 'off', reply);
+    } else if (status === 'success') {
+      voiceSetStage('已完成', 'ok', reply);
+    } else if (status === 'no_evidence') {
+      voiceSetStage('等待设备证据', 'warn', reply);
+    } else if (status === 'not_found') {
+      voiceSetStage('未找到数据', 'warn', reply);
+    } else {
+      voiceSetStage('执行失败', 'err', reply);
+    }
+    voiceAddBubble('assistant', reply);
+    voiceLog('任务响应', status + (data.elapsed_ms !== undefined
+      ? ' · 服务端 ' + data.elapsed_ms + ' ms' : ''), requestId);
+    voiceSetLatency();
+    if ($.voiceAutoSpeak && $.voiceAutoSpeak.checked) voiceSpeak(reply);
+  } catch (e) {
+    if (generation !== VOICE.generation || e.name === 'AbortError') return;
+    const reply = '请求失败：' + e.message;
+    voiceSetStage('执行失败', 'err', reply);
+    voiceAddBubble('assistant', reply);
+    voiceLog('请求异常', e.message, requestId);
+  } finally {
+    if (generation === VOICE.generation) {
+      VOICE.busy = false;
+      VOICE.abortController = null;
+      voiceSetLatency();
+      voiceRefreshButtons();
+    }
+  }
+}
+
+function initVoiceAssistant() {
+  if (!$.voiceInput) return;
+  const ttsSupported = !!(window.speechSynthesis &&
+                          window.SpeechSynthesisUtterance);
+  if ($.voiceRecognizer) {
+    $.voiceRecognizer.textContent = SpeechRecognitionCtor
+      ? 'Web Speech（浏览器）' : '不支持，使用文字';
+  }
+  if ($.voiceSupport) {
+    $.voiceSupport.textContent =
+      '语音识别：' + (SpeechRecognitionCtor ? '可用（zh-CN）' : '当前浏览器不支持') +
+      '；语音播报：' + (ttsSupported ? '可用' : '当前浏览器不支持') +
+      '。首次录音时浏览器会请求麦克风权限。';
+  }
+  if (!ttsSupported && $.voiceAutoSpeak) $.voiceAutoSpeak.checked = false;
+
+  $.voiceRecordBtn.addEventListener('click', voiceStartRecognition);
+  $.voiceSendBtn.addEventListener('click', () => {
+    voiceSubmit($.voiceInput.value, { inputSource: '文字输入' });
+  });
+  $.voiceStopBtn.addEventListener('click', () => voiceStopCurrent('用户停止'));
+  $.voiceClearBtn.addEventListener('click', voiceClearAssistant);
+  $.voiceSpeakStopBtn.addEventListener('click', () => voiceStopSpeech(false));
+  $.voiceInput.addEventListener('input', voiceRefreshButtons);
+  $.voiceInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      voiceSubmit($.voiceInput.value, { inputSource: '文字输入' });
+    }
+  });
+  window.addEventListener('beforeunload', () => {
+    if (VOICE.requestId) void voiceCancelOnServer(VOICE.requestId);
+    voiceStopRecognition(true);
+    voiceStopSpeech(true);
+  });
+  voiceRenderLog();
+  voiceSetStage('空闲', 'off', '可以输入文字，或点击“开始录音”');
+}
+
+initVoiceAssistant();
+
+/* ------------------------------------------------------------------ *
  *  功能分区（同一页面内切换，避免 9 张卡片竖着堆成一长条）
  *
  *  6 个分区按钮 ↔ 6 个 .tab-panel：按钮 data-tab="x" 对应面板 id="panel-x"。
@@ -2306,7 +2928,7 @@ $.histBody.addEventListener('click', (ev) => {
  *      同步代码只碰 DOM；所有刷新调用都发生在初始化之后或事件回调里。
  * ------------------------------------------------------------------ */
 
-const TABS = ['data', 'history', 'task', 'control', 'camera', 'event'];
+const TABS = ['data', 'history', 'voice', 'task', 'control', 'camera', 'event'];
 const TAB_KEY = 'imu_web_tab';    // localStorage：记住上次停留的分区，下次打开还停在那页
 let activeTab = 'data';
 
@@ -2340,6 +2962,8 @@ function refreshTab(id) {
     drawScene3D(state.lastPoints || []);
   } else if (id === 'history') {
     refreshHistory();          // 采集历史列表（新批次 / 换设备 / 换过滤条件）
+  } else if (id === 'voice') {
+    voiceRefreshButtons();     // 输入框、录音、停止按钮按当前状态重新启用
   } else if (id === 'task') {
     refreshLatestTask();       // 任务卡片 + 任务历史表（同一次 /api/v1/tasks 请求）
   } else if (id === 'control') {

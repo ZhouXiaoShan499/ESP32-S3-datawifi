@@ -15,12 +15,14 @@ class ToolResultStatus(Enum):
     AMBIGUOUS    = 歧义（需要追问用户再做决定）
     NO_EVIDENCE  = 没有设备返回的真实完成证据（防幻觉）
     NOT_FOUND    = 资源不存在（查询无数据等）
+    CANCELLED    = 用户已取消（保留设备任务号便于追溯）
     """
     SUCCESS = "success"
     FAILURE = "failure"
     AMBIGUOUS = "ambiguous"
     NO_EVIDENCE = "no_evidence"
     NOT_FOUND = "not_found"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -143,3 +145,43 @@ def format_time_ago(ts):
         return f"{int(delta // 3600)} 小时前"
     else:
         return f"{int(delta // 86400)} 天前"
+
+
+def cancellation_requested(params: Dict[str, Any]) -> bool:
+    event = params.get("_cancel_event")
+    return bool(event and event.is_set())
+
+
+def cancelled_result(agent_request_id: str = "") -> ToolResult:
+    """统一的取消结果：不携带 evidence，避免被当成设备执行成功。"""
+    return ToolResult(
+        status=ToolResultStatus.CANCELLED,
+        error="cancelled",
+        data={"cancelled": True,
+              "agent_request_id": agent_request_id or None},
+        message="任务已取消，未继续等待设备回执。",
+    )
+
+
+def mark_device_task_cancelled(main, task_request_id: str):
+    """把尚未结束的设备任务标记为失败，阻止队列继续领取。"""
+    if not task_request_id:
+        return
+    import time
+    conn = main._connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='failed', completed_at=?,"
+            " error='cancelled by user'"
+            " WHERE request_id=? AND status NOT IN"
+            " ('completed','failed','timeout')",
+            (time.time(), task_request_id),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Agent API —— 暴露 /agent/chat 和 /agent/clarify 端点。"""
-import json, logging, uuid, threading, time
+"""Agent API —— 暴露 /agent/chat、/agent/clarify 和 /agent/cancel 端点。"""
+import json, logging, re, uuid, threading, time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
@@ -13,17 +13,68 @@ router = APIRouter(prefix="/api/v1/agent", tags=["AI Agent"])
 
 # 简单会话存储（内存 dict，进程重启丢失；生产可换 Redis）
 _sessions: Dict[str, Dict[str, Any]] = {}
+# 请求级取消状态：request_id -> {event, created_at, done, cancelled}。
+# 取消失败/晚到的 HTTP 响应由前端再按 request_id 隔离；这里的 Event 让仍在轮询
+# 设备的工具尽快退出，避免用户点了「停止」后线程继续等 30-60 秒。
+_requests: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
 SESSION_TTL_S = 900  # 15 分钟
+REQUEST_TTL_S = 900
+AGENT_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
 
 
 def _clean_expired():
     """惰性清理过期会话。"""
     now = time.time()
-    expired = [k for k, v in _sessions.items()
-               if now - v.get("_ts", now) > SESSION_TTL_S]
-    for k in expired:
-        _sessions.pop(k, None)
+    with _lock:
+        expired = [k for k, v in _sessions.items()
+                   if now - v.get("_ts", now) > SESSION_TTL_S]
+        for k in expired:
+            _sessions.pop(k, None)
+        stale = [k for k, v in _requests.items()
+                 if now - v.get("created_at", now) > REQUEST_TTL_S]
+        for k in stale:
+            _requests.pop(k, None)
+
+
+def _register_request(request_id: str) -> Optional[threading.Event]:
+    """登记一个正在执行的 Agent 请求；同一 request_id 不允许并发重入。"""
+    with _lock:
+        current = _requests.get(request_id)
+        if current and not current.get("done"):
+            return None
+        event = threading.Event()
+        _requests[request_id] = {
+            "event": event,
+            "created_at": time.time(),
+            "done": False,
+            "cancelled": False,
+        }
+        return event
+
+
+def _finish_request(request_id: str):
+    with _lock:
+        rec = _requests.get(request_id)
+        if rec:
+            rec["done"] = True
+
+
+def _cancel_request(request_id: str) -> bool:
+    """把正在执行的请求标记为取消；已完成/未知请求返回 False。"""
+    with _lock:
+        rec = _requests.get(request_id)
+        if not rec or rec.get("done"):
+            return False
+        rec["cancelled"] = True
+        rec["event"].set()
+        return True
+
+
+def _is_cancelled(request_id: str) -> bool:
+    with _lock:
+        rec = _requests.get(request_id)
+        return bool(rec and rec["event"].is_set())
 
 
 # ---------------------------------------------------------------------------
@@ -31,16 +82,18 @@ def _clean_expired():
 # ---------------------------------------------------------------------------
 class AgentRequest:
     def __init__(self, message: str, session_id: str = "",
-                 device_id: str = ""):
+                 device_id: str = "", request_id: str = ""):
         self.message = message.strip()
         self.session_id = session_id.strip() or uuid.uuid4().hex[:12]
         self.device_id = device_id.strip() or ""
+        self.request_id = request_id.strip() or ("agent-" + uuid.uuid4().hex)
 
 
 class ClarifyRequest:
-    def __init__(self, session_id: str, choice: str):
+    def __init__(self, session_id: str, choice: str, request_id: str = ""):
         self.session_id = session_id.strip()
         self.choice = choice.strip()
+        self.request_id = request_id.strip() or ("agent-" + uuid.uuid4().hex)
 
 
 def _parse_agent_request(body: dict) -> Optional[AgentRequest]:
@@ -51,7 +104,8 @@ def _parse_agent_request(body: dict) -> Optional[AgentRequest]:
     return AgentRequest(
         message=msg,
         session_id=body.get("session_id", ""),
-        device_id=body.get("device_id", ""))
+        device_id=body.get("device_id", ""),
+        request_id=body.get("request_id", ""))
 
 
 def _parse_clarify_request(body: dict) -> Optional[ClarifyRequest]:
@@ -59,7 +113,26 @@ def _parse_clarify_request(body: dict) -> Optional[ClarifyRequest]:
     c = body.get("choice", "")
     if not sid or not c:
         return None
-    return ClarifyRequest(session_id=sid, choice=c)
+    return ClarifyRequest(session_id=sid, choice=c,
+                          request_id=body.get("request_id", ""))
+
+
+def _valid_request_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(AGENT_REQUEST_ID_RE.match(value.strip()))
+
+
+def _cancelled_response(session_id: str, request_id: str, started_at: float):
+    return JSONResponse({
+        "session_id": session_id,
+        "request_id": request_id,
+        "type": "result",
+        "message": "任务已取消，已停止等待设备回执。迟到的结果不会再覆盖当前界面。",
+        "status": "cancelled",
+        "data": {"cancelled": True},
+        "options": None,
+        "evidence": None,
+        "elapsed_ms": round((time.time() - started_at) * 1000),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +141,16 @@ def _parse_clarify_request(body: dict) -> Optional[ClarifyRequest]:
 @router.post("/chat")
 async def agent_chat(request: Request):
     """接收用户消息，返回结果或追问。"""
+    started_at = time.time()
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+    raw_request_id = body.get("request_id", "")
+    if raw_request_id and not _valid_request_id(raw_request_id):
+        return JSONResponse(
+            {"error": "invalid request_id (expect 6-80 chars of [A-Za-z0-9_-])"},
+            status_code=400)
     req = _parse_agent_request(body)
     if req is None:
         return JSONResponse({"error": "缺少 message 参数"}, status_code=400)
@@ -84,8 +163,14 @@ async def agent_chat(request: Request):
     from .nlu import get_nlu_parser
     from .router import get_router
 
-    # 读取/创建会话上下文
     _clean_expired()
+    cancel_event = _register_request(req.request_id)
+    if cancel_event is None:
+        return JSONResponse(
+            {"error": "request_id is already running", "request_id": req.request_id},
+            status_code=409)
+
+    # 读取/创建会话上下文
     with _lock:
         sess = _sessions.get(req.session_id, {"_ts": time.time()})
         sess["_ts"] = time.time()
@@ -102,12 +187,30 @@ async def agent_chat(request: Request):
     # 「采集timeout: expired before device upload」（实测：agent 请求 60.2s 期间
     # health 连续 12 次 3s 超时，agent 一返回 0.19s 内立刻恢复 200）。
     # run_in_threadpool 把这两个阻塞调用挪出事件循环，其它请求照常被服务。
-    nlu = get_nlu_parser()
-    parsed = await run_in_threadpool(nlu.parse, req.message, sess)
+    try:
+        nlu = get_nlu_parser()
+        parsed = await run_in_threadpool(nlu.parse, req.message, sess)
+        if cancel_event.is_set():
+            _finish_request(req.request_id)
+            return _cancelled_response(req.session_id, req.request_id, started_at)
 
-    # 路由执行
-    router_ = get_router()
-    result = await run_in_threadpool(router_.route, parsed, sess)
+        # 路由执行
+        router_ = get_router()
+        result = await run_in_threadpool(
+            router_.route, parsed, sess,
+            cancel_event=cancel_event, agent_request_id=req.request_id)
+    except Exception:
+        _finish_request(req.request_id)
+        raise
+
+    # 工具可能在取消动作与设备回执之间完成；此时仍按取消返回，避免迟到结果
+    # 覆盖用户已经切走/重新输入的界面。
+    if cancel_event.is_set():
+        with _lock:
+            sess.pop("_pending", None)
+            _sessions[req.session_id] = sess
+        _finish_request(req.request_id)
+        return _cancelled_response(req.session_id, req.request_id, started_at)
 
     # 歧义时暂存意图，以便 clarify 继续
     if result.status.value == "ambiguous":
@@ -122,8 +225,10 @@ async def agent_chat(request: Request):
             sess.pop("_pending", None)
             _sessions[req.session_id] = sess
 
+    _finish_request(req.request_id)
     return JSONResponse({
         "session_id": req.session_id,
+        "request_id": req.request_id,
         "type": ("clarification"
                  if result.status.value == "ambiguous" else "result"),
         "message": result.message,
@@ -132,30 +237,51 @@ async def agent_chat(request: Request):
         "options": (result.ambiguous_options
                     if result.status.value == "ambiguous" else None),
         "evidence": result.evidence,
+        "elapsed_ms": round((time.time() - started_at) * 1000),
     })
 
 
 @router.post("/clarify")
 async def agent_clarify(request: Request):
     """用户选择澄清选项后继续执行。"""
+    started_at = time.time()
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+    raw_request_id = body.get("request_id", "")
+    if raw_request_id and not _valid_request_id(raw_request_id):
+        return JSONResponse(
+            {"error": "invalid request_id (expect 6-80 chars of [A-Za-z0-9_-])"},
+            status_code=400)
     req = _parse_clarify_request(body)
     if req is None:
         return JSONResponse({"error": "缺少 session_id/choice"}, status_code=400)
 
     from .router import get_router
 
+    _clean_expired()
+    cancel_event = _register_request(req.request_id)
+    if cancel_event is None:
+        return JSONResponse(
+            {"error": "request_id is already running", "request_id": req.request_id},
+            status_code=409)
+
+    no_pending = False
     with _lock:
         sess = _sessions.get(req.session_id)
         if not sess or "_pending" not in sess:
-            return JSONResponse(
-                {"type": "result", "message": "没有待澄清的上下文，请重新输入。",
-                 "session_id": req.session_id, "status": "failure"}, status_code=200)
-        pending = sess.pop("_pending")
-        _sessions[req.session_id] = sess
+            no_pending = True
+            pending = None
+        else:
+            pending = sess.pop("_pending")
+            _sessions[req.session_id] = sess
+    if no_pending:
+        _finish_request(req.request_id)
+        return JSONResponse(
+            {"type": "result", "message": "没有待澄清的上下文，请重新输入。",
+             "session_id": req.session_id, "request_id": req.request_id,
+             "status": "failure"}, status_code=200)
 
     # 用用户选择**重新解析**意图 —— 历史实现直接复用 pending["intent"]，
     # 于是不管在追问里选哪一项，跑的都是第一句「听不懂」的兜底意图（选择被静默丢弃）。
@@ -164,24 +290,67 @@ async def agent_clarify(request: Request):
     # 保证「选择即执行」，不把用户卡在追问里。
     from .nlu import get_nlu_parser
 
-    chosen = await run_in_threadpool(get_nlu_parser().parse, req.choice, sess)
-    params = dict(pending.get("parameters") or {})
-    params.update(chosen.get("parameters") or {})
-    new_parsed = {
-        "intent": chosen.get("intent") or pending["intent"],
-        "parameters": params,
-        "confidence": 0.9,
-        "ambiguous": False}
-    # 与 /chat 同理：route() 里是同步阻塞的工具轮询，不能占着事件循环。
-    router_ = get_router()
-    result = await run_in_threadpool(router_.route, new_parsed, sess)
+    try:
+        chosen = await run_in_threadpool(get_nlu_parser().parse, req.choice, sess)
+        if cancel_event.is_set():
+            _finish_request(req.request_id)
+            return _cancelled_response(req.session_id, req.request_id, started_at)
+        params = dict(pending.get("parameters") or {})
+        params.update(chosen.get("parameters") or {})
+        new_parsed = {
+            "intent": chosen.get("intent") or pending["intent"],
+            "parameters": params,
+            "confidence": 0.9,
+            "ambiguous": False}
+        # 与 /chat 同理：route() 里是同步阻塞的工具轮询，不能占着事件循环。
+        router_ = get_router()
+        result = await run_in_threadpool(
+            router_.route, new_parsed, sess,
+            cancel_event=cancel_event, agent_request_id=req.request_id)
+    except Exception:
+        _finish_request(req.request_id)
+        raise
 
+    if cancel_event.is_set():
+        _finish_request(req.request_id)
+        return _cancelled_response(req.session_id, req.request_id, started_at)
+
+    _finish_request(req.request_id)
     return JSONResponse({
         "session_id": req.session_id,
+        "request_id": req.request_id,
         "type": "result",
         "message": result.message,
         "status": result.status.value,
         "data": result.data,
         "options": None,
         "evidence": result.evidence,
+        "elapsed_ms": round((time.time() - started_at) * 1000),
+    })
+
+
+@router.post("/cancel")
+async def agent_cancel(request: Request):
+    """取消正在等待设备回执的 Agent 请求。
+
+    取消只终止本次 Agent 请求的等待链；如果请求在取消前已经完成，接口会如实
+    返回 cancelled=false，由前端继续按 request_id 隔离迟到结果。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    request_id = body.get("request_id", "")
+    if not _valid_request_id(request_id):
+        return JSONResponse(
+            {"error": "invalid request_id (expect 6-80 chars of [A-Za-z0-9_-])"},
+            status_code=400)
+    request_id = request_id.strip()
+    cancelled = _cancel_request(request_id)
+    return JSONResponse({
+        "ok": True,
+        "request_id": request_id,
+        "cancelled": cancelled,
+        "message": ("已取消正在执行的请求" if cancelled
+                    else "请求已完成或不存在，迟到结果会由界面隔离"),
     })

@@ -2,7 +2,10 @@
 """任务管理工具 —— 查询任务、暂停/恢复周期上报。"""
 import time, uuid
 from typing import Dict, Any
-from .base import BaseTool, ToolResult, ToolResultStatus, make_evidence, format_time_ago
+from .base import (
+    BaseTool, ToolResult, ToolResultStatus, make_evidence, format_time_ago,
+    cancellation_requested, cancelled_result, mark_device_task_cancelled,
+)
 
 
 class QueryTasksTool(BaseTool):
@@ -61,7 +64,7 @@ class QueryTasksTool(BaseTool):
                           evidence=evidence, message="\n".join(lines))
 
 
-def _submit_control_task(main, did, kind, duration_s):
+def _submit_control_task(main, did, kind, duration_s, agent_params=None):
     """提交一条控制任务（pause / resume）并等板端确认「已生效」。
 
     控制任务不产生观测数据，收尾靠板端 POST /api/v1/tasks/{id}/applied
@@ -74,6 +77,11 @@ def _submit_control_task(main, did, kind, duration_s):
     禁止的行为（工具不能给自己发证据）。
     """
     from ..config import CONTROL_POLL_TIMEOUT_S, CONTROL_POLL_INTERVAL_S
+    agent_params = agent_params or {}
+    agent_request_id = agent_params.get("_agent_request_id", "")
+    cancel_event = agent_params.get("_cancel_event")
+    if cancellation_requested(agent_params):
+        return cancelled_result(agent_request_id)
     kind_cn = "暂停" if kind == "pause" else "恢复"
     payload = {"device_id": did, "kind": kind}
     if duration_s is not None:
@@ -127,7 +135,15 @@ def _submit_control_task(main, did, kind, duration_s):
     poll_start = time.time()
     last_status = "submitted"
     while (time.time() - poll_start) < CONTROL_POLL_TIMEOUT_S:
-        time.sleep(CONTROL_POLL_INTERVAL_S)
+        if cancel_event is not None:
+            if cancel_event.wait(CONTROL_POLL_INTERVAL_S):
+                mark_device_task_cancelled(main, request_id)
+                return cancelled_result(agent_request_id)
+        else:
+            time.sleep(CONTROL_POLL_INTERVAL_S)
+        if cancellation_requested(agent_params):
+            mark_device_task_cancelled(main, request_id)
+            return cancelled_result(agent_request_id)
         conn = main._connect()
         try:
             main._expire_stale_tasks(conn)
@@ -226,7 +242,7 @@ class PausePeriodicTool(BaseTool):
         main = _import_main()
         did = params.get("device_id", "").strip()
         dur = int(params.get("duration_s", 120))
-        return _submit_control_task(main, did, "pause", dur)
+        return _submit_control_task(main, did, "pause", dur, params)
 
 
 class ResumePeriodicTool(BaseTool):
@@ -244,4 +260,4 @@ class ResumePeriodicTool(BaseTool):
         from .. import _import_main
         main = _import_main()
         did = params.get("device_id", "").strip()
-        return _submit_control_task(main, did, "resume", None)
+        return _submit_control_task(main, did, "resume", None, params)

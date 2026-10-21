@@ -42,7 +42,7 @@ data_capture_sim/
 │   ├── main.py                 # FastAPI 服务
 │   ├── requirements.txt
 │   ├── agent/                  # AI Agent：自然语言 → 意图 → 受限工具
-│   │   ├── api.py              # /api/v1/agent/chat · /clarify
+│   │   ├── api.py              # /api/v1/agent/chat · /clarify · /cancel
 │   │   ├── nlu.py              # LLM 解析 + 本地关键词回退
 │   │   ├── router.py           # 意图 → 工具分发
 │   │   ├── config.py           # 模型档 / 设备白名单 / 等待回执超时
@@ -176,6 +176,7 @@ stand,1767123456789,0.02,-0.15,9.81
 |------|--------|
 | 实时数据面板 | 自动刷新（0.8s），显示最新一批加速度 + 设备状态 |
 | 历史记录 | 每批采集数据一行（批号 / 接收时间 / 点数 / 触发方式 / 任务号 / 来源），可翻页、按触发方式过滤；点「查看样本」看该批原始采样点 + 波形，并可导出 CSV |
+| 语音助手 | 点顶部分区「语音助手」→ 输入文字，或点「开始录音」说话 → 确认识别文字后发送；支持澄清选项、自动播报、停止任务、停止播报、清空重输，并按 `request_id` 显示交互时序 |
 | 采集一次最新数据 | 填样本数 / 采样率 → 点按钮 → 板端按需采集一批 → 结果实时显示 |
 | 暂停 / 恢复周期上报 | 暂停后板端停止 1s 周期上传（采样和落盘照旧），到点自动恢复 |
 | 拍一张照片 | 点按钮 → 板端拍 640×480 JPEG → 画廊显示缩略图，可看原图 / 删除 |
@@ -202,6 +203,7 @@ stand,1767123456789,0.02,-0.15,9.81
 | `DELETE` | `/api/v1/photos/{id}` | 删除照片（库 + 文件同时删） |
 | `POST` | `/api/v1/agent/chat` | AI Agent：一句中文 → 意图 → 受限工具 |
 | `POST` | `/api/v1/agent/clarify` | 回答 AI 的反问（选完候选意图继续执行） |
+| `POST` | `/api/v1/agent/cancel` | 按 Agent `request_id` 取消仍在等待设备回执的请求 |
 | `GET` | `/ui/` | 监控面板 |
 
 > 完整接口文档（含闭环事件、直播推流、控制状态等）见 `PROJECT_STRUCTURE.md`。
@@ -236,9 +238,10 @@ curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
   -d "{\"message\":\"帮我采集一次数据\",\"device_id\":\"esp32s3-eye-0001\"}"
 ```
 
-响应：`{session_id, type, status, message, data, options, evidence}`，其中
+响应：`{session_id, request_id, type, status, message, data, options, evidence, elapsed_ms}`，其中
 `status` = `success`（有设备证据）/ `no_evidence`（任务已提交但设备没回执）/
-`not_found`（查无数据）/ `failure`（参数或权限错误）/ `ambiguous`（需要追问）。
+`not_found`（查无数据）/ `failure`（参数或权限错误）/ `ambiguous`（需要追问）/
+`cancelled`（用户已停止）。
 会话存在服务端进程内存里（TTL 15 分钟），重启即丢。
 
 ### 接入真实 LLM（可选）
@@ -261,8 +264,13 @@ pip install openai          # 可选依赖，不进 CI
 | `AGENT_CONFIDENCE_THRESHOLD` | `0.7` | 低于此置信度触发追问 |
 | `AGENT_CAPTURE_TIMEOUT_S` / `AGENT_PHOTO_TIMEOUT_S` / `AGENT_CONTROL_TIMEOUT_S` | `60` / `30` / `30` | 等设备回执的上限（秒） |
 
-> 目前只提供 HTTP 接口，Web 页面还没有对话入口。自测 `python server/test_agent.py`
-> **不需要 `openai`、不联网**（内部强制走关键词回退分支）。
+Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音识别结果走同一个输入框；
+录音、识别中间结果、任务执行、播报状态都会显示。录音与播报使用浏览器
+`SpeechRecognition` / `SpeechSynthesis`，音频源是当前浏览器麦克风，运行位置是当前页面所在浏览器。
+浏览器不支持识别时仍可用文字入口。停止操作会同时中止识别/播报、`Abort` 当前请求并通过
+`/api/v1/agent/cancel` 通知服务端；页面用单调递增 generation 丢弃迟到结果。
+
+自测 `python server/test_agent.py` **不需要 `openai`、不联网**（内部强制走关键词回退分支）。
 
 ---
 
@@ -307,4 +315,5 @@ python server/e2e_live_check.py    # 直播自检
 - **摄像头直播** → `docs/camera_live_stream.md`
 - **闭环事件** → `docs/loop_trigger_callback.md`
 - **AI Agent（需求 · 修复 · 验证记录）** → `docs/ai_agent_work_log.md`
+- **语音任务助手（入口 · 状态 · 取消 · 验收）** → `docs/voice_assistant_ui.md`
 - **崩溃修复、上传修复等工作记录** → `docs/`
