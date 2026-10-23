@@ -61,6 +61,7 @@ data_capture_sim/                  # 仓库根目录
     ├── make_dev_https.ps1         # 本地 CA + 局域网 IP 开发证书
     ├── start_https_proxy.bat      # 启动浏览器 HTTPS 入口
     ├── start_local_nokey.bat      # 强制本地关键词模式，不调用模型 API
+    ├── check_microphone.ps1       # 检查 Windows 输入端点、隐私与 Edge 策略
     ├── test_receive.py            # 本地联调自测脚本（含按需采集任务全流程）
     ├── test_photos.py             # 拍照链路自测脚本（临时库 + 临时照片目录）
     ├── test_events.py             # 闭环事件自测脚本（临时库，23 项断言）
@@ -101,6 +102,7 @@ data_capture_sim/                  # 仓库根目录
 | `make_dev_https.ps1` | 为 `localhost` 和指定局域网 IP 生成本地 CA、服务器证书与私钥；输出位于 gitignore 的 `server/certs/`。 |
 | `start_https_proxy.bat` | 默认将 `https://0.0.0.0:8443` 转发到 `http://127.0.0.1:8000`，端口可通过参数或环境变量覆盖。 |
 | `start_local_nokey.bat` | 设置 `AGENT_NLU_MODE=keyword` 后启动服务；不读取 Key、不发送模型请求。 |
+| `check_microphone.ps1` | 只读诊断 Windows 麦克风隐私、活动输入端点与 Edge 企业策略，帮助定位 `not-allowed`。 |
 | `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败/控制任务 applied/暂停状态惰性归零），43 项断言。 |
 | `test_photos.py` | 拍照链路自测（临时库 + 临时照片目录）：JPEG 上传校验/落盘/取图/列表/404+410/删除/camera 任务收尾/幂等，16 项断言。 |
 | `test_events.py` | 闭环事件自测（临时库）：触发校验/板端重试幂等/状态机单向性（accept→ack、cancel→cancelled、confirm→completed）/终态不可回退/超 TTL 惰性过期/列表过滤与分页/设备侧鉴权/health 汇总，23 项断言。 |

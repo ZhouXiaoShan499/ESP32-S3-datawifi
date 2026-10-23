@@ -46,6 +46,7 @@ data_capture_sim/
 │   ├── make_dev_https.ps1      # 生成本地开发 CA/证书
 │   ├── start_https_proxy.bat   # 启动 8443 HTTPS 代理
 │   ├── start_local_nokey.bat   # 强制关键词模式，不调用模型 API
+│   ├── check_microphone.ps1    # 检查 Windows 输入端点与 Edge 麦克风策略
 │   ├── agent/                  # AI Agent：自然语言 → 意图 → 受限工具
 │   │   ├── api.py              # /api/v1/agent/chat · /clarify · /cancel
 │   │   ├── nlu.py              # LLM 解析 + 本地关键词回退

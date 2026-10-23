@@ -626,8 +626,9 @@ def main_run():
           "voiceInput / voiceRecordBtn / voiceSendBtn")
     check("voice assistant exposes stop, clear and speak-stop controls",
           all(('id="%s"' % eid) in dom14 for eid in
-              ("voiceStopBtn", "voiceClearBtn", "voiceSpeakStopBtn")),
-          "voiceStopBtn / voiceClearBtn / voiceSpeakStopBtn")
+              ("voiceStopBtn", "voiceClearBtn", "voiceSpeakStopBtn",
+               "voiceMicTestBtn")),
+          "voiceStopBtn / voiceClearBtn / voiceSpeakStopBtn / voiceMicTestBtn")
     check("voice assistant states its audio source and runtime",
           "当前浏览器麦克风" in dom14 and "Web Speech API" in dom14,
           field(dom14, "voiceSupport"))

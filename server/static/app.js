@@ -170,6 +170,7 @@ const $ = {
   voiceMicPermission: el('voiceMicPermission'),
   voiceNluState: el('voiceNluState'),
   voiceSpeechState: el('voiceSpeechState'),
+  voiceMicTestBtn: el('voiceMicTestBtn'),
   voiceAutoSpeak: el('voiceAutoSpeak'),
   voiceSpeakStopBtn: el('voiceSpeakStopBtn'),
   voiceSupport: el('voiceSupport'),
@@ -2343,6 +2344,7 @@ const VOICE = {
   generation: 0,
   busy: false,
   stopping: false,
+  testingMic: false,
   requestId: '',
   taskRequestId: '',
   sessionId: '',
@@ -2352,6 +2354,7 @@ const VOICE = {
   abortController: null,
   recognition: null,
   listening: false,
+  micVerified: false,
   recognitionToken: 0,
   recognitionError: '',
   captureRequestId: '',
@@ -2395,13 +2398,13 @@ function voiceElapsedMs() {
 function voiceRefreshButtons() {
   const synthBusy = !!(window.speechSynthesis && window.speechSynthesis.speaking);
   if ($.voiceRecordBtn) {
-    $.voiceRecordBtn.disabled = VOICE.busy || VOICE.stopping;
+    $.voiceRecordBtn.disabled = VOICE.busy || VOICE.stopping || VOICE.testingMic;
     $.voiceRecordBtn.classList.toggle('recording', VOICE.listening);
     $.voiceRecordBtn.setAttribute('aria-pressed', VOICE.listening ? 'true' : 'false');
     $.voiceRecordBtn.textContent = VOICE.listening ? '■ 停止录音' : '🎙 开始录音';
   }
   if ($.voiceSendBtn) {
-    $.voiceSendBtn.disabled = VOICE.busy || VOICE.stopping || !$.voiceInput ||
+    $.voiceSendBtn.disabled = VOICE.busy || VOICE.stopping || VOICE.testingMic || !$.voiceInput ||
                               !$.voiceInput.value.trim();
   }
   if ($.voiceStopBtn) {
@@ -2412,7 +2415,10 @@ function voiceRefreshButtons() {
     $.voiceSpeakStopBtn.disabled = !synthBusy;
   }
   if ($.voiceClearBtn) {
-    $.voiceClearBtn.disabled = VOICE.stopping;
+    $.voiceClearBtn.disabled = VOICE.stopping || VOICE.testingMic;
+  }
+  if ($.voiceMicTestBtn) {
+    $.voiceMicTestBtn.disabled = VOICE.busy || VOICE.stopping || VOICE.testingMic;
   }
 }
 
@@ -2630,7 +2636,79 @@ function voiceStopRecognition(abort) {
   voiceRefreshButtons();
 }
 
-function voiceStartRecognition() {
+async function voiceTestMicrophone(forRecognition) {
+  if (VOICE.testingMic) return false;
+  if (!window.isSecureContext) {
+    voiceSetStage('需要 HTTPS', 'warn',
+                  '当前页面不是安全上下文。请在本机使用 localhost，或通过 HTTPS 访问后再测试麦克风。');
+    return false;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    voiceSetStage('无录音接口', 'err',
+                  '当前浏览器没有提供 getUserMedia，不能测试或使用麦克风。');
+    return false;
+  }
+
+  VOICE.testingMic = true;
+  voiceRefreshButtons();
+  voiceSetStage('测试麦克风', 'warn',
+                forRecognition ? '正在检查麦克风，随后开始识别…'
+                               : '正在请求麦克风并读取设备参数…');
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+    const track = stream.getAudioTracks()[0];
+    if (!track) throw new DOMException('没有可用的音频轨道', 'NotFoundError');
+    const settings = track.getSettings ? track.getSettings() : {};
+    const detail = [
+      '设备=' + (track.label || '默认麦克风'),
+      settings.sampleRate ? '采样率=' + settings.sampleRate + ' Hz' : '',
+      settings.channelCount ? '声道=' + settings.channelCount : '',
+      track.readyState ? '状态=' + track.readyState : '',
+    ].filter(Boolean).join('；');
+    if ($.voiceMicPermission) $.voiceMicPermission.textContent = '已允许';
+    VOICE.micVerified = true;
+    voiceLog('麦克风测试', detail,
+             VOICE.requestId || VOICE.captureRequestId || 'microphone-test');
+    if (!forRecognition) {
+      voiceSetStage('麦克风正常', 'ok', detail + '。麦克风已释放，可以开始录音。');
+    }
+    return true;
+  } catch (e) {
+    const name = e && e.name ? e.name : 'UnknownError';
+    const messages = {
+      NotAllowedError: '麦克风权限被拒绝。请允许该网站使用麦克风，并检查 Windows 隐私设置。',
+      PermissionDeniedError: '麦克风权限被拒绝。请允许该网站使用麦克风。',
+      NotFoundError: '系统没有检测到可用的麦克风。请连接或启用输入设备，并在 Windows“声音设置 → 输入”中确认有活动设备。',
+      DevicesNotFoundError: '系统没有检测到可用的麦克风。',
+      NotReadableError: '麦克风存在但无法读取，可能被其他程序占用或驱动异常。',
+      TrackStartError: '麦克风无法启动，可能被其他程序占用。',
+      OverconstrainedError: '当前麦克风不满足请求的音频参数。',
+      SecurityError: '浏览器安全策略阻止麦克风，请使用 localhost 或 HTTPS。',
+      AbortError: '麦克风启动被系统中止，请检查设备和驱动。',
+    };
+    if ((name === 'NotAllowedError' || name === 'PermissionDeniedError') &&
+        $.voiceMicPermission) {
+      $.voiceMicPermission.textContent = '已拒绝';
+    }
+    VOICE.micVerified = false;
+    voiceSetStage('麦克风不可用', 'err',
+                  (messages[name] || ('麦克风测试失败：' + (e.message || name))) +
+                  '（' + name + '）');
+    voiceLog('麦克风测试失败', name + ' · ' + (e.message || ''),
+             VOICE.requestId || VOICE.captureRequestId || 'microphone-test');
+    return false;
+  } finally {
+    if (stream) stream.getTracks().forEach((track) => track.stop());
+    VOICE.testingMic = false;
+    voiceRefreshButtons();
+  }
+}
+
+async function voiceStartRecognition() {
   if (VOICE.busy || VOICE.stopping) return;
   if (!SpeechRecognitionCtor) {
     voiceSetStage('不支持识别', 'warn',
@@ -2648,6 +2726,8 @@ function voiceStartRecognition() {
     voiceStopRecognition(false);
     return;
   }
+  const micReady = await voiceTestMicrophone(true);
+  if (!micReady) return;
 
   VOICE.captureRequestId = VOICE.captureRequestId || voiceNewRequestId('speech');
   VOICE.requestId = VOICE.captureRequestId;
@@ -2707,12 +2787,19 @@ function voiceStartRecognition() {
     if (token !== VOICE.recognitionToken) return;
     VOICE.listening = false;
     VOICE.recognitionError = event.error || 'unknown';
-    if (event.error === 'not-allowed' && $.voiceMicPermission) {
+    if (event.error === 'not-allowed' && !VOICE.micVerified &&
+        $.voiceMicPermission) {
       $.voiceMicPermission.textContent = '已拒绝';
     }
-    const message = event.error === 'not-allowed'
-      ? '麦克风权限被拒绝（not-allowed）。请点地址栏左侧站点图标 → 网站权限 → 麦克风 → 允许；再到 Windows“隐私和安全性 → 麦克风”允许浏览器访问，修改后刷新页面。'
-      : '语音识别失败（' + (event.error || 'unknown') + '），可改用文字输入。';
+    let message;
+    if (event.error === 'service-not-allowed' ||
+        (event.error === 'not-allowed' && VOICE.micVerified)) {
+      message = '麦克风硬件已通过测试，但当前浏览器的 Web Speech 语音识别服务不可用或被禁用。请尝试新版 Edge/Chrome，或改用文字输入。';
+    } else if (event.error === 'not-allowed') {
+      message = '麦克风权限被拒绝（not-allowed）。请点地址栏左侧站点图标 → 网站权限 → 麦克风 → 允许；再到 Windows“隐私和安全性 → 麦克风”允许浏览器访问，修改后刷新页面。';
+    } else {
+      message = '语音识别失败（' + (event.error || 'unknown') + '），可改用文字输入。';
+    }
     voiceSetStage('识别异常', 'err', message);
     voiceLog('识别异常', event.error || 'unknown', VOICE.captureRequestId);
     voiceRefreshButtons();
@@ -3025,6 +3112,9 @@ function initVoiceAssistant() {
   if (!ttsSupported && $.voiceAutoSpeak) $.voiceAutoSpeak.checked = false;
 
   $.voiceRecordBtn.addEventListener('click', voiceStartRecognition);
+  $.voiceMicTestBtn.addEventListener('click', () => {
+    void voiceTestMicrophone(false);
+  });
   $.voiceSendBtn.addEventListener('click', () => {
     voiceSubmit($.voiceInput.value, { inputSource: '文字输入' });
   });
