@@ -53,7 +53,7 @@ class NLUParser:
             self._ensure_client()
         except Exception as e:                       # noqa: BLE001
             _warn_nlu_unavailable(e)
-            return self._fallback(user_input)
+            return self._fallback(user_input, context)
         system = build_system_prompt(self._allowed)
         user_msg = build_user_message(user_input, context)
         messages = [
@@ -73,7 +73,7 @@ class NLUParser:
                         elapsed, getattr(resp.usage, "total_tokens", "?"))
         except Exception as e:
             logger.error("NLU parse error: %s", e)
-            return self._fallback(user_input)
+            return self._fallback(user_input, context)
         parsed = None
         try:
             parsed = json.loads(raw)
@@ -90,7 +90,7 @@ class NLUParser:
                     except json.JSONDecodeError:
                         continue
             if not isinstance(parsed, dict):
-                return self._fallback(user_input)
+                return self._fallback(user_input, context)
         return {
             "intent": parsed.get("intent", ""),
             "parameters": parsed.get("parameters", {}),
@@ -100,53 +100,85 @@ class NLUParser:
             "clarification_options": parsed.get("clarification_options", []),
             "raw": raw}
 
-    def _fallback(self, text: str) -> Dict[str, Any]:
-        """LLM 不可用时的本地关键词回退。"""
-        t = text.lower()
-        if any(w in t for w in ("采集", "采", "获取")):
-            return {"intent": "start_capture", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("拍照", "照片", "拍一张")):
-            return {"intent": "take_photo", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("暂停", "停止", "停一下")):
-            return {"intent": "pause_periodic", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("恢复", "继续", "重启")):
-            return {"intent": "resume_periodic", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        # 放在查询类之前：「查看系统状态」同时含「查」（query_latest 的关键词），
-        # 但用户的真实意图是健康汇总，先命中这里更准。
-        if any(w in t for w in ("系统状态", "健康", "汇总", "概览", "状态")):
-            return {"intent": "query_health", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
+    def _fallback(self, text: str, context: Optional[Dict[str, Any]] = None
+                  ) -> Dict[str, Any]:
+        """LLM 不可用时的本地关键词回退。
+
+        安全原则：查询优先于动作、否定句绝不执行、单字「采/查」不当作动作。
+        设备动作只认明确短语；其余问法进入追问，避免“查看采集任务”真的发起采集。
+        """
+        t = "".join((text or "").lower().split())
+        context = context or {}
+
+        def out(intent, confidence=0.82, parameters=None, ambiguous=False,
+                message="", options=None):
+            return {
+                "intent": intent,
+                "parameters": parameters or {},
+                "confidence": confidence,
+                "ambiguous": ambiguous,
+                "clarification_message": message,
+                "clarification_options": options or [],
+            }
+
+        followups = ("再查一次", "再查一遍", "再看一次", "重新查询", "重复查询")
+        if any(w in t for w in followups):
+            last_intent = context.get("last_intent")
+            if last_intent in ("query_history", "query_latest", "query_devices",
+                               "query_health", "query_tasks", "query_events"):
+                return out(last_intent, 0.88)
+            return out(
+                "", 0.3, ambiguous=True,
+                message="目前没有可重复的上一次查询，请说明要查询什么。",
+                options=["查看最新数据", "查看任务状态", "查看设备列表"])
+
+        if any(w in t for w in ("不要", "别", "无需", "不用", "取消")) and any(
+                w in t for w in ("采集", "拍照", "暂停", "停止", "恢复")):
+            return out(
+                "", 0.35, ambiguous=True,
+                message="这条输入包含否定或取消含义，我没有执行设备动作。",
+                options=["查看任务状态", "查看最新数据"])
+
+        if (any(w in t for w in ("历史", "多少批", "几条记录", "采集记录")) or
+                ("采集" in t and any(w in t for w in ("多少", "几次", "几批")))):
+            return out("query_history", 0.86)
+        if any(w in t for w in ("任务状态", "任务进度", "任务怎么样", "完成了吗",
+                                  "是否完成", "查询任务", "查看任务",
+                                  "暂停了吗", "恢复了吗", "正在采集吗")) or \
+                "任务" in t:
+            return out("query_tasks", 0.9)
+        if any(w in t for w in ("系统状态", "健康", "汇总", "概览")):
+            return out("query_health", 0.88)
         if any(w in t for w in ("事件", "告警")):
-            return {"intent": "query_events", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("任务", "进度")):
-            return {"intent": "query_tasks", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("设备", "列表")):
-            return {"intent": "query_devices", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        if any(w in t for w in ("数据", "结果", "看看", "查", "显示",
+            return out("query_events", 0.86)
+        if any(w in t for w in ("设备列表", "有哪些设备", "查看设备", "设备在线")):
+            return out("query_devices", 0.88)
+
+        capture_actions = ("发起采集", "开始采集", "重新采集", "再采集",
+                           "采集一次", "采一组", "帮我采集", "请采集",
+                           "采集200", "采集100", "采集50")
+        if (any(w in t for w in capture_actions) or
+                (t.startswith("采集") and "数据" in t) or
+                ("采集" in t and "个点" in t)):
+            return out("start_capture", 0.85)
+
+        if any(w in t for w in ("拍一张", "拍个照", "拍照", "拍摄照片")):
+            return out("take_photo", 0.86)
+        if any(w in t for w in ("暂停周期", "停止周期", "暂停上报",
+                                  "停止上报", "暂停上传")):
+            return out("pause_periodic", 0.88)
+        if any(w in t for w in ("恢复周期", "恢复上报", "恢复上传",
+                                  "继续上报")):
+            return out("resume_periodic", 0.88)
+
+        if any(w in t for w in ("数据", "结果", "看看", "查询", "显示",
                                   "最新", "最近", "刚才", "上次")):
-            return {"intent": "query_latest", "parameters": {},
-                    "confidence": 0.4, "ambiguous": False,
-                    "clarification_message": "", "clarification_options": []}
-        return {"intent": "query_health", "parameters": {},
-                "confidence": 0.2, "ambiguous": True,
-                "clarification_message": "我不太确定您想做什么。",
-                "clarification_options": ["查看最新数据", "发起采集",
-                                          "查看设备列表", "查看系统状态"]}
+            return out("query_latest", 0.8)
+
+        return out(
+            "query_health", 0.2, ambiguous=True,
+            message="我不太确定您想做什么。",
+            options=["查看最新数据", "查看任务状态", "查看设备列表", "查看系统状态"])
 
 
 _nlu_parser: Optional[NLUParser] = None

@@ -28,7 +28,9 @@ jobs:
 
       # 先做语法检查，语法错时给出比 assert 更直观的定位
       - name: 语法检查
-        run: python -m compileall -q server
+        run: |
+          python -m compileall -q server
+          node --check server/static/app.js
 
       # 五个自测脚本各自用独立临时库（server/data/ 已在 .gitignore 里），
       # 互不干扰；任何一个失败都直接让 job 红。

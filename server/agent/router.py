@@ -27,6 +27,10 @@ INTENT_TOOL_MAP: Dict[str, Any] = {
     "query_events": QueryEventsTool,
 }
 
+MUTATING_INTENTS = {
+    "start_capture", "take_photo", "pause_periodic", "resume_periodic",
+}
+
 
 class IntentRouter:
     """意图路由器。"""
@@ -63,8 +67,11 @@ class IntentRouter:
 
         # 低置信度追问
         conf = parsed.get("confidence", 1.0)
-        if conf < CONFIDENCE_THRESHOLD and parsed.get("clarification_message"):
+        if conf < CONFIDENCE_THRESHOLD and (
+                parsed.get("clarification_message") or intent in MUTATING_INTENTS):
             opts = parsed.get("clarification_options", [])
+            if not opts and intent in MUTATING_INTENTS:
+                opts = ["查看任务状态", "查看最新数据"]
             return ToolResult(
                 status=ToolResultStatus.AMBIGUOUS,
                 message=parsed.get("clarification_message",
@@ -90,8 +97,8 @@ class IntentRouter:
         if agent_request_id:
             params["_agent_request_id"] = agent_request_id
 
-        logger.info("Route intent=%s tool=%s params=%s",
-                    intent, tool.name,
+        logger.info("Route request_id=%s intent=%s tool=%s params=%s",
+                    agent_request_id or "-", intent, tool.name,
                     {k: v for k, v in params.items() if not k.startswith("_")})
         result = tool.run(params)
         return result

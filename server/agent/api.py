@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Agent API —— 暴露 /agent/chat、/agent/clarify 和 /agent/cancel 端点。"""
-import json, logging, re, uuid, threading, time
+import asyncio, json, logging, re, uuid, threading, time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
@@ -135,6 +135,56 @@ def _cancelled_response(session_id: str, request_id: str, started_at: float):
     })
 
 
+def _validate_body(body: Any, fields: Dict[str, int]) -> Optional[str]:
+    """请求体必须是 JSON 对象，指定字段必须为有长度上限的字符串。"""
+    if not isinstance(body, dict):
+        return "request body must be a JSON object"
+    for name, max_len in fields.items():
+        value = body.get(name, "")
+        if not isinstance(value, str):
+            return f"'{name}' must be a string"
+        if len(value) > max_len:
+            return f"'{name}' is too long (max {max_len})"
+    return None
+
+
+async def _run_nlu_cancellable(parser, message: str, session: Dict[str, Any],
+                               cancel_event: threading.Event,
+                               request_id: str):
+    """等待 NLU 时每 50 ms 查看取消事件。
+
+    同步 OpenAI 客户端无法从外部强制中断，因此取消后立即结束 HTTP 等待；
+    被放弃的线程完成/超时后由回调清理请求登记，不会再执行设备工具。
+    """
+    task = asyncio.create_task(asyncio.to_thread(parser.parse, message, session))
+    while not task.done():
+        if cancel_event.is_set():
+            def _finish_late(completed):
+                try:
+                    completed.result()
+                except BaseException as exc:          # noqa: BLE001
+                    logger.warning("late NLU request_id=%s failed after cancel: %s",
+                                   request_id, exc)
+                finally:
+                    _finish_request(request_id)
+            task.add_done_callback(_finish_late)
+            return None
+        await asyncio.wait({task}, timeout=0.05)
+    return task.result()
+
+
+def _remember_context(session: Dict[str, Any], message: str, intent: str,
+                      result) -> None:
+    """保存最小化的多轮上下文，不保存完整聊天记录或敏感参数。"""
+    session["last_intent"] = intent or ""
+    session["last_message"] = (message or "")[:300]
+    data = result.data if isinstance(result.data, dict) else {}
+    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+    task_rid = task.get("request_id") or data.get("task_request_id")
+    if isinstance(task_rid, str) and task_rid:
+        session["last_task_request_id"] = task_rid
+
+
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
@@ -146,6 +196,11 @@ async def agent_chat(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+    body_error = _validate_body(
+        body, {"message": 4000, "session_id": 128,
+               "device_id": 128, "request_id": 80})
+    if body_error:
+        return JSONResponse({"error": body_error}, status_code=400)
     raw_request_id = body.get("request_id", "")
     if raw_request_id and not _valid_request_id(raw_request_id):
         return JSONResponse(
@@ -154,6 +209,8 @@ async def agent_chat(request: Request):
     req = _parse_agent_request(body)
     if req is None:
         return JSONResponse({"error": "缺少 message 参数"}, status_code=400)
+    logger.info("agent start request_id=%s session_id=%s device_id=%s",
+                req.request_id, req.session_id, req.device_id or "-")
 
     # 用单点相对导入（.nlu/.router），而不是 ..agent.nlu ——
     # 运行期 agent 有两种落点：`python server/main.py` 时是**顶层包 agent**
@@ -189,9 +246,14 @@ async def agent_chat(request: Request):
     # run_in_threadpool 把这两个阻塞调用挪出事件循环，其它请求照常被服务。
     try:
         nlu = get_nlu_parser()
-        parsed = await run_in_threadpool(nlu.parse, req.message, sess)
+        parsed = await _run_nlu_cancellable(
+            nlu, req.message, sess, cancel_event, req.request_id)
+        if parsed is None:
+            logger.info("agent cancelled during NLU request_id=%s", req.request_id)
+            return _cancelled_response(req.session_id, req.request_id, started_at)
         if cancel_event.is_set():
             _finish_request(req.request_id)
+            logger.info("agent cancelled after NLU request_id=%s", req.request_id)
             return _cancelled_response(req.session_id, req.request_id, started_at)
 
         # 路由执行
@@ -200,6 +262,7 @@ async def agent_chat(request: Request):
             router_.route, parsed, sess,
             cancel_event=cancel_event, agent_request_id=req.request_id)
     except Exception:
+        logger.exception("agent failed request_id=%s", req.request_id)
         _finish_request(req.request_id)
         raise
 
@@ -210,6 +273,7 @@ async def agent_chat(request: Request):
             sess.pop("_pending", None)
             _sessions[req.session_id] = sess
         _finish_request(req.request_id)
+        logger.info("agent cancelled during tool request_id=%s", req.request_id)
         return _cancelled_response(req.session_id, req.request_id, started_at)
 
     # 歧义时暂存意图，以便 clarify 继续
@@ -219,13 +283,18 @@ async def agent_chat(request: Request):
                 "intent": parsed.get("intent"),
                 "parameters": parsed.get("parameters", {}),
                 "options": result.ambiguous_options}
+            _remember_context(sess, req.message, parsed.get("intent", ""), result)
             _sessions[req.session_id] = sess
     else:
         with _lock:
             sess.pop("_pending", None)
+            _remember_context(sess, req.message, parsed.get("intent", ""), result)
             _sessions[req.session_id] = sess
 
     _finish_request(req.request_id)
+    logger.info("agent done request_id=%s status=%s elapsed_ms=%d",
+                req.request_id, result.status.value,
+                round((time.time() - started_at) * 1000))
     return JSONResponse({
         "session_id": req.session_id,
         "request_id": req.request_id,
@@ -249,6 +318,10 @@ async def agent_clarify(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+    body_error = _validate_body(
+        body, {"session_id": 128, "choice": 1000, "request_id": 80})
+    if body_error:
+        return JSONResponse({"error": body_error}, status_code=400)
     raw_request_id = body.get("request_id", "")
     if raw_request_id and not _valid_request_id(raw_request_id):
         return JSONResponse(
@@ -257,6 +330,8 @@ async def agent_clarify(request: Request):
     req = _parse_clarify_request(body)
     if req is None:
         return JSONResponse({"error": "缺少 session_id/choice"}, status_code=400)
+    logger.info("agent clarify start request_id=%s session_id=%s",
+                req.request_id, req.session_id)
 
     from .router import get_router
 
@@ -291,9 +366,16 @@ async def agent_clarify(request: Request):
     from .nlu import get_nlu_parser
 
     try:
-        chosen = await run_in_threadpool(get_nlu_parser().parse, req.choice, sess)
+        chosen = await _run_nlu_cancellable(
+            get_nlu_parser(), req.choice, sess, cancel_event, req.request_id)
+        if chosen is None:
+            logger.info("agent clarify cancelled during NLU request_id=%s",
+                        req.request_id)
+            return _cancelled_response(req.session_id, req.request_id, started_at)
         if cancel_event.is_set():
             _finish_request(req.request_id)
+            logger.info("agent clarify cancelled after NLU request_id=%s",
+                        req.request_id)
             return _cancelled_response(req.session_id, req.request_id, started_at)
         params = dict(pending.get("parameters") or {})
         params.update(chosen.get("parameters") or {})
@@ -308,14 +390,23 @@ async def agent_clarify(request: Request):
             router_.route, new_parsed, sess,
             cancel_event=cancel_event, agent_request_id=req.request_id)
     except Exception:
+        logger.exception("agent clarify failed request_id=%s", req.request_id)
         _finish_request(req.request_id)
         raise
 
     if cancel_event.is_set():
         _finish_request(req.request_id)
+        logger.info("agent clarify cancelled during tool request_id=%s",
+                    req.request_id)
         return _cancelled_response(req.session_id, req.request_id, started_at)
 
+    with _lock:
+        _remember_context(sess, req.choice, new_parsed.get("intent", ""), result)
+        _sessions[req.session_id] = sess
     _finish_request(req.request_id)
+    logger.info("agent clarify done request_id=%s status=%s elapsed_ms=%d",
+                req.request_id, result.status.value,
+                round((time.time() - started_at) * 1000))
     return JSONResponse({
         "session_id": req.session_id,
         "request_id": req.request_id,
@@ -340,6 +431,9 @@ async def agent_cancel(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+    body_error = _validate_body(body, {"request_id": 80})
+    if body_error:
+        return JSONResponse({"error": body_error}, status_code=400)
     request_id = body.get("request_id", "")
     if not _valid_request_id(request_id):
         return JSONResponse(
@@ -347,6 +441,7 @@ async def agent_cancel(request: Request):
             status_code=400)
     request_id = request_id.strip()
     cancelled = _cancel_request(request_id)
+    logger.info("agent cancel request_id=%s cancelled=%s", request_id, cancelled)
     return JSONResponse({
         "ok": True,
         "request_id": request_id,

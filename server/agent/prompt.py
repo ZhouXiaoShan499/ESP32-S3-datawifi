@@ -153,6 +153,11 @@ def build_user_message(user_input, context=None):
             ctx_parts.append(f"最近操作的设备: {context['last_device_id']}")
         if context.get("last_intent"):
             ctx_parts.append(f"上一次意图: {context['last_intent']}")
+        if context.get("last_message"):
+            ctx_parts.append(f"上一次输入: {str(context['last_message'])[:300]}")
+        if context.get("last_task_request_id"):
+            ctx_parts.append(
+                f"上一次设备任务 request_id: {context['last_task_request_id']}")
         if ctx_parts:
             parts.append("## 上下文\n" + "\n".join(ctx_parts))
 

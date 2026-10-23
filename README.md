@@ -296,7 +296,7 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 python server/test_receive.py      # 单元自测（校验/入库/查询/任务全流程）
 python server/test_photos.py       # 拍照链路自测
 python server/test_events.py       # 闭环事件自测（23 项）
-python server/test_agent.py        # AI Agent 自测（19 项；不需要 openai、不联网）
+python server/test_agent.py        # AI Agent 自测（23 项；不需要 openai、不联网）
 python server/e2e_server_check.py  # 真实 HTTP 端到端自检
 python server/e2e_ui_check.py      # 界面自检（可选；无浏览器则 SKIP）
 python server/e2e_device_check.py  # 真机验收（可选；无板则 SKIP）

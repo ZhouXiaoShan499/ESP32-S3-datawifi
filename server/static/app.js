@@ -1634,6 +1634,16 @@ try {
     setTimeout(() => switchTab('control'), 0);
     setTimeout(() => createTask('resume'), 1200);
   }
+  // ?autovoice=1&voice_text=查看系统状态：自动走一次文字版语音助手链路，
+  // 用于无头浏览器验证输入 → Agent → 结果气泡/时序日志（不伪造麦克风录音）。
+  if (params.get('autovoice') === '1') {
+    setTimeout(() => switchTab('voice'), 0);
+    setTimeout(() => {
+      if (!$.voiceInput) return;
+      $.voiceInput.value = params.get('voice_text') || '查看系统状态';
+      voiceSubmit($.voiceInput.value, { inputSource: '自动验收文字输入' });
+    }, 1200);
+  }
 } catch (e) {
   /* 不支持 URLSearchParams 的环境忽略即可 */
 }
@@ -2330,11 +2340,13 @@ const SpeechRecognitionCtor = window.SpeechRecognition ||
 const VOICE = {
   generation: 0,
   busy: false,
+  stopping: false,
   requestId: '',
   taskRequestId: '',
   sessionId: '',
   startedAt: 0,
   firstFeedbackMs: null,
+  agentResponseMs: null,
   abortController: null,
   recognition: null,
   listening: false,
@@ -2345,6 +2357,7 @@ const VOICE = {
   interimLogged: false,
   pendingOptions: [],
   logs: [],
+  cancellationWarning: '',
 };
 
 try {
@@ -2380,20 +2393,24 @@ function voiceElapsedMs() {
 function voiceRefreshButtons() {
   const synthBusy = !!(window.speechSynthesis && window.speechSynthesis.speaking);
   if ($.voiceRecordBtn) {
-    $.voiceRecordBtn.disabled = VOICE.busy;
+    $.voiceRecordBtn.disabled = VOICE.busy || VOICE.stopping;
     $.voiceRecordBtn.classList.toggle('recording', VOICE.listening);
     $.voiceRecordBtn.setAttribute('aria-pressed', VOICE.listening ? 'true' : 'false');
     $.voiceRecordBtn.textContent = VOICE.listening ? '■ 停止录音' : '🎙 开始录音';
   }
   if ($.voiceSendBtn) {
-    $.voiceSendBtn.disabled = VOICE.busy || !$.voiceInput ||
+    $.voiceSendBtn.disabled = VOICE.busy || VOICE.stopping || !$.voiceInput ||
                               !$.voiceInput.value.trim();
   }
   if ($.voiceStopBtn) {
-    $.voiceStopBtn.disabled = !VOICE.busy && !VOICE.listening && !synthBusy;
+    $.voiceStopBtn.disabled = VOICE.stopping ||
+      (!VOICE.busy && !VOICE.listening && !synthBusy);
   }
   if ($.voiceSpeakStopBtn) {
     $.voiceSpeakStopBtn.disabled = !synthBusy;
+  }
+  if ($.voiceClearBtn) {
+    $.voiceClearBtn.disabled = VOICE.stopping;
   }
 }
 
@@ -2414,10 +2431,12 @@ function voiceSetLatency() {
   if (!$.voiceLatency) return;
   const parts = [];
   if (VOICE.firstFeedbackMs !== null) {
-    parts.push('首反馈 ' + Math.round(VOICE.firstFeedbackMs) + ' ms');
+    parts.push('本地反馈 ' + Math.round(VOICE.firstFeedbackMs) + ' ms');
   }
-  if (VOICE.startedAt) {
-    parts.push('累计 ' + Math.round(voiceElapsedMs()) + ' ms');
+  if (VOICE.agentResponseMs !== null) {
+    parts.push('Agent 完成 ' + Math.round(VOICE.agentResponseMs) + ' ms');
+  } else if (VOICE.startedAt) {
+    parts.push('已等待 ' + Math.round(voiceElapsedMs()) + ' ms');
   }
   $.voiceLatency.textContent = parts.length ? parts.join(' · ') : '—';
 }
@@ -2563,11 +2582,17 @@ function voiceStopRecognition(abort) {
 }
 
 function voiceStartRecognition() {
-  if (VOICE.busy) return;
+  if (VOICE.busy || VOICE.stopping) return;
   if (!SpeechRecognitionCtor) {
     voiceSetStage('不支持识别', 'warn',
                   '当前浏览器不支持语音识别，请继续使用文字输入。');
     voiceLog('识别不可用', '缺少 SpeechRecognition 或 webkitSpeechRecognition');
+    return;
+  }
+  if (!window.isSecureContext) {
+    voiceSetStage('需要 HTTPS', 'warn',
+                  '当前页面不是安全上下文。请在本机使用 localhost，或通过 HTTPS 访问后再录音。');
+    voiceLog('识别不可用', '页面不是 secure context');
     return;
   }
   if (VOICE.listening) {
@@ -2672,20 +2697,35 @@ function voiceStartRecognition() {
 }
 
 async function voiceCancelOnServer(requestId) {
-  if (!requestId) return;
+  if (!requestId) return { cancelled: false, missing: true };
+  let res;
   try {
-    await fetch('/api/v1/agent/cancel', {
+    const options = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ request_id: requestId }),
       cache: 'no-store',
-    });
+      keepalive: true,
+    };
+    if (window.AbortSignal && AbortSignal.timeout) {
+      options.signal = AbortSignal.timeout(3000);
+    }
+    res = await fetch('/api/v1/agent/cancel', options);
   } catch (e) {
-    /* 用户已经回到空闲；网络失败不阻塞下一次输入 */
+    throw new Error('取消请求未送达：' + e.message);
   }
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    throw new Error((data && data.error) || ('取消接口返回 ' + res.status));
+  }
+  return data || { cancelled: false };
 }
 
-function voiceStopCurrent(reason) {
+async function voiceStopCurrent(reason) {
+  if (VOICE.stopping) return;
+  VOICE.stopping = true;
+  VOICE.cancellationWarning = '';
   const requestId = VOICE.requestId;
   const taskActive = VOICE.busy || VOICE.listening;
   const speechActive = !!(window.speechSynthesis &&
@@ -2700,22 +2740,48 @@ function voiceStopCurrent(reason) {
   }
   voiceSetOptions([]);
   if (taskActive) {
-    voiceLog('任务取消', reason || '用户停止当前任务', requestId);
-    voiceAddBubble('system', '已停止当前任务与播报，迟到的结果会被忽略。可以重新输入。');
+    voiceLog('取消中', reason || '用户停止当前任务', requestId);
+    voiceSetStage('正在取消', 'warn', '界面已停止；正在等待服务端确认取消…');
   } else if (speechActive) {
     voiceLog('播报停止', reason || '用户停止播报', requestId);
     voiceAddBubble('system', '已停止播报。');
   }
+  let cancellationNote = '';
+  if (taskActive && requestId) {
+    try {
+      const data = await voiceCancelOnServer(requestId);
+      if (data.cancelled) {
+        voiceLog('取消确认', '服务端已取消等待并处理设备任务', requestId);
+        voiceAddBubble('system',
+          '服务端已确认取消，迟到的结果不会再覆盖当前界面。');
+        cancellationNote = '服务端已确认取消，已回到空闲。';
+      } else {
+        voiceLog('取消未确认', '请求可能已完成或已不存在', requestId);
+        voiceAddBubble('system',
+          '界面已停止；该请求可能已经完成，因此服务端没有可取消的任务。');
+        cancellationNote = '界面已停止；请求可能已经完成。';
+      }
+    } catch (e) {
+      voiceLog('取消异常', e.message, requestId);
+      voiceAddBubble('system',
+        '界面已停止，但服务端取消未确认；设备任务可能仍在执行。');
+      cancellationNote = '界面已停止；服务端取消未确认，设备任务可能继续。';
+      VOICE.cancellationWarning = cancellationNote;
+    }
+  }
   VOICE.firstFeedbackMs = null;
+  VOICE.agentResponseMs = null;
   VOICE.startedAt = 0;
+  VOICE.stopping = false;
   voiceSetLatency();
-  voiceSetStage('空闲', 'off', '已回到空闲，可重新输入或录音。');
+  voiceSetStage('空闲', 'off',
+                cancellationNote || '已回到空闲，可重新输入或录音。');
   voiceRefreshButtons();
-  if (taskActive && requestId) void voiceCancelOnServer(requestId);
 }
 
-function voiceClearAssistant() {
-  voiceStopCurrent('清空并重新输入');
+async function voiceClearAssistant() {
+  await voiceStopCurrent('清空并重新输入');
+  const cancellationWarning = VOICE.cancellationWarning;
   VOICE.generation++;
   VOICE.requestId = '';
   VOICE.taskRequestId = '';
@@ -2730,6 +2796,9 @@ function voiceClearAssistant() {
     $.voiceThread.innerHTML = '';
     voiceAddBubble('system',
       '会话已清空。可以输入文字，或点击“开始录音”发起一次新任务。');
+    if (cancellationWarning) {
+      voiceAddBubble('system', cancellationWarning);
+    }
   }
   if ($.voiceRequestId) $.voiceRequestId.textContent = '—';
   if ($.voiceTaskRid) $.voiceTaskRid.textContent = '—';
@@ -2737,7 +2806,10 @@ function voiceClearAssistant() {
   if ($.voiceSpeechState) $.voiceSpeechState.textContent = '空闲';
   voiceSetOptions([]);
   voiceRenderLog();
-  voiceSetStage('空闲', 'off', '会话已清空，等待新的文字或语音输入。');
+  voiceSetStage('空闲', cancellationWarning ? 'warn' : 'off',
+                cancellationWarning ||
+                '会话已清空，等待新的文字或语音输入。');
+  VOICE.cancellationWarning = '';
   voiceRefreshButtons();
 }
 
@@ -2752,6 +2824,10 @@ async function voiceSubmit(text, options) {
   if (VOICE.busy) {
     voiceSetStage('任务进行中', 'warn',
                   '当前任务仍在执行。先点“停止当前任务”，再输入下一条。');
+    return;
+  }
+  if (VOICE.stopping) {
+    voiceSetStage('正在取消', 'warn', '请等待服务端取消结果后再发送下一条任务。');
     return;
   }
   if (options.clarify && !VOICE.sessionId) {
@@ -2816,6 +2892,7 @@ async function voiceSubmit(text, options) {
       throw new Error((data && data.error) || ('接口返回 ' + res.status));
     }
     if (!data) throw new Error('Agent 响应不是合法 JSON');
+    VOICE.agentResponseMs = voiceElapsedMs();
 
     if (data.session_id) {
       VOICE.sessionId = data.session_id;
@@ -2859,6 +2936,7 @@ async function voiceSubmit(text, options) {
     if ($.voiceAutoSpeak && $.voiceAutoSpeak.checked) voiceSpeak(reply);
   } catch (e) {
     if (generation !== VOICE.generation || e.name === 'AbortError') return;
+    VOICE.agentResponseMs = voiceElapsedMs();
     const reply = '请求失败：' + e.message;
     voiceSetStage('执行失败', 'err', reply);
     voiceAddBubble('assistant', reply);
@@ -2885,7 +2963,10 @@ function initVoiceAssistant() {
     $.voiceSupport.textContent =
       '语音识别：' + (SpeechRecognitionCtor ? '可用（zh-CN）' : '当前浏览器不支持') +
       '；语音播报：' + (ttsSupported ? '可用' : '当前浏览器不支持') +
-      '。首次录音时浏览器会请求麦克风权限。';
+      '。首次录音时浏览器会请求麦克风权限。' +
+      (window.isSecureContext
+        ? ' 当前页面满足安全上下文要求。'
+        : ' 当前页面不是安全上下文；请使用 localhost 或 HTTPS。');
   }
   if (!ttsSupported && $.voiceAutoSpeak) $.voiceAutoSpeak.checked = false;
 
@@ -2893,8 +2974,12 @@ function initVoiceAssistant() {
   $.voiceSendBtn.addEventListener('click', () => {
     voiceSubmit($.voiceInput.value, { inputSource: '文字输入' });
   });
-  $.voiceStopBtn.addEventListener('click', () => voiceStopCurrent('用户停止'));
-  $.voiceClearBtn.addEventListener('click', voiceClearAssistant);
+  $.voiceStopBtn.addEventListener('click', () => {
+    void voiceStopCurrent('用户停止');
+  });
+  $.voiceClearBtn.addEventListener('click', () => {
+    void voiceClearAssistant();
+  });
   $.voiceSpeakStopBtn.addEventListener('click', () => voiceStopSpeech(false));
   $.voiceInput.addEventListener('input', voiceRefreshButtons);
   $.voiceInput.addEventListener('keydown', (ev) => {
@@ -2904,7 +2989,15 @@ function initVoiceAssistant() {
     }
   });
   window.addEventListener('beforeunload', () => {
-    if (VOICE.requestId) void voiceCancelOnServer(VOICE.requestId);
+    if (VOICE.requestId && navigator.sendBeacon) {
+      const payload = new Blob(
+        [JSON.stringify({ request_id: VOICE.requestId })],
+        { type: 'application/json' });
+      const queued = navigator.sendBeacon('/api/v1/agent/cancel', payload);
+      if (!queued) void voiceCancelOnServer(VOICE.requestId);
+    } else if (VOICE.requestId) {
+      void voiceCancelOnServer(VOICE.requestId);
+    }
     voiceStopRecognition(true);
     voiceStopSpeech(true);
   });

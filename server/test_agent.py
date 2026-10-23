@@ -16,6 +16,7 @@ AI Agent（自然语言 → 意图 → 受限工具调用）自测。
       拍照、暂停、恢复四条动作路径）/ 工具层返回值结构 / 会话 TTL / 包导入布局。
 """
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -71,13 +72,15 @@ def ok(msg):
     print("[PASS] %s" % msg)
 
 
-def chat(client, message, device_id="", request_id=""):
+def chat(client, message, device_id="", request_id="", session_id=""):
     """POST /agent/chat，要求 200 并返回 JSON（404/500 都在这里炸出来）。"""
     body = {"message": message}
     if device_id:
         body["device_id"] = device_id
     if request_id:
         body["request_id"] = request_id
+    if session_id:
+        body["session_id"] = session_id
     r = client.post("/api/v1/agent/chat", json=body)
     assert r.status_code == 200, (r.status_code, r.text)
     return r.json()
@@ -117,12 +120,48 @@ def main_run():
         assert got["confidence"] > 0, (text, got)
     ok("LLM 不可达时回退关键词解析：%d 句话映射到正确意图" % len(expect))
 
+    safe_cases = {
+        "查看采集任务": "query_tasks",
+        "采集完成了吗": "query_tasks",
+        "暂停了吗": "query_tasks",
+        "查看采集数据": "query_latest",
+        "获取数据": "query_latest",
+        "今天采集了多少": "query_history",
+    }
+    for text, intent in safe_cases.items():
+        got = parser.parse(text)
+        assert got["intent"] == intent, (text, got)
+        assert got["intent"] not in (
+            "start_capture", "take_photo", "pause_periodic", "resume_periodic"), got
+    for text in ("不要采集", "别拍照", "取消暂停"):
+        got = parser.parse(text)
+        assert got["ambiguous"] is True and not got["intent"], (text, got)
+    weak_action = get_router().route({
+        "intent": "start_capture", "parameters": {},
+        "confidence": 0.4, "clarification_message": "",
+        "clarification_options": []})
+    assert weak_action.status is ToolResultStatus.AMBIGUOUS, weak_action
+    ok("关键词回退安全：查询不误采集、否定句不执行、低置信度动作强制追问")
+
     # 3) 正面用例：成功结果必须带 evidence
     body = chat(client, "查看系统状态", request_id="test-health-0001")
     assert body["status"] == "success" and body["evidence"], body
     assert body["data"]["total_uploads"] == 0, body["data"]
     assert body["request_id"] == "test-health-0001", body
     ok("成功返回必带 evidence，且回显客户端 request_id")
+
+    # 3b) 最小多轮上下文：记录上一次意图，并支持安全的“再查一次”。
+    ctx_sid = "test-context-session"
+    body = chat(client, "查看系统状态", session_id=ctx_sid,
+                request_id="test-context-0001")
+    assert body["status"] == "success", body
+    ctx = agent_api._sessions[ctx_sid]
+    assert ctx["last_intent"] == "query_health", ctx
+    assert ctx["last_message"] == "查看系统状态", ctx
+    body = chat(client, "再查一次", session_id=ctx_sid,
+                request_id="test-context-0002")
+    assert body["status"] == "success", body
+    ok("有限多轮上下文：保存 last_intent/last_message，支持重复只读查询")
 
     # 4) 空库下的查询类意图：不 500，如实说“没数据”
     for text in ("看看最新的数据", "查看设备列表", "有事件吗"):
@@ -173,6 +212,12 @@ def main_run():
                        json={"message": 123}).status_code == 400
     assert client.post("/api/v1/agent/chat",
                        json={"message": "状态", "request_id": "x"}).status_code == 400
+    assert client.post("/api/v1/agent/chat", json=[]).status_code == 400
+    assert client.post("/api/v1/agent/chat", json="状态").status_code == 400
+    assert client.post("/api/v1/agent/chat",
+                       json={"message": "状态", "session_id": 123}).status_code == 400
+    assert client.post("/api/v1/agent/chat",
+                       json={"message": "状态", "device_id": 123}).status_code == 400
     assert client.post("/api/v1/agent/clarify",
                        json={"choice": "x"}).status_code == 400
     assert client.post("/api/v1/agent/clarify",
@@ -180,7 +225,7 @@ def main_run():
     r = client.post("/api/v1/agent/chat", content=b"{not json",
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400, r.text
-    ok("入参校验：缺/空白 message、缺 session_id|choice、非法 JSON → 400")
+    ok("入参校验：缺/空白/错误类型字段、非对象 JSON、非法 JSON → 400")
 
     # 7b) request_id 取消链：Event、取消接口和路由入口状态一致；
     #     已取消的请求不会继续执行工具，也不会产生 evidence。
@@ -201,6 +246,35 @@ def main_run():
     assert client.post("/api/v1/agent/cancel",
                        json={"request_id": "x"}).status_code == 400
     agent_api._requests.pop(cancel_rid, None)
+
+    # 7c) 慢 NLU 也必须能及时结束等待：同步模型客户端不能被强杀，但 HTTP
+    # 请求应在 Event 置位后返回；后台线程完成后只清理登记，不再进入工具路由。
+    slow_rid = "test-slow-nlu-0001"
+    slow_event = agent_api._register_request(slow_rid)
+    assert slow_event is not None
+
+    class SlowParser:
+        def parse(self, message, context=None):
+            time.sleep(0.5)
+            return parser._fallback(message, context)
+
+    timer = threading.Timer(0.1, slow_event.set)
+    timer.start()
+    loop = asyncio.new_event_loop()
+    try:
+        t0 = time.monotonic()
+        early = loop.run_until_complete(agent_api._run_nlu_cancellable(
+            SlowParser(), "查看系统状态", {}, slow_event, slow_rid))
+        elapsed = time.monotonic() - t0
+        assert early is None and elapsed < 0.35, (early, elapsed)
+        deadline = time.time() + 2
+        while not agent_api._requests[slow_rid]["done"] and time.time() < deadline:
+            loop.run_until_complete(asyncio.sleep(0.05))
+        assert agent_api._requests[slow_rid]["done"], agent_api._requests[slow_rid]
+    finally:
+        loop.close()
+        agent_api._requests.pop(slow_rid, None)
+    ok("慢 NLU 取消：HTTP 等待及时退出，后台完成后不再执行工具")
 
     # 真实在飞请求：工具创建 task 后阻塞在 Event.wait；/cancel 应立即唤醒并
     # 把尚未领取的设备任务标成 failed，HTTP 最终返回 cancelled 而不是等 3 s 超时。
