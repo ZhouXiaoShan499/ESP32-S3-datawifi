@@ -39,6 +39,10 @@ POST /api/v1/agent/chat 或 /clarify
 pip install -r server/requirements-agent.txt
 ```
 
+完全不使用 API Key 时运行 `server\start_local_nokey.bat`；它把
+`AGENT_NLU_MODE` 固定为 `keyword`，不会调用任何模型端点。麦克风
+`not-allowed` 的排查步骤见 `docs/local_no_key_voice.md`。
+
 ## 2. 交互状态
 
 | 状态 | 页面表现 | 可执行动作 |
@@ -84,10 +88,10 @@ python server/e2e_ui_check.py
 
 当前验证结果：
 
-- `test_agent.py`：23 项断言通过，含安全意图回退、异常输入、多轮上下文、慢 NLU
+- `test_agent.py`：24 项断言通过，含强制 keyword 模式、安全意图回退、异常输入、多轮上下文、慢 NLU
   取消、真实在飞采集请求取消与设备任务取消落库。
 - `test_receive.py`、`test_photos.py`、`test_events.py`：全部通过。
-- `e2e_ui_check.py`：109 项 UI 断言通过；除静态控件外，`?autovoice=1` 实际执行一次
+- `e2e_ui_check.py`：110 项 UI 断言通过；除静态控件外，`?autovoice=1` 实际执行一次
   “文字输入 → Agent → 解析模式/结果气泡/耗时日志”链路。
 - 无头 Edge 截图检查：1440×1200 下语音助手分区布局完整，无横向溢出。
 

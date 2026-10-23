@@ -57,6 +57,7 @@ sys.path.insert(0, _HERE)
 from fastapi.testclient import TestClient        # noqa: E402
 import main                                       # noqa: E402
 import agent.api as agent_api                     # noqa: E402
+import agent.config as agent_config               # noqa: E402
 import agent.nlu as nlu_mod                       # noqa: E402
 from agent.router import get_router               # noqa: E402
 from agent.tools.base import (                    # noqa: E402
@@ -106,6 +107,18 @@ def main_run():
     assert "api_key" not in agent_status, agent_status
     assert chat(client, "查看系统状态")["status"] == "success"
     ok("main.app 已挂载 AI Agent；status 如实报告关键词回退且不泄露密钥")
+
+    original_mode = agent_config.AGENT_NLU_MODE
+    agent_config.AGENT_NLU_MODE = "keyword"
+    keyword_parser = nlu_mod.NLUParser()
+    keyword_parser._ensure_client = lambda: (_ for _ in ()).throw(
+        AssertionError("keyword 模式不应尝试创建模型客户端"))
+    parsed_keyword = keyword_parser.parse("查看系统状态")
+    keyword_status = client.get("/api/v1/agent/status").json()
+    assert parsed_keyword["intent"] == "query_health", parsed_keyword
+    assert keyword_status["requested_mode"] == "keyword", keyword_status
+    agent_config.AGENT_NLU_MODE = original_mode
+    ok("AGENT_NLU_MODE=keyword：强制本地解析，不创建模型 API 客户端")
 
     # 2) LLM 不可达 → 关键词回退；逐条核对意图映射
     parser = nlu_mod.get_nlu_parser()

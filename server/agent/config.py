@@ -10,6 +10,9 @@ import os
 #   local = 完全断网（本地 Ollama）
 # ---------------------------------------------------------------------------
 AGENT_ENV = os.environ.get("AGENT_ENV", "dev").strip()
+AGENT_NLU_MODE = os.environ.get("AGENT_NLU_MODE", "auto").strip().lower()
+if AGENT_NLU_MODE not in ("auto", "keyword", "llm"):
+    AGENT_NLU_MODE = "auto"
 
 # ---------------------------------------------------------------------------
 # 模型配置（按环境分离）

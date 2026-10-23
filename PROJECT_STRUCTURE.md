@@ -49,6 +49,7 @@ data_capture_sim/                  # 仓库根目录
 │   ├── wifi_network_troubleshooting.md # WiFi 关联成功却拿不到 IP：DHCP 排查与静态兜底验证
 │   ├── static_ip_fallback_fix.md       # 静态 IP 兜底复盘：条件编译缺陷 + sdkconfig 回写陷阱
 │   ├── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
+│   ├── local_no_key_voice.md           # 无 API Key 使用流程与麦克风 not-allowed 排查
 │   ├── camera_bad_frame_fix_work_log.md # 相机坏帧/拍照失败治理：一轮基线 → 定位改写 → 修复 → 一轮验证
 │   └── camera_frame_truncation_fix_work_log.md # 直播/预览帧尾部截断（下半幅灰带/中段撕裂）：根因 → 修复 → 验证
 │
@@ -59,6 +60,7 @@ data_capture_sim/                  # 仓库根目录
     ├── https_proxy.py             # 浏览器 HTTPS → 本机 HTTP Uvicorn 代理
     ├── make_dev_https.ps1         # 本地 CA + 局域网 IP 开发证书
     ├── start_https_proxy.bat      # 启动浏览器 HTTPS 入口
+    ├── start_local_nokey.bat      # 强制本地关键词模式，不调用模型 API
     ├── test_receive.py            # 本地联调自测脚本（含按需采集任务全流程）
     ├── test_photos.py             # 拍照链路自测脚本（临时库 + 临时照片目录）
     ├── test_events.py             # 闭环事件自测脚本（临时库，23 项断言）
@@ -98,12 +100,13 @@ data_capture_sim/                  # 仓库根目录
 | `https_proxy.py` | 标准库实现的本地 HTTPS 反向代理：浏览器访问 8443，转发到 Uvicorn 的 HTTP 8000；板端上传协议不用改。 |
 | `make_dev_https.ps1` | 为 `localhost` 和指定局域网 IP 生成本地 CA、服务器证书与私钥；输出位于 gitignore 的 `server/certs/`。 |
 | `start_https_proxy.bat` | 默认将 `https://0.0.0.0:8443` 转发到 `http://127.0.0.1:8000`，端口可通过参数或环境变量覆盖。 |
+| `start_local_nokey.bat` | 设置 `AGENT_NLU_MODE=keyword` 后启动服务；不读取 Key、不发送模型请求。 |
 | `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败/控制任务 applied/暂停状态惰性归零），43 项断言。 |
 | `test_photos.py` | 拍照链路自测（临时库 + 临时照片目录）：JPEG 上传校验/落盘/取图/列表/404+410/删除/camera 任务收尾/幂等，16 项断言。 |
 | `test_events.py` | 闭环事件自测（临时库）：触发校验/板端重试幂等/状态机单向性（accept→ack、cancel→cancelled、confirm→completed）/终态不可回退/超 TTL 惰性过期/列表过滤与分页/设备侧鉴权/health 汇总，23 项断言。 |
-| `test_agent.py` | AI Agent 自测（临时库、不联网）：安全意图回退/设备白名单/防幻觉/澄清闭环/多轮上下文/慢 NLU 与在飞任务 `request_id` 取消/异常输入，23 项断言。 |
+| `test_agent.py` | AI Agent 自测（临时库、不联网）：安全意图回退/强制 keyword 模式/设备白名单/防幻觉/澄清闭环/多轮上下文/慢 NLU 与在飞任务 `request_id` 取消/异常输入，24 项断言。 |
 | `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等，pause/resume 的 `/applied` 收尾与 `/devices` 暂停标注，以及闭环事件「触发 → 幂等重试 → 轮询 → 回应 → 确认完成 → 终态不可回退」9 项），23 项断言。 |
-| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（15 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图、任务与历史、控制与事件闭环，以及**语音分区的文字→Agent→结果/耗时链路、解析模式、录音/停止/播报入口和 request_id 时序**），109 项断言；未装浏览器时打印 SKIP。 |
+| `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（15 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图、任务与历史、控制与事件闭环，以及**语音分区的文字→Agent→结果/耗时链路、解析模式、麦克风权限、录音/停止/播报入口和 request_id 时序**），110 项断言；未装浏览器时打印 SKIP。 |
 | `e2e_live_check.py` | 摄像头直播自检（临时库 + 真实 uvicorn，`SENSOR_LIVE_TIMEOUT_S=1`）：推帧 201/单调 `seq`、状态 `active/尺寸/帧龄`、`/live/frame` 原样取回、只保留最新一帧、错误路径（400/413/404）、**不落盘不入库**（`photos` 总数 0 + 照片目录为空）、超时后 `active=false` 但仍可取最后一帧；有 Edge/Chrome 时再 dump 两次 DOM，断言实时卡片 `<img>`、「推流中 · 640×480」徽章与超时后的「已停止（保留最后一帧）」，28 项断言。 |
 | `e2e_device_check.py` | 真机（上板）脚本化验收：起真实服务（默认 `0.0.0.0:8000`），等板端周期上报出现后跑「建任务 → 领取 → ack → 采集窗口内周期上报为 0 → completed + upload_id → 周期恢复 → 历史可见」+「暂停周期（板端 applied → device_control 停止中 → 观察窗内 0 新周期批次 → 暂停中手动采集仍可用）→ 恢复周期」28 项断言；板端不在场时打印 `[SKIP]` 并以 0 退出。 |
 | `static/index.html` | 监控页面结构（顶部常驻设备下拉 + 仅刷新、**7 个功能分区按钮（实时数据 / 历史记录 / 语音助手 / 采集任务 / 周期控制 / 摄像头 / 事件闭环）**、采集参数表单、暂停时长 + 暂停周期/恢复周期按钮、数据卡片、样本表、波形画布、历史记录批次表 + 单批详情、**语音输入/录音/停止/播报控件 + 澄清选项 + request_id 时序**、任务卡片、周期控制卡片、手动/周期对照表、任务历史表、摄像头实时画面、拍照画廊、三维视图画布）。 |

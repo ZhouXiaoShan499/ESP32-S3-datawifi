@@ -47,6 +47,9 @@ class NLUParser:
     def parse(self, user_input: str,
               context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         from .prompt import build_system_prompt, build_user_message
+        from .config import AGENT_NLU_MODE
+        if AGENT_NLU_MODE == "keyword":
+            return self._fallback(user_input, context)
         # 客户端不可用（未装 openai 库 / key 为空 / base_url 配错）也算「LLM 不可达」，
         # 必须走本地关键词回退，而不是把 500 抛给调用方。
         try:
@@ -193,11 +196,14 @@ def get_nlu_parser() -> NLUParser:
 
 def get_nlu_status() -> Dict[str, Any]:
     """返回不包含密钥的运行配置，供页面明确显示真实 LLM / 关键词回退。"""
-    from .config import AGENT_ENV, get_agent_config
+    from .config import AGENT_ENV, AGENT_NLU_MODE, get_agent_config
     cfg = get_agent_config()
     has_key = bool(str(cfg.get("api_key") or "").strip())
-    configured = bool(_HAS_OPENAI and has_key and cfg.get("model"))
-    if not _HAS_OPENAI:
+    configured = bool(
+        AGENT_NLU_MODE != "keyword" and _HAS_OPENAI and has_key and cfg.get("model"))
+    if AGENT_NLU_MODE == "keyword":
+        fallback_reason = "AGENT_NLU_MODE=keyword（主动禁用模型调用）"
+    elif not _HAS_OPENAI:
         fallback_reason = "openai 包未安装"
     elif not has_key:
         fallback_reason = "未配置模型 API Key"
@@ -205,6 +211,7 @@ def get_nlu_status() -> Dict[str, Any]:
         fallback_reason = ""
     return {
         "agent_env": AGENT_ENV if AGENT_ENV in ("dev", "prod", "local") else "dev",
+        "requested_mode": AGENT_NLU_MODE,
         "mode": "llm" if configured else "keyword_fallback",
         "provider": ("ollama" if AGENT_ENV == "local"
                      else "openai-compatible"),

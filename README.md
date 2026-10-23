@@ -45,6 +45,7 @@ data_capture_sim/
 │   ├── https_proxy.py          # 浏览器 HTTPS → 本机 Uvicorn HTTP 代理
 │   ├── make_dev_https.ps1      # 生成本地开发 CA/证书
 │   ├── start_https_proxy.bat   # 启动 8443 HTTPS 代理
+│   ├── start_local_nokey.bat   # 强制关键词模式，不调用模型 API
 │   ├── agent/                  # AI Agent：自然语言 → 意图 → 受限工具
 │   │   ├── api.py              # /api/v1/agent/chat · /clarify · /cancel
 │   │   ├── nlu.py              # LLM 解析 + 本地关键词回退
@@ -102,6 +103,12 @@ AI Agent：一句中文 ──▶ 意图 ──▶ 受限工具（复用上面�
 cd server
 pip install -r requirements.txt   # 首次
 python main.py                    # 监听 http://0.0.0.0:8000
+```
+
+不需要任何模型 API Key 时，可直接使用本地关键词模式：
+
+```powershell
+server\start_local_nokey.bat
 ```
 
 记下电脑的局域网 IP：Windows 用 `ipconfig`，找 IPv4 地址（如 `192.168.1.100`）。
@@ -282,6 +289,7 @@ pip install -r server/requirements-agent.txt   # 可选依赖，不进 CI
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `AGENT_ENV` | `dev` | `dev` 开发模型 / `prod` 低温度稳定 / `local` 走 Ollama |
+| `AGENT_NLU_MODE` | `auto` | `keyword` 强制完全本地、不调用模型 API；`auto` 无 Key 时自动回退；`llm` 使用已配置模型 |
 | `OPENAI_API_KEY`（dev）· `AGENT_API_KEY`（prod） | 空 | 留空 ⇒ 回退关键词解析 |
 | `AGENT_DEV_MODEL` / `AGENT_PROD_MODEL` / `AGENT_LOCAL_MODEL` | `gpt-4o-mini` / `gpt-4o-mini` / `qwen2.5:7b` | 模型名 |
 | `AGENT_DEV_BASE_URL` / `AGENT_PROD_BASE_URL` / `AGENT_LOCAL_BASE_URL` | OpenAI 官方 / OpenAI 官方 / `http://localhost:11434/v1` | OpenAI 兼容端点 |
@@ -298,6 +306,9 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 自测 `python server/test_agent.py` **不需要 `openai`、不联网**（内部强制走关键词回退分支）。
 页面右侧「语言解析」会显示当前实际模式；只有 `LLM · 模型名` 才表示真实语言模型已配置，
 `关键词回退` 表示当前没有启用语言模型。状态接口不会暴露 API Key。
+
+无 Key 使用、录音步骤及 `not-allowed` 麦克风权限排查见
+[`docs/local_no_key_voice.md`](docs/local_no_key_voice.md)。
 
 ---
 
@@ -323,7 +334,7 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 python server/test_receive.py      # 单元自测（校验/入库/查询/任务全流程）
 python server/test_photos.py       # 拍照链路自测
 python server/test_events.py       # 闭环事件自测（23 项）
-python server/test_agent.py        # AI Agent 自测（23 项；不需要 openai、不联网）
+python server/test_agent.py        # AI Agent 自测（24 项；不需要 openai、不联网）
 python server/e2e_server_check.py  # 真实 HTTP 端到端自检
 python server/e2e_ui_check.py      # 界面自检（可选；无浏览器则 SKIP）
 python server/e2e_device_check.py  # 真机验收（可选；无板则 SKIP）
@@ -343,4 +354,5 @@ python server/e2e_live_check.py    # 直播自检
 - **闭环事件** → `docs/loop_trigger_callback.md`
 - **AI Agent（需求 · 修复 · 验证记录）** → `docs/ai_agent_work_log.md`
 - **语音任务助手（入口 · 状态 · 取消 · 验收）** → `docs/voice_assistant_ui.md`
+- **无 API Key 语音流程与麦克风权限排查** → `docs/local_no_key_voice.md`
 - **崩溃修复、上传修复等工作记录** → `docs/`

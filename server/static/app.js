@@ -167,6 +167,7 @@ const $ = {
   voiceTaskRid: el('voiceTaskRid'),
   voiceLatency: el('voiceLatency'),
   voiceRecognizer: el('voiceRecognizer'),
+  voiceMicPermission: el('voiceMicPermission'),
   voiceNluState: el('voiceNluState'),
   voiceSpeechState: el('voiceSpeechState'),
   voiceAutoSpeak: el('voiceAutoSpeak'),
@@ -2530,6 +2531,34 @@ async function refreshAgentStatus() {
   }
 }
 
+async function refreshMicPermission() {
+  if (!$.voiceMicPermission) return;
+  const set = (text, title) => {
+    $.voiceMicPermission.textContent = text;
+    $.voiceMicPermission.title = title || text;
+  };
+  if (!navigator.permissions || !navigator.permissions.query) {
+    set('由浏览器询问', '当前浏览器不支持 Permissions API，录音时会直接请求权限');
+    return;
+  }
+  try {
+    const result = await navigator.permissions.query({ name: 'microphone' });
+    const labels = {
+      granted: '已允许',
+      prompt: '未选择',
+      denied: '已拒绝',
+    };
+    set(labels[result.state] || result.state,
+        '麦克风权限状态：' + result.state + '；页面来源：' + window.location.origin);
+    result.onchange = () => {
+      set(labels[result.state] || result.state,
+          '麦克风权限状态：' + result.state + '；页面来源：' + window.location.origin);
+    };
+  } catch (e) {
+    set('由浏览器询问', '无法读取麦克风权限；录音时会请求。' + e.message);
+  }
+}
+
 function voicePersistSession() {
   try {
     if (VOICE.sessionId) {
@@ -2641,6 +2670,7 @@ function voiceStartRecognition() {
   rec.onstart = () => {
     if (token !== VOICE.recognitionToken) return;
     VOICE.listening = true;
+    if ($.voiceMicPermission) $.voiceMicPermission.textContent = '已允许';
     voiceSetStage('录音 / 识别中', 'warn',
                   '正在使用浏览器麦克风录音并识别，再点一次按钮可停止。');
     voiceLog('录音开始', '音频源=浏览器麦克风；识别=Web Speech API',
@@ -2677,8 +2707,11 @@ function voiceStartRecognition() {
     if (token !== VOICE.recognitionToken) return;
     VOICE.listening = false;
     VOICE.recognitionError = event.error || 'unknown';
+    if (event.error === 'not-allowed' && $.voiceMicPermission) {
+      $.voiceMicPermission.textContent = '已拒绝';
+    }
     const message = event.error === 'not-allowed'
-      ? '麦克风权限被拒绝，请在浏览器地址栏允许麦克风后重试。'
+      ? '麦克风权限被拒绝（not-allowed）。请点地址栏左侧站点图标 → 网站权限 → 麦克风 → 允许；再到 Windows“隐私和安全性 → 麦克风”允许浏览器访问，修改后刷新页面。'
       : '语音识别失败（' + (event.error || 'unknown') + '），可改用文字输入。';
     voiceSetStage('识别异常', 'err', message);
     voiceLog('识别异常', event.error || 'unknown', VOICE.captureRequestId);
@@ -2986,7 +3019,8 @@ function initVoiceAssistant() {
       '。首次录音时浏览器会请求麦克风权限。' +
       (window.isSecureContext
         ? ' 当前页面满足安全上下文要求。'
-        : ' 当前页面不是安全上下文；请使用 localhost 或 HTTPS。');
+        : ' 当前页面不是安全上下文；请使用 localhost 或 HTTPS。') +
+      ' 当前来源：' + window.location.origin + '。';
   }
   if (!ttsSupported && $.voiceAutoSpeak) $.voiceAutoSpeak.checked = false;
 
@@ -3024,6 +3058,7 @@ function initVoiceAssistant() {
   voiceRenderLog();
   voiceSetStage('空闲', 'off', '可以输入文字，或点击“开始录音”');
   void refreshAgentStatus();
+  void refreshMicPermission();
 }
 
 initVoiceAssistant();
@@ -3078,6 +3113,7 @@ function refreshTab(id) {
     refreshHistory();          // 采集历史列表（新批次 / 换设备 / 换过滤条件）
   } else if (id === 'voice') {
     void refreshAgentStatus();
+    void refreshMicPermission();
     voiceRefreshButtons();     // 输入框、录音、停止按钮按当前状态重新启用
   } else if (id === 'task') {
     refreshLatestTask();       // 任务卡片 + 任务历史表（同一次 /api/v1/tasks 请求）

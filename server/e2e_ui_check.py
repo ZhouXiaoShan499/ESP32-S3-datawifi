@@ -631,6 +631,9 @@ def main_run():
     check("voice assistant states its audio source and runtime",
           "当前浏览器麦克风" in dom14 and "Web Speech API" in dom14,
           field(dom14, "voiceSupport"))
+    mic_permission = field(dom14, "voiceMicPermission")
+    check("voice assistant surfaces microphone permission state",
+          bool(mic_permission) and mic_permission != "检测中…", mic_permission)
     check("voice assistant renders request-correlated timeline",
           "request_id" in dom14 and 'id="voiceLogBody"' in dom14,
           field(dom14, "voiceLogInfo"))
