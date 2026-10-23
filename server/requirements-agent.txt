@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# 真实 LLM 可选依赖。安装后仍需配置 AGENT_ENV、模型端点和凭据；
+# 不安装时服务自动使用本地安全关键词解析。
+openai>=1.0

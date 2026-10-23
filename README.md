@@ -41,6 +41,10 @@ data_capture_sim/
 ├── server/                     # 服务端（PC，Python/FastAPI）
 │   ├── main.py                 # FastAPI 服务
 │   ├── requirements.txt
+│   ├── requirements-agent.txt  # 可选真实 LLM 依赖（OpenAI 兼容协议）
+│   ├── https_proxy.py          # 浏览器 HTTPS → 本机 Uvicorn HTTP 代理
+│   ├── make_dev_https.ps1      # 生成本地开发 CA/证书
+│   ├── start_https_proxy.bat   # 启动 8443 HTTPS 代理
 │   ├── agent/                  # AI Agent：自然语言 → 意图 → 受限工具
 │   │   ├── api.py              # /api/v1/agent/chat · /clarify · /cancel
 │   │   ├── nlu.py              # LLM 解析 + 本地关键词回退
@@ -126,6 +130,26 @@ idf.py -p COMx flash monitor     # COMx = 实际串口
 
 > Windows 防火墙可能会拦截 `8000/TCP`，放行「专用网络」即可。
 
+### 本机 HTTPS 语音入口（没有 VPS 时使用）
+
+板端继续访问明文 `http://<电脑IP>:8000/api/v1/upload`；如果从另一台电脑或手机
+打开 Web 页面并使用麦克风，再启动一个只面向浏览器的 HTTPS 代理：
+
+```powershell
+# 1. 首次生成本地 CA 和带局域网 IP 的服务器证书
+powershell -ExecutionPolicy Bypass -File server\make_dev_https.ps1 -LanIp 192.168.1.100
+
+# 2. 后端仍按原方式启动：http://0.0.0.0:8000
+python server/main.py
+
+# 3. 另一个终端启动 HTTPS 代理：https://<电脑IP>:8443
+server\start_https_proxy.bat
+```
+
+将 `server/certs/dev-ca-cert.pem` 安装为受控客户端设备的受信任根证书，再打开
+`https://<电脑IP>:8443/ui/`。本机访问 `http://127.0.0.1:8000/ui/` 本身是安全上下文，
+无需代理。代理不改变板端协议，也不要求 VPS。
+
 ---
 
 ## 四、板端操作
@@ -204,6 +228,7 @@ stand,1767123456789,0.02,-0.15,9.81
 | `POST` | `/api/v1/agent/chat` | AI Agent：一句中文 → 意图 → 受限工具 |
 | `POST` | `/api/v1/agent/clarify` | 回答 AI 的反问（选完候选意图继续执行） |
 | `POST` | `/api/v1/agent/cancel` | 按 Agent `request_id` 取消仍在等待设备回执的请求 |
+| `GET` | `/api/v1/agent/status` | 当前解析引擎：真实 LLM 或关键词回退、模型名与回退原因，不返回密钥 |
 | `GET` | `/ui/` | 监控面板 |
 
 > 完整接口文档（含闭环事件、直播推流、控制状态等）见 `PROJECT_STRUCTURE.md`。
@@ -249,7 +274,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/agent/chat \
 不装也能用（走关键词回退）；要让它真正「听懂」自然语言：
 
 ```bash
-pip install openai          # 可选依赖，不进 CI
+pip install -r server/requirements-agent.txt   # 可选依赖，不进 CI
 # 默认 AGENT_ENV=dev，读 OPENAI_API_KEY
 # 本地 Ollama 离线：AGENT_ENV=local（默认 qwen2.5:7b @ localhost:11434/v1）
 ```
@@ -271,6 +296,8 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 `/api/v1/agent/cancel` 通知服务端；页面用单调递增 generation 丢弃迟到结果。
 
 自测 `python server/test_agent.py` **不需要 `openai`、不联网**（内部强制走关键词回退分支）。
+页面右侧「语言解析」会显示当前实际模式；只有 `LLM · 模型名` 才表示真实语言模型已配置，
+`关键词回退` 表示当前没有启用语言模型。状态接口不会暴露 API Key。
 
 ---
 

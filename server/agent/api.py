@@ -188,6 +188,14 @@ def _remember_context(session: Dict[str, Any], message: str, intent: str,
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
+@router.get("/status")
+async def agent_status():
+    """AI 解析引擎状态：只暴露模式与模型名，不返回 API Key。"""
+    from .nlu import get_nlu_status
+    data = get_nlu_status()
+    return JSONResponse({"ok": True, **data})
+
+
 @router.post("/chat")
 async def agent_chat(request: Request):
     """接收用户消息，返回结果或追问。"""

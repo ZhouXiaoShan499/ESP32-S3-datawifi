@@ -648,6 +648,9 @@ def main_run():
           "本地反馈" in field(dom15, "voiceLatency")
           and "Agent 完成" in field(dom15, "voiceLatency"),
           field(dom15, "voiceLatency"))
+    nlu_mode = field(dom15, "voiceNluState")
+    check("voice assistant shows the actual language-parser mode",
+          "LLM" in nlu_mode or "关键词回退" in nlu_mode, nlu_mode)
 
     print("\nALL %d UI E2E CHECKS PASSED" % len(PASSED))
 

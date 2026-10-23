@@ -59,6 +59,7 @@ tmp*idf*
 # ---- Web/server runtime artifacts ----
 server/data/
 server/photos/
+server/certs/
 server/__pycache__/
 __pycache__/
 *.db

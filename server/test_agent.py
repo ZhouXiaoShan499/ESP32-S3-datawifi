@@ -98,8 +98,14 @@ def main_run():
     # 1) 路由确实挂在 app 上（没挂上时下面的请求会是 404，而不是 200）
     assert "/api/v1/agent/chat" in getattr(main, "_AGENT_PATHS", []), \
         getattr(main, "_AGENT_PATHS", None)
+    st = client.get("/api/v1/agent/status")
+    agent_status = st.json()
+    assert st.status_code == 200, st.text
+    assert agent_status["mode"] == "keyword_fallback", agent_status
+    assert agent_status["openai_installed"] is False, agent_status
+    assert "api_key" not in agent_status, agent_status
     assert chat(client, "查看系统状态")["status"] == "success"
-    ok("main.app 已挂载 AI Agent 路由（/api/v1/agent/chat 可达）")
+    ok("main.app 已挂载 AI Agent；status 如实报告关键词回退且不泄露密钥")
 
     # 2) LLM 不可达 → 关键词回退；逐条核对意图映射
     parser = nlu_mod.get_nlu_parser()

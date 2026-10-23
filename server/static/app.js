@@ -167,6 +167,7 @@ const $ = {
   voiceTaskRid: el('voiceTaskRid'),
   voiceLatency: el('voiceLatency'),
   voiceRecognizer: el('voiceRecognizer'),
+  voiceNluState: el('voiceNluState'),
   voiceSpeechState: el('voiceSpeechState'),
   voiceAutoSpeak: el('voiceAutoSpeak'),
   voiceSpeakStopBtn: el('voiceSpeakStopBtn'),
@@ -2510,6 +2511,25 @@ function voiceLog(phase, detail, requestId) {
   voiceRenderLog();
 }
 
+async function refreshAgentStatus() {
+  if (!$.voiceNluState) return;
+  try {
+    const data = await apiGet('/api/v1/agent/status');
+    if (data.mode === 'llm') {
+      $.voiceNluState.textContent = 'LLM · ' + (data.model || data.provider);
+      $.voiceNluState.title =
+        '真实语言模型已配置：' + data.provider + ' / ' + data.api_base_url;
+    } else {
+      $.voiceNluState.textContent = '关键词回退';
+      $.voiceNluState.title = data.fallback_reason ||
+        '真实语言模型未配置，使用本地安全关键词解析';
+    }
+  } catch (e) {
+    $.voiceNluState.textContent = '状态读取失败';
+    $.voiceNluState.title = e.message;
+  }
+}
+
 function voicePersistSession() {
   try {
     if (VOICE.sessionId) {
@@ -3003,6 +3023,7 @@ function initVoiceAssistant() {
   });
   voiceRenderLog();
   voiceSetStage('空闲', 'off', '可以输入文字，或点击“开始录音”');
+  void refreshAgentStatus();
 }
 
 initVoiceAssistant();
@@ -3056,6 +3077,7 @@ function refreshTab(id) {
   } else if (id === 'history') {
     refreshHistory();          // 采集历史列表（新批次 / 换设备 / 换过滤条件）
   } else if (id === 'voice') {
+    void refreshAgentStatus();
     voiceRefreshButtons();     // 输入框、录音、停止按钮按当前状态重新启用
   } else if (id === 'task') {
     refreshLatestTask();       // 任务卡片 + 任务历史表（同一次 /api/v1/tasks 请求）

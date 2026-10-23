@@ -189,3 +189,29 @@ def get_nlu_parser() -> NLUParser:
     if _nlu_parser is None:
         _nlu_parser = NLUParser()
     return _nlu_parser
+
+
+def get_nlu_status() -> Dict[str, Any]:
+    """返回不包含密钥的运行配置，供页面明确显示真实 LLM / 关键词回退。"""
+    from .config import AGENT_ENV, get_agent_config
+    cfg = get_agent_config()
+    has_key = bool(str(cfg.get("api_key") or "").strip())
+    configured = bool(_HAS_OPENAI and has_key and cfg.get("model"))
+    if not _HAS_OPENAI:
+        fallback_reason = "openai 包未安装"
+    elif not has_key:
+        fallback_reason = "未配置模型 API Key"
+    else:
+        fallback_reason = ""
+    return {
+        "agent_env": AGENT_ENV if AGENT_ENV in ("dev", "prod", "local") else "dev",
+        "mode": "llm" if configured else "keyword_fallback",
+        "provider": ("ollama" if AGENT_ENV == "local"
+                     else "openai-compatible"),
+        "model": cfg.get("model") or "",
+        "api_base_url": cfg.get("api_base_url") or "",
+        "openai_installed": bool(_HAS_OPENAI),
+        "credential_configured": has_key,
+        "llm_configured": configured,
+        "fallback_reason": fallback_reason,
+    }
