@@ -400,12 +400,40 @@ round2 结论：**拍照回来了**（未做兜底时的 100% 失败 → 0 失�
 
 ---
 
-## 七、验证方法
+## 七、隐私保留（照片自动清理）
+
+脏数据与「忘了删」是照片功能最现实的隐私风险：`server/photos/` 会一直长大，
+而照片往往包含实验室/宿舍画面。因此服务端给 `photos` 加了一条**保留期**：
+
+| 项 | 默认 | 环境变量 | 行为 |
+|----|------|----------|------|
+| 保留天数 | 7 天 | `SENSOR_PHOTO_RETENTION_DAYS` | 超过则删除该照片的库行 + 磁盘 JPEG；`0` = 关闭自动清理 |
+| 设备保底 | 10 张 | `SENSOR_PHOTO_MIN_KEEP` | 每台设备**至少**保留最近 N 张，超期也不删（画廊不会被清空） |
+
+**触发点**（惰性清理，和 `tasks` / `events` 的超时判定同一套模式，不开后台线程）：
+
+| 路径 | 说明 |
+|------|------|
+| `GET /api/v1/photos` | 先清理再统计，`total` 不会把刚过期的照片算进去；响应带 `retention` |
+| `GET /api/v1/photos/{id}` | 刚过期的照片返回 404（而不是「元数据在、文件丢失」的 410） |
+| `GET /api/v1/health` | 汇总前清理一次，返回 `photo_retention`（策略 + 最近一次清理计数） |
+| `POST /api/v1/photos` | 板端每传一张就顺带清一次（没人打开页面也会清） |
+| `POST /api/v1/photos/cleanup` | 手动立刻清一次，返回 `deleted` / `files_deleted` / `cleanup` |
+
+**顺序**：先删库行并 `commit`，再删磁盘文件 —— 与 `DELETE /api/v1/photos/{id}` 一致。
+事务回滚时绝不能把仍在库里的照片文件删掉；文件删不掉只算磁盘垃圾，不让整次清理失败。
+
+**验收**：`python server/test_photos.py` 第 23 项把一批照片的 `received_at` 倒推到保留期之外，
+断言「最旧的 3 张连库行带文件一起消失、最近 10 张（含文件）仍在、health 暴露同一份策略」。
+
+---
+
+## 八、验证方法
 
 | 层 | 命令 | 覆盖内容 |
 |----|------|----------|
 | 固件编译 | `build_idf.bat`（写 `build_log.txt`，末尾 `BUILD_EXIT=0`） | 新驱动 + esp_video/相机代码可编译、可链接（无新增 warning） |
-| 服务端单元 | `python server/test_photos.py` | 参数校验、413、落盘、取图、列表/limit、404/410、camera 任务收尾、幂等、设备不匹配、capture 任务不能被照片收尾、删除、health/devices 统计、临时目录清理 |
+| 服务端单元 | `python server/test_photos.py` | 参数校验、413、落盘、取图、列表/limit、404/410、camera 任务收尾、幂等、设备不匹配、capture 任务不能被照片收尾、删除、health/devices 统计、**保留期自动清理（库行+文件）**、临时目录清理 |
 | 服务端回归 | `python server/test_receive.py` | 原有采集/任务/控制链路未被破坏（同一 `tasks` 表新增 `camera` 类型不改变既有行为） |
 | 真实 HTTP | `python server/e2e_server_check.py` | 真实 uvicorn 下的上传/任务/控制链路 |
 | 界面 | `python server/e2e_ui_check.py`（需本机 Edge/Chrome，无则 SKIP） | `/ui/?autophoto=1` 建 camera 任务 → 模拟板端领取并上传 JPEG → 任务详情带 photo、画廊渲染缩略图/尺寸/删除按钮、任务卡片显示照片 → DELETE 后画廊空态与计数归零 |
@@ -438,7 +466,7 @@ round2 结论：**拍照回来了**（未做兜底时的 100% 失败 → 0 失�
 
 ---
 
-## 八、已知限制与回滚
+## 九、已知限制与回滚
 
 **限制 / 未做**：
 

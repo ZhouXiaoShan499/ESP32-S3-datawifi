@@ -132,7 +132,7 @@ data_capture_sim/                  # 仓库根目录
 | `samples` | 每批内的每个采样点一行，记录 `ax/ay/az` 三轴加速度与相对时间偏移。 |
 | `tasks` | 任务：`request_id`（主键，uuid4 hex）、设备、来源、单位、采样率/样本数、**类型 `kind`（`capture`/`pause`/`resume`）与暂停时长 `duration_s`**、状态、各状态时间戳、`expires_at`、关联 `upload_id` 与失败原因。 |
 | `device_control` | 周期上报暂停状态（`device_id + source` 主键）：`periodic_paused`、`paused_until`、`request_id`、`updated_at`——「是否真的暂停」的真相源，由板端 `POST /tasks/{id}/applied` 写入。 |
-| `photos` | 照片数据（`id` 主键、`device_id`、`request_id`、`ts_ms`、`received_at`、`bytes`、`width`、`height`、`ip`、`path`、`note`）：图片字节不入库，文件落在 `server/photos/<device_id>/<id>.jpg`。 |
+| `photos` | 照片数据（`id` 主键、`device_id`、`request_id`、`ts_ms`、`received_at`、`bytes`、`width`、`height`、`ip`、`path`、`note`）：图片字节不入库，文件落在 `server/photos/<device_id>/<id>.jpg`。**隐私保留**：超过 `SENSOR_PHOTO_RETENTION_DAYS`（默认 7 天）的行与文件会被惰性删除，但每台设备至少保留最近 `SENSOR_PHOTO_MIN_KEEP`（默认 10）张。 |
 | `events` | 闭环事件（板端按键发起）：`request_id` 主键（**由板端生成**）、`device_id`、`source`、`kind`、`status`（`pending`/`ack`/`cancelled`/`completed`/`expired`）、`created_at`、`device_ts_ms`、`responded_at`/`response`/`responded_by`、`closed_at`、`expires_at`、`ip`、`note`。与 `tasks` **刻意分表**：`tasks` 的语义是「服务端派发、板端执行」，事件塞进去会被 `/tasks/next` 领回来形成回环。 |
 | `voice_notes` | 板端语音记录：`request_id`（唯一，板端生成，重试幂等）、`device_id`、`source`（`device`/`upload`）、采样率/时长/字节数、识别文字 `text`、`status`（`ok`/`no_speech`/`asr_unavailable`/…）、`engine`、`error`、`audio_path`（相对 `server/data/voice/`）、`ip`、`created_at`。音频字节不入库，文件按 `<request_id>.wav` 落盘。 |
 
@@ -143,7 +143,7 @@ data_capture_sim/                  # 仓库根目录
   `idx_tasks_device_kind`（支撑 `device+source+kind` 去重）。
 - **幂等**：带 `request_id` 的上传先查 `uploads.request_id`，命中即返回 `200 + idempotent=true`
   且不写任何新行；`tasks` 的收尾与 `uploads/samples` 写入在同一事务内提交。
-- **惰性超时 / 惰性归零**：`_expire_stale_tasks()` 在创建/查询/领取路径调用，把 `expires_at`
+- **惰性超时 / 惰性归零 / 惰性清理**：`_expire_stale_tasks()` 在创建/查询/领取路径调用，把 `expires_at`
   已过的非终态任务置 `timeout`；`_lazy_reset_control()` 在读控制状态的路径调用，把
   `paused_until` 已过的行置回未暂停。两者都不需要后台线程，服务重启后状态自洽。
 
@@ -177,6 +177,7 @@ data_capture_sim/                  # 仓库根目录
 | `GET` | `/api/v1/photos?device_id=…&limit=12` | 照片列表（新的在前，`limit` 1–200），供页面画廊渲染缩略图与删除按钮。 |
 | `GET` | `/api/v1/photos/{id}` | 取一张照片的 JPEG 字节（画廊 `<img src>` 用它）；不存在 404，元数据在而文件丢失 410。 |
 | `DELETE` | `/api/v1/photos/{id}` | 删除一张照片（先删库行再删文件，返回 `file_deleted`）；重复删除 404。 |
+| `POST` | `/api/v1/photos/cleanup` | 手动触发一次**隐私保留清理**：删掉超过 `SENSOR_PHOTO_RETENTION_DAYS` 天的照片（库行 + 磁盘 JPEG），但每台设备至少保留最近 `SENSOR_PHOTO_MIN_KEEP` 张；列表 / 取图 / health / 上传成功时本来就会惰性清理一次。 |
 | `POST` | `/api/v1/live?device_id=…&ts_ms=…&w=…&h=…` | 板端直播推一帧 JPEG（body 即图片字节）：校验 `device_id` / SOI 魔数 / 512 KiB 上限，**只写内存**（不落盘、不入库、不建任务），成功 201 + 全局单调 `seq`。 |
 | `GET` | `/api/v1/live?device_id=…` | 直播状态：`active`（超过 `SENSOR_LIVE_TIMEOUT_S`，默认 5 s 无新帧即 false）/ `seq` / `age_ms` / 分辨率 / 字节数 / 时间戳 / `devices[]`；从未推流的设备返回 200 + `active=false`。 |
 | `GET` | `/api/v1/live/frame?device_id=…` | 最新一帧 JPEG（页面 `<img src>` 用它；`Cache-Control: no-store`）；从未推流 404。 |

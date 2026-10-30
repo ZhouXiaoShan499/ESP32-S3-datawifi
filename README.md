@@ -256,6 +256,7 @@ stand,1767123456789,0.02,-0.15,9.81
 | `POST` | `/api/v1/photos` | 板端上传照片（body = JPEG 字节） |
 | `GET` | `/api/v1/photos/{id}` | 取照片 |
 | `DELETE` | `/api/v1/photos/{id}` | 删除照片（库 + 文件同时删） |
+| `POST` | `/api/v1/photos/cleanup` | 手动触发一次照片保留期清理（**隐私**：超期照片连库行带 JPEG 一并删除） |
 | `POST` | `/api/v1/agent/chat` | AI Agent：一句中文 → 意图 → 受限工具 |
 | `POST` | `/api/v1/agent/clarify` | 回答 AI 的反问（选完候选意图继续执行） |
 | `POST` | `/api/v1/agent/cancel` | 按 Agent `request_id` 取消仍在等待设备回执的请求 |
@@ -263,6 +264,10 @@ stand,1767123456789,0.02,-0.15,9.81
 | `GET` | `/ui/` | 监控面板 |
 
 > 完整接口文档（含闭环事件、直播推流、控制状态等）见 `PROJECT_STRUCTURE.md`。
+>
+> **照片隐私保留**：照片默认只保留 7 天（`SENSOR_PHOTO_RETENTION_DAYS`，设 `0` 关闭），
+> 且每台设备至少保留最近 10 张（`SENSOR_PHOTO_MIN_KEEP`）；超期照片在列表 / 取图 /
+> health / 上传成功时惰性清理，库行与磁盘 JPEG 一起删除，`POST /api/v1/photos/cleanup` 可立刻清一次。
 
 ---
 
@@ -349,6 +354,8 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 | `SENSOR_DB` | `server/data/upload.db` | SQLite 路径 |
 | `SENSOR_TOKEN` | 空（不鉴权） | 可选上传鉴权 |
 | `SENSOR_PHOTO_DIR` | `server/photos` | 照片目录 |
+| `SENSOR_PHOTO_RETENTION_DAYS` | `7` | 照片保留天数（**隐私**：超期自动删除；`0` = 关闭自动清理） |
+| `SENSOR_PHOTO_MIN_KEEP` | `10` | 每台设备至少保留的最近照片张数（即使全部超期也不删） |
 | `SENSOR_VOICE_DIR` | `server/data/voice` | 板端语音音频目录（`<request_id>.wav`） |
 | `VOICE_MODEL_DIR` | `server/models/vosk-model-small-cn-0.22` | 离线识别模型目录，换模型时指这里 |
 
