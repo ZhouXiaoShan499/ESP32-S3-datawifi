@@ -350,6 +350,31 @@
   </div>
 </section>
 
+<section class="card" id="boardVoiceCard">
+  <h2>板端麦克风 · ESP32-S3-EYE<span id="boardVoiceBadge" class="badge off">未就绪</span>
+      <span id="boardVoiceHint" class="poll-hint">正在读取识别引擎状态…</span></h2>
+  <div class="grid">
+    <div class="kv"><span class="k">识别引擎</span><span class="v" id="boardVoiceEngine">检测中…</span></div>
+    <div class="kv"><span class="k">最近 request_id</span><span class="v" id="boardVoiceRid">—</span></div>
+    <div class="kv"><span class="k">最近识别文字</span><span class="v" id="boardVoiceText">—</span></div>
+    <div class="kv"><span class="k">音频时长 / 采样率</span><span class="v" id="boardVoiceMeta">—</span></div>
+    <div class="kv"><span class="k">最近录音</span><span class="v" id="boardVoiceAudio">—</span></div>
+  </div>
+  <div class="photo-controls" style="margin-top:10px">
+    <button id="boardVoiceRefresh" type="button">刷新识别状态</button>
+    <label class="hint">上传 WAV 自测：<input type="file" id="boardVoiceFile"
+           accept=".wav,audio/wav,audio/*"></label>
+    <label><input type="checkbox" id="boardVoiceAutoSend" checked> 识别后自动发送任务</label>
+    <span id="boardVoiceStatusLine" class="hint"></span>
+  </div>
+  <p class="hint">
+    板端按 <code>BOOT</code> 键（GPIO0）录 5 秒 → <code>POST /api/v1/voice</code> →
+    电脑本地离线识别（Vosk，无 Key）→ 文字自动填进上方输入框；勾选“自动发送”时直接执行。
+    识别引擎没装好也能用：音频照常保存到 <code>server/data/voice/</code>，这里会显示缺什么。
+    没有板子时可先用「上传 WAV 自测」验证整条链路。
+  </p>
+</section>
+
 <section class="card">
   <h2>语言交互时序<span id="voiceLogInfo" class="poll-hint"></span></h2>
   <table>

@@ -176,6 +176,18 @@ const $ = {
   voiceSupport: el('voiceSupport'),
   voiceLogInfo: el('voiceLogInfo'),
   voiceLogBody: el('voiceLogBody'),
+  // 板端麦克风（ESP32-S3-EYE → 服务端离线识别）
+  boardVoiceBadge: el('boardVoiceBadge'),
+  boardVoiceHint: el('boardVoiceHint'),
+  boardVoiceEngine: el('boardVoiceEngine'),
+  boardVoiceRid: el('boardVoiceRid'),
+  boardVoiceText: el('boardVoiceText'),
+  boardVoiceMeta: el('boardVoiceMeta'),
+  boardVoiceAudio: el('boardVoiceAudio'),
+  boardVoiceFile: el('boardVoiceFile'),
+  boardVoiceAutoSend: el('boardVoiceAutoSend'),
+  boardVoiceRefresh: el('boardVoiceRefresh'),
+  boardVoiceStatusLine: el('boardVoiceStatusLine'),
 };
 
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '',
@@ -3154,6 +3166,235 @@ function initVoiceAssistant() {
 initVoiceAssistant();
 
 /* ------------------------------------------------------------------ *
+ *  板端麦克风（ESP32-S3-EYE → 服务端离线识别）
+ *
+ *  与上面的浏览器录音是两条独立入口，最终汇到同一个 voiceSubmit()：
+ *    板端 BOOT 键录音 → POST /api/v1/voice → 服务端 Vosk 识别
+ *    → 本页轮询 GET /api/v1/voice/latest?after_id= → 填输入框（可选自动发送）
+ *
+ *  游标 last_id 存 sessionStorage：刷新页面不会把旧语音重新执行一遍；
+ *  服务端库被重置（id 变小）时自动把游标拉回最新，不会永久卡死。
+ * ------------------------------------------------------------------ */
+const BOARD_VOICE_POLL_MS = 1500;
+const BOARD_VOICE_LAST_KEY = 'imu_board_voice_last_id';
+
+const BOARD_VOICE = {
+  lastId: 0,
+  primed: false,
+  polling: false,
+  timer: null,
+};
+
+try {
+  BOARD_VOICE.lastId = Number(
+    window.sessionStorage.getItem(BOARD_VOICE_LAST_KEY) || 0) || 0;
+} catch (e) {
+  BOARD_VOICE.lastId = 0;
+}
+
+function boardVoiceSetLine(text) {
+  if ($.boardVoiceStatusLine) $.boardVoiceStatusLine.textContent = text || '';
+}
+
+function boardVoiceSaveCursor() {
+  try {
+    window.sessionStorage.setItem(BOARD_VOICE_LAST_KEY, String(BOARD_VOICE.lastId));
+  } catch (e) { /* 隐私模式忽略 */ }
+}
+
+/** 把一条板端识别记录渲染到卡片（不触发任务） */
+function boardVoiceRenderNote(note) {
+  if (!note) return;
+  if ($.boardVoiceRid) {
+    $.boardVoiceRid.textContent = shortRid(note.request_id);
+    $.boardVoiceRid.title = note.request_id;
+  }
+  if ($.boardVoiceText) {
+    $.boardVoiceText.textContent = note.text || ('（' + (note.status || '—') + '）');
+    $.boardVoiceText.title = note.text || '';
+  }
+  if ($.boardVoiceMeta) {
+    const ms = (note.duration_ms === null || note.duration_ms === undefined)
+      ? '—' : (note.duration_ms + ' ms');
+    $.boardVoiceMeta.textContent = ms + ' · ' + (note.sample_rate || '—') + ' Hz · ' +
+      (note.source === 'upload' ? '网页上传' : '板端') +
+      (note.created ? ' · ' + note.created : '');
+  }
+  if ($.boardVoiceAudio) {
+    $.boardVoiceAudio.textContent = '';
+    if (note.audio_url) {
+      const a = document.createElement('a');
+      a.href = note.audio_url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = '▶ 回放';
+      $.boardVoiceAudio.appendChild(a);
+    } else {
+      $.boardVoiceAudio.textContent = '—';
+    }
+  }
+}
+
+/** 读取识别引擎状态（缺库/缺模型时这里给出可执行提示） */
+async function refreshBoardVoiceStatus() {
+  if (!$.boardVoiceBadge) return null;
+  try {
+    const data = await apiGet('/api/v1/voice/status');
+    const ready = !!data.ready;
+    $.boardVoiceBadge.className = 'badge ' + (ready ? 'ok' : 'warn');
+    $.boardVoiceBadge.textContent = ready ? '就绪' : '未就绪';
+    if ($.boardVoiceEngine) {
+      $.boardVoiceEngine.textContent =
+        (data.engine || 'none') +
+        (data.vosk_installed ? ' · vosk 已安装' : ' · 未安装 vosk') +
+        (data.model_present ? ' · 模型已就位' : ' · 缺中文模型');
+      $.boardVoiceEngine.title = data.model_dir || '';
+    }
+    if ($.boardVoiceHint) $.boardVoiceHint.textContent = data.detail || '';
+    if (data.last_note) {
+      boardVoiceRenderNote(data.last_note);
+      // 首次打开 / 服务端库被重建：把游标对齐到最新一条，不回放历史
+      if (!BOARD_VOICE.lastId || data.last_note.note_id < BOARD_VOICE.lastId) {
+        BOARD_VOICE.lastId = data.last_note.note_id;
+        boardVoiceSaveCursor();
+      }
+    }
+    return data;
+  } catch (e) {
+    $.boardVoiceBadge.className = 'badge err';
+    $.boardVoiceBadge.textContent = '不可用';
+    if ($.boardVoiceHint) $.boardVoiceHint.textContent = e.message;
+    return null;
+  }
+}
+
+/** 处理一条新记录：填入输入框；勾选自动发送且空闲时直接执行 */
+function boardVoiceHandleNote(note) {
+  boardVoiceRenderNote(note);
+  if (note.status === 'ok' && note.text) {
+    if ($.voiceInput) $.voiceInput.value = note.text;
+    voiceLog('板端识别', note.text, note.request_id);
+    boardVoiceSetLine('识别完成：' + note.text);
+    if ($.boardVoiceAutoSend && $.boardVoiceAutoSend.checked &&
+        !VOICE.busy && !VOICE.stopping && !VOICE.listening) {
+      voiceSubmit(note.text, { inputSource: '板端麦克风' });
+    } else if (VOICE.busy) {
+      voiceSetStage('板端识别完成', 'ok',
+        '识别文字已填入输入框；当前任务还在执行，完成后可手动发送。');
+      boardVoiceSetLine('已填入输入框（当前任务执行中，未自动发送）');
+    } else {
+      voiceSetStage('板端识别完成', 'ok', '识别文字已填入输入框，点击“发送任务”。');
+    }
+  } else {
+    const why = note.error || note.status || 'unknown';
+    voiceLog('板端识别异常', note.status + ' · ' + why, note.request_id);
+    voiceSetStage('板端识别失败', 'err', '板端语音未能识别：' + why);
+    boardVoiceSetLine('识别失败：' + why +
+      (note.hint ? '（' + note.hint + '）' : ''));
+  }
+}
+
+/** 轮询新记录（只取 id > lastId，最多 5 条） */
+async function boardVoiceTick() {
+  if (BOARD_VOICE.polling || document.hidden) return;
+  BOARD_VOICE.polling = true;
+  try {
+    const data = await apiGet('/api/v1/voice/latest?after_id=' +
+      encodeURIComponent(BOARD_VOICE.lastId) + '&limit=5');
+    const notes = data.notes || [];
+    if (!notes.length) return;
+    if (!BOARD_VOICE.primed || !BOARD_VOICE.lastId) {
+      // 还没建立游标（首次打开 / 状态接口失败）：只把游标推到最新，不重放历史
+      BOARD_VOICE.primed = true;
+      BOARD_VOICE.lastId = notes[notes.length - 1].note_id;
+      boardVoiceSaveCursor();
+      boardVoiceRenderNote(notes[notes.length - 1]);
+      return;
+    }
+    for (const note of notes) {
+      if (note.note_id > BOARD_VOICE.lastId) {
+        BOARD_VOICE.lastId = note.note_id;
+        boardVoiceHandleNote(note);
+      }
+    }
+    boardVoiceSaveCursor();
+  } catch (e) {
+    /* 状态卡片负责报错；轮询本身不弹窗 */
+  } finally {
+    BOARD_VOICE.polling = false;
+  }
+}
+
+/** 网页上传一段 WAV 自测（不依赖板子，用来先验证服务端 + 页面链路） */
+async function boardVoiceUpload(file) {
+  if (!file) return;
+  if (VOICE.busy || VOICE.stopping) {
+    boardVoiceSetLine('当前任务执行中，稍后再上传。');
+    return;
+  }
+  const device = (state.current && /^[A-Za-z0-9._-]+$/.test(state.current))
+    ? state.current : 'web-upload';
+  const rid = voiceNewRequestId('voice');
+  boardVoiceSetLine('正在上传 ' + file.name + ' …');
+  try {
+    const res = await fetch('/api/v1/voice?device_id=' + encodeURIComponent(device) +
+      '&source=upload&request_id=' + encodeURIComponent(rid), {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+      cache: 'no-store',
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) {
+      throw new Error((data && data.error) || ('接口返回 ' + res.status));
+    }
+    if (data.note) {
+      boardVoiceHandleNote(data.note);
+      if (data.note.note_id > BOARD_VOICE.lastId) {
+        BOARD_VOICE.lastId = data.note.note_id;
+        boardVoiceSaveCursor();
+      }
+    }
+    boardVoiceSetLine('上传完成：' + (data.status || '') +
+      (data.text ? ' → ' + data.text : ' (无文字)'));
+  } catch (e) {
+    boardVoiceSetLine('上传失败：' + e.message);
+  }
+}
+
+function initBoardVoice() {
+  if (!$.boardVoiceBadge) return;
+  if ($.boardVoiceRefresh) {
+    $.boardVoiceRefresh.addEventListener('click', () => {
+      void refreshBoardVoiceStatus();
+    });
+  }
+  if ($.boardVoiceFile) {
+    $.boardVoiceFile.addEventListener('change', () => {
+      const file = $.boardVoiceFile.files && $.boardVoiceFile.files[0];
+      $.boardVoiceFile.value = '';       // 允许连续选同一个文件
+      if (file) void boardVoiceUpload(file);
+    });
+  }
+  void (async () => {
+    const data = await refreshBoardVoiceStatus();
+    if (data && data.last_note) {
+      if (!BOARD_VOICE.lastId || data.last_note.note_id < BOARD_VOICE.lastId) {
+        BOARD_VOICE.lastId = data.last_note.note_id;
+        boardVoiceSaveCursor();
+      }
+    }
+    BOARD_VOICE.primed = true;
+    if (BOARD_VOICE.timer) clearInterval(BOARD_VOICE.timer);
+    BOARD_VOICE.timer = setInterval(boardVoiceTick, BOARD_VOICE_POLL_MS);
+    void boardVoiceTick();
+  })();
+}
+
+initBoardVoice();
+
+/* ------------------------------------------------------------------ *
  *  功能分区（同一页面内切换，避免 9 张卡片竖着堆成一长条）
  *
  *  6 个分区按钮 ↔ 6 个 .tab-panel：按钮 data-tab="x" 对应面板 id="panel-x"。
@@ -3204,6 +3445,7 @@ function refreshTab(id) {
   } else if (id === 'voice') {
     void refreshAgentStatus();
     void refreshMicPermission();
+    void refreshBoardVoiceStatus();   // 板端识别引擎状态（vosk/模型是否就绪）
     voiceRefreshButtons();     // 输入框、录音、停止按钮按当前状态重新启用
   } else if (id === 'task') {
     refreshLatestTask();       // 任务卡片 + 任务历史表（同一次 /api/v1/tasks 请求）
