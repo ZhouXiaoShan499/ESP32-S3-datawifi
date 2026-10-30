@@ -583,6 +583,9 @@
     画廊读取 <code>GET /api/v1/photos?device_id=…&amp;limit=12</code>，缩略图直接是
     <code>GET /api/v1/photos/{id}</code>；点图或「原图」在新标签页看原尺寸，点「删除」
     （<code>DELETE /api/v1/photos/{id}</code>）会同时删掉数据库记录与磁盘 JPEG 文件。<br>
+    <b>隐私保留</b>：照片默认只保留 <b>7 天</b>（<code>SENSOR_PHOTO_RETENTION_DAYS</code>，设 0 关闭），
+    且每台设备<b>至少保留最近 10 张</b>（<code>SENSOR_PHOTO_MIN_KEEP</code>）；超期照片在
+    读列表 / 取图 / 上传成功时被惰性清理，<b>库行与磁盘 JPEG 一起删除</b>。<br>
     拍照不占用 IMU 采样器、不暂停周期上报；板端没有相机/未启用
     <code>CONFIG_CAMERA_OV2640</code> 时会以 <code>POST /fail</code> 明确回执，
     任务卡片会显示原因而不是静默超时。

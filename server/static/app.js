@@ -1501,8 +1501,17 @@ async function refreshGallery() {
   }
   const list = (data && data.photos) || [];
   if ($.photoInfo) {
-    $.photoInfo.textContent = '· ' + state.current + ' · 共 ' + (data.total ?? 0) +
+    let info = '· ' + state.current + ' · 共 ' + (data.total ?? 0) +
       ' 张（显示最近 ' + list.length + ' 张）';
+    // 保留策略由服务端下发（SENSOR_PHOTO_RETENTION_DAYS / MIN_KEEP），页面不写死数字
+    const ret = data && data.retention;
+    if (ret && ret.enabled) {
+      info += ' · 保留 ' + ret.retention_days + ' 天（每台设备至少留最近 ' +
+        ret.min_keep_per_device + ' 张，超期自动删除）';
+    } else if (ret && !ret.enabled) {
+      info += ' · 自动清理已关闭';
+    }
+    $.photoInfo.textContent = info;
   }
   if ($.photoBadge) {
     $.photoBadge.className = 'badge ' + (list.length ? 'ok' : 'off');
