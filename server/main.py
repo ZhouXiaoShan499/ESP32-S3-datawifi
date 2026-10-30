@@ -105,6 +105,23 @@ MAX_BODY_BYTES = 2 * 1024 * 1024      # 单次请求体上限 2 MB
 MAX_JSON_BODY_BYTES = 64 * 1024       # 64 KiB
 SUPPORTED_AXES = ("ax", "ay", "az")
 
+# ---------------------------------------------------------------------------
+# 板端语音（ESP32-S3-EYE 数字 I2S 麦克风 → 上传 → 电脑本地离线识别）
+#   板端：BOOT 键触发 → 录 5 s 16 kHz/16 bit 单声道 → POST /api/v1/voice
+#   服务端：音频落盘 server/data/voice/、识别结果入库 voice_notes
+#   网页：/api/v1/voice/latest 轮询，拿到文字后填进语音助手输入框
+#   识别引擎见 voice_asr.py（Vosk，无 Key、纯离线；缺库/缺模型时降级为
+#   asr_unavailable，音频仍保存，不影晌其它接口）
+# ---------------------------------------------------------------------------
+VOICE_API_PATH = "/api/v1/voice"
+VOICE_DIR = (os.environ.get("SENSOR_VOICE_DIR")
+             or os.path.join(_DATA_DIR, "voice"))
+MAX_VOICE_BYTES = 2 * 1024 * 1024     # 16 kHz/16 bit 单声道约 65 s，足够 5 s 录音
+VOICE_DEFAULT_RATE = 16000
+VOICE_SOURCE_DEVICE = "device"
+VOICE_SOURCE_UPLOAD = "upload"
+VOICE_MAX_LIMIT = 50                  # /api/v1/voice/latest 单次最多返回条数
+
 # /api/v1/window（实时波形）上限：
 #   300 s × 100 Hz = 30000 点，这里限 12000 点（约 120 s @100Hz）避免响应过大
 MAX_WINDOW_SECONDS = 300
@@ -319,12 +336,31 @@ except Exception as _agent_exc:                       # noqa: BLE001
     print(f"[sensor-server] [agent] AI Agent 路由注册失败"
           f"（该功能不可用，主服务不受影响）: {_agent_exc}")
 
+# ---------------------------------------------------------------------------
+# 板端语音识别模块（纯标准库封装，vosk 是可选依赖）
+#   与 agent 同样的两种落点：python server/main.py 时是顶层包 voice_asr，
+#   仓库根目录布局下是 server.voice_asr。
+# ---------------------------------------------------------------------------
+try:
+    try:
+        import voice_asr
+    except ImportError:
+        from server import voice_asr  # type: ignore
+except Exception as _voice_exc:                       # noqa: BLE001
+    voice_asr = None                                  # type: ignore
+    print(f"[sensor-server] [voice] 语音识别模块加载失败"
+          f"（该功能不可用，主服务不受影响）: {_voice_exc}")
+else:
+    print(f"[sensor-server] 板端语音已挂载: POST {VOICE_API_PATH}"
+          f" · GET {VOICE_API_PATH}/latest · GET {VOICE_API_PATH}/status")
+
 # sqlite 连接：多线程下为每个请求单独建连接，见 get_db()
 _db_init_lock = threading.Lock()
 _initialized = False
 
 # _table_columns() 的白名单（见该函数 docstring）。
-_SQL_TABLES = ("uploads", "samples", "tasks", "device_control", "photos", "events")
+_SQL_TABLES = ("uploads", "samples", "tasks", "device_control", "photos", "events",
+               "voice_notes")
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +613,27 @@ def init_db():
                     ON events (device_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_events_status
                     ON events (status, created_at);
+                -- 板端语音：一行 = 一次上传。音频文件放 server/data/voice/，
+                -- 库里只存元数据 + 识别文字（同 photos：BLOB 会让备份/查询变重）。
+                -- request_id 唯一：板端重试上传同一段录音不会产生两行。
+                CREATE TABLE IF NOT EXISTS voice_notes (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id  TEXT NOT NULL UNIQUE,
+                    device_id   TEXT NOT NULL,
+                    source      TEXT NOT NULL DEFAULT 'device',  -- device / upload
+                    sample_rate INTEGER,
+                    duration_ms INTEGER,
+                    bytes       INTEGER,
+                    text        TEXT,                 -- 识别结果（失败时为空）
+                    status      TEXT NOT NULL,        -- ok/no_speech/asr_unavailable/...
+                    engine      TEXT,                 -- vosk / none
+                    error       TEXT,
+                    audio_path  TEXT,                 -- 相对 server/ 的 wav 路径
+                    ip          TEXT,
+                    created_at  REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_voice_created
+                    ON voice_notes (created_at);
                 """
             )
             _migrate_uploads_columns(conn)
@@ -3296,6 +3353,266 @@ def window(request: Request):
             "points": points,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 板端语音（ESP32-S3-EYE 数字 I2S 麦克风）
+#
+# 与 IMU 数据的「板端周期上报」不同，这个方向是「用户说话 → 板子录一段 →
+# 上传 → 电脑本地离线识别 → 网页拿到文字后走同一条 Agent 链路」：
+#   * 音频存 server/data/voice/<request_id>.wav，库表 voice_notes 只存元数据；
+#   * 识别引擎在 voice_asr.py，缺 vosk/模型时降级为 asr_unavailable，
+#     音频照常保存，页面能看到失败原因；
+#   * request_id 唯一：板端网络抖动重试不会产生重复记录，也不会重复识别。
+# ---------------------------------------------------------------------------
+def _voice_note_view(row):
+    """voice_notes 行 → 对外结构（页面轮询与板端回执共用）。"""
+    audio_path = row["audio_path"]
+    return {
+        "note_id": row["id"],
+        "request_id": row["request_id"],
+        "device_id": row["device_id"],
+        "source": row["source"],
+        "sample_rate": row["sample_rate"],
+        "duration_ms": row["duration_ms"],
+        "bytes": row["bytes"],
+        "text": row["text"] or "",
+        "status": row["status"],
+        "engine": row["engine"],
+        "error": row["error"] or "",
+        "created_at": row["created_at"],
+        "created": _fmt_time(row["created_at"]),
+        "audio_url": (f"{VOICE_API_PATH}/{row['id']}/audio" if audio_path else None),
+    }
+
+
+def _voice_bad_request(message):
+    return JSONResponse(status_code=400, content={
+        "code": "INVALID", "ok": False, "error": message})
+
+
+@app.post(VOICE_API_PATH)
+async def upload_voice(request: Request):
+    """接收一段录音并做本地识别。
+
+    查询参数：
+        device_id    必填，与 IMU 接口同一套字符白名单
+        request_id   可选，板端生成；重试同一个 id 直接返回已有记录（幂等）
+        sample_rate  裸 PCM 的采样率，默认 16000（WAV 以文件头为准）
+        source       device（默认）/ upload（网页自测）
+    请求体：
+        WAV（``audio/wav``）或裸 PCM16LE 单声道（``application/octet-stream``）
+    """
+    if not _device_auth_ok(request):
+        return _unauthorized()
+    if voice_asr is None:
+        return JSONResponse(
+            status_code=503,
+            content={"code": "VOICE_UNAVAILABLE", "ok": False,
+                     "error": "语音识别模块未加载，请查看服务端启动日志"},
+        )
+
+    raw, too_large = await _read_body_limited(
+        request, MAX_VOICE_BYTES, "voice audio")
+    if too_large is not None:
+        return too_large
+
+    params = request.query_params
+    device_id = (params.get("device_id") or "").strip()
+    if not device_id or len(device_id) > MAX_DEVICE_ID_LEN:
+        return _voice_bad_request("missing or empty 'device_id'")
+    if not _device_id_ok(device_id):
+        return _voice_bad_request(
+            "invalid 'device_id' (only letters, digits, '.', '-' and '_'"
+            " are accepted)")
+
+    request_id = (params.get("request_id") or "").strip()
+    if request_id and not REQUEST_ID_RE.match(request_id):
+        return _voice_bad_request(
+            "invalid 'request_id' (expect 6-64 chars of [A-Za-z0-9_-])")
+    if not request_id:
+        request_id = "voice-" + uuid.uuid4().hex[:20]
+
+    try:
+        sample_rate = int(params.get("sample_rate") or VOICE_DEFAULT_RATE)
+    except (TypeError, ValueError):
+        return _voice_bad_request("'sample_rate' must be an integer")
+
+    source = (params.get("source") or VOICE_SOURCE_DEVICE).strip().lower()
+    if source not in (VOICE_SOURCE_DEVICE, VOICE_SOURCE_UPLOAD):
+        source = VOICE_SOURCE_DEVICE
+
+    # 幂等：板端断网重试会带同一个 request_id，不重复识别、不重复落盘
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM voice_notes WHERE request_id=?", (request_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if existing is not None:
+        return JSONResponse(status_code=200, content={
+            "ok": True, "code": "DUPLICATE", "duplicate": True,
+            "request_id": request_id,
+            "text": existing["text"] or "",
+            "status": existing["status"],
+            "note": _voice_note_view(existing),
+        })
+
+    # 识别是 CPU 密集的同步调用（Vosk 解码），必须挪出事件循环，
+    # 否则识别那 1–2 秒里设备端的 /tasks/next 和页面轮询都会卡住。
+    try:
+        result = await run_in_threadpool(voice_asr.analyze, raw, sample_rate)
+    except voice_asr.BadAudio as exc:
+        return _voice_bad_request(str(exc))
+
+    os.makedirs(VOICE_DIR, exist_ok=True)
+    filename = re.sub(r"[^A-Za-z0-9_-]", "_", request_id) + ".wav"
+    try:
+        with open(os.path.join(VOICE_DIR, filename), "wb") as fh:
+            fh.write(result["wav"])
+    except OSError as exc:
+        return JSONResponse(status_code=500, content={
+            "code": "IO_ERROR", "ok": False,
+            "error": f"save audio failed: {exc}"})
+
+    now = time.time()
+    try:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO voice_notes"
+                " (request_id, device_id, source, sample_rate, duration_ms,"
+                "  bytes, text, status, engine, error, audio_path, ip,"
+                "  created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_id, device_id, source, result["sample_rate"],
+                 result["duration_ms"], len(result["wav"]), result["text"],
+                 result["status"], result["engine"], result["error"] or "",
+                 filename, request.client.host if request.client else None,
+                 now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM voice_notes WHERE request_id=?", (request_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return JSONResponse(status_code=500, content={
+            "code": "DB_ERROR", "ok": False,
+            "error": f"store voice note failed: {exc}"})
+
+    ok = result["status"] == "ok"
+    return JSONResponse(status_code=200, content={
+        "ok": ok,
+        "code": "OK" if ok else str(result["status"]).upper(),
+        "duplicate": False,
+        "request_id": request_id,
+        "device_id": device_id,
+        "source": source,
+        "text": result["text"],
+        "status": result["status"],
+        "duration_ms": result["duration_ms"],
+        "sample_rate": result["sample_rate"],
+        "engine": result["engine"],
+        "error": result["error"],
+        "hint": result["hint"],
+        "note": _voice_note_view(row),
+    })
+
+
+@app.get(VOICE_API_PATH + "/latest")
+def voice_latest(request: Request):
+    """页面轮询：返回 id > after_id 的识别记录（按 id 升序，最多 50 条）。
+
+    页面用 ``last_id`` 做游标，只处理新记录，避免刷新后重复把旧语音再发一遍。
+    """
+    params = request.query_params
+    device_id = (params.get("device_id") or "").strip()
+    if device_id and not _device_id_ok(device_id):
+        return _voice_bad_request("invalid 'device_id'")
+
+    try:
+        after_id = int(params.get("after_id") or 0)
+    except (TypeError, ValueError):
+        return _voice_bad_request("'after_id' must be an integer")
+    if after_id < 0:
+        return _voice_bad_request("'after_id' must be >= 0")
+
+    try:
+        limit = int(params.get("limit") or 10)
+    except (TypeError, ValueError):
+        return _voice_bad_request("'limit' must be an integer")
+    limit = max(1, min(VOICE_MAX_LIMIT, limit))
+
+    sql = "SELECT * FROM voice_notes WHERE id > ?"
+    args = [after_id]
+    if device_id:
+        sql += " AND device_id = ?"
+        args.append(device_id)
+    sql += " ORDER BY id ASC LIMIT ?"
+    args.append(limit)
+
+    conn = _connect()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+    notes = [_voice_note_view(r) for r in rows]
+    return JSONResponse(status_code=200, content={
+        "ok": True,
+        "notes": notes,
+        "last_id": rows[-1]["id"] if rows else after_id,
+    })
+
+
+@app.get(VOICE_API_PATH + "/status")
+def voice_status(request: Request):
+    """识别引擎状态 + 最近一条板端语音（页面打开时先拉一次）。"""
+    if voice_asr is None:
+        info = {"engine": "none", "ready": False,
+                "detail": "语音识别模块未加载，请查看服务端启动日志"}
+    else:
+        info = voice_asr.status()
+
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM voice_notes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    payload = dict(info)
+    payload.update({
+        "ok": True,
+        "api": VOICE_API_PATH,
+        "last_note": _voice_note_view(row) if row is not None else None,
+    })
+    return JSONResponse(status_code=200, content=payload)
+
+
+@app.get(VOICE_API_PATH + "/{note_id}/audio")
+def voice_audio(note_id: int):
+    """回放某条录音（排障用：确认板端到底录到了什么）。"""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM voice_notes WHERE id=?", (note_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["audio_path"]:
+        return JSONResponse(status_code=404, content={
+            "code": "NOT_FOUND", "ok": False, "error": "voice note not found"})
+
+    path = os.path.join(VOICE_DIR, row["audio_path"])
+    if not os.path.isfile(path):
+        return JSONResponse(status_code=404, content={
+            "code": "NOT_FOUND", "ok": False, "error": "audio file missing"})
+    return FileResponse(path, media_type="audio/wav")
 
 
 def _fmt_epoch_ms(ts_ms):

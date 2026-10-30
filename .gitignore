@@ -71,3 +71,6 @@ __pycache__/
 *.db-shm
 *.db-journal
 
+
+# ---- 板端语音模型（约 42 MB，由 server/download_voice_model.py 下载）----
+server/models/

@@ -1,0 +1,8 @@
+# 板端语音（ESP32-S3-EYE 麦克风）的本地离线识别依赖。
+#
+#   pip install -r server/requirements-voice.txt
+#   python server/download_voice_model.py
+#
+# 不装也能启动服务：POST /api/v1/voice 会返回 asr_unavailable，
+# 音频仍落盘 server/data/voice/，其它接口（IMU/任务/拍照/事件）完全不受影响。
+vosk>=0.3.45
