@@ -40,6 +40,9 @@ ESP32-S3-EYE 真实传感数据接收与存储服务（Web 平台端，FastAPI�
     并在同一事务里把任务置 completed（幂等：同一 request_id 重复上传不会重复存图）
   查询/管理接口：GET /api/v1/photos（列表）· GET /api/v1/photos/{id}（JPEG 字节）
   · DELETE /api/v1/photos/{id}（删库行 + 删文件）。
+  隐私保留：照片默认只留 SENSOR_PHOTO_RETENTION_DAYS 天（默认 7，<=0 关闭），且每台设备
+  至少保留最近 SENSOR_PHOTO_MIN_KEEP 张（默认 10）。列表 / 取图 / health / 上传成功时
+  惰性清理超期照片（库行与磁盘 JPEG 一起删），POST /api/v1/photos/cleanup 可手动清一次。
 
 摄像头实时直播（live camera）—— 对应板端长按 Button A 的「实时画面」：
   * 板端侧：长按 Button A 开启后，live_stream_task 循环「拍一帧 JPEG → POST /api/v1/live」
@@ -185,6 +188,14 @@ PHOTO_MAX_LIMIT = 200
 PHOTO_JPEG_MAGIC = b"\xff\xd8\xff"    # JPEG SOI + 首个 marker，用于拒绝非图片 body
 PHOTO_MAX_NOTE_LEN = 200
 PHOTO_ID_RE = re.compile(r"^\d{1,18}$")
+
+# 隐私保留：照片只在服务器上留一段时间（默认 7 天，<=0 表示关闭自动清理），
+# 且**每台设备至少保留最近 N 张** —— 即使全部超期也不会把画廊清空。
+# 清理由读路径（列表 / 取图 / health）与上传成功后**惰性触发**，不引入后台线程：
+# 与 tasks、events 的超时判定同一套模式（uvicorn reload / 多 worker 下后台线程会
+# 互相打架，惰性清理天然重启自洽）。删的是「库行 + 磁盘 JPEG」两处，缺一不可。
+PHOTO_RETENTION_DAYS = float(os.environ.get("SENSOR_PHOTO_RETENTION_DAYS", "7"))
+PHOTO_RETENTION_MIN_KEEP = int(os.environ.get("SENSOR_PHOTO_MIN_KEEP", "10"))
 
 # 数据采集历史（GET /api/v1/uploads*）：uploads 一行 = 一批采集数据
 # （周期上报一批 / 手动采集一批）。/api/v1/latest 只回答「最近一批」，
@@ -1041,6 +1052,100 @@ def _photo_view(row):
     return photo
 
 
+def photo_retention_policy():
+    """对外暴露的保留策略（列表接口、/health 与页面提示共用一份口径）。"""
+    return {
+        "enabled": PHOTO_RETENTION_DAYS > 0,
+        "retention_days": PHOTO_RETENTION_DAYS,
+        "min_keep_per_device": PHOTO_RETENTION_MIN_KEEP,
+    }
+
+
+_photo_cleanup_lock = threading.Lock()
+_photo_cleanup_state = {
+    "last_run": None,          # 最近一次真正跑完清理的 epoch 秒（没删东西也会更新）
+    "last_deleted": 0,         # 最近一次删掉的库行数
+    "last_files_deleted": 0,   # 最近一次删掉的磁盘文件数（文件已丢失时小于库行数）
+    "total_deleted": 0,        # 进程生命周期内累计删掉的库行数
+}
+
+
+def _expire_stale_photos(conn, now=None):
+    """删除超过保留期的照片（先删库行并提交，再删磁盘文件）。
+
+    返回 (deleted_rows, deleted_files)。判据是「比它新的同设备照片已经够
+    PHOTO_RETENTION_MIN_KEEP 张」，这样每台设备永远留得下最近 N 张。
+
+    为什么先提交再删文件：事务回滚时绝不能把**仍在库里**的照片文件删掉
+    （delete_photo 也是这个顺序）。文件删不掉只算磁盘垃圾，不让整次清理失败。
+    """
+    if PHOTO_RETENTION_DAYS <= 0:
+        return 0, 0
+    cutoff = (time.time() if now is None else now) - PHOTO_RETENTION_DAYS * 86400
+    with _photo_cleanup_lock:
+        rows = conn.execute(
+            "SELECT id, path FROM photos p"
+            " WHERE p.received_at < ?"
+            "   AND (SELECT COUNT(*) FROM photos q"
+            "         WHERE q.device_id = p.device_id"
+            "           AND (q.received_at > p.received_at"
+            "                OR (q.received_at = p.received_at AND q.id > p.id))) >= ?",
+            (cutoff, PHOTO_RETENTION_MIN_KEEP),
+        ).fetchall()
+        deleted_at = time.time()
+        _photo_cleanup_state["last_run"] = deleted_at
+        if not rows:
+            _photo_cleanup_state["last_deleted"] = 0
+            _photo_cleanup_state["last_files_deleted"] = 0
+            return 0, 0
+        ids = [r["id"] for r in rows]
+        conn.execute(
+            "DELETE FROM photos WHERE id IN (%s)" % ",".join("?" * len(ids)),
+            ids,
+        )
+        conn.commit()
+        deleted_files = 0
+        for row in rows:
+            rel_path = row["path"] or ""
+            if not rel_path:
+                continue
+            try:
+                abs_path = os.path.join(PHOTO_DIR, rel_path)
+                if os.path.isfile(abs_path):
+                    os.remove(abs_path)
+                    deleted_files += 1
+            except OSError:
+                pass          # 库行已删，文件残留只是磁盘垃圾
+    _photo_cleanup_state["last_deleted"] = len(ids)
+    _photo_cleanup_state["last_files_deleted"] = deleted_files
+    _photo_cleanup_state["total_deleted"] += len(ids)
+    print(f"[sensor-server] photo retention: deleted {len(ids)} row(s),"
+          f" {deleted_files} file(s) older than {PHOTO_RETENTION_DAYS:g} day(s)"
+          f" (min keep {PHOTO_RETENTION_MIN_KEEP}/device)")
+    return len(ids), deleted_files
+
+
+def cleanup_expired_photos():
+    """在独立连接上跑一次保留期清理（上传后 / 手动接口调用）。
+
+    读路径有自己的连接，直接调 _expire_stale_photos(conn) 即可；这里只是给
+    「没有现成连接」的异步路径一个入口，并且吞掉数据库异常 —— 清理失败
+    不应该让上传请求或手动触发返回 500。
+    """
+    try:
+        conn = _connect()
+    except sqlite3.Error as e:
+        print(f"[sensor-server] photo retention skipped: {e}")
+        return 0, 0
+    try:
+        return _expire_stale_photos(conn)
+    except sqlite3.Error as e:
+        print(f"[sensor-server] photo retention skipped: {e}")
+        return 0, 0
+    finally:
+        conn.close()
+
+
 def store_photo(data):
     """一个事务内写 photos 行 + 落盘 JPEG；带 request_id 时联动 camera 任务收尾。
 
@@ -1696,6 +1801,9 @@ async def upload_photo(request: Request):
         row = conn.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
     finally:
         conn.close()
+    # 隐私保留：板端只要还在上传，就顺带把超期照片清掉（不必等有人打开页面）。
+    # 放在线程池里跑：删库 + 删文件都是同步 IO，不能占用事件循环。
+    await run_in_threadpool(cleanup_expired_photos)
     return JSONResponse(
         status_code=200 if idempotent else 201,
         content={
@@ -1743,6 +1851,10 @@ def list_photos(request: Request):
 
     conn = _connect()
     try:
+        # 先做惰性清理，再统计：否则 total 会把刚过期、马上要被删的照片算进去
+        # （与 tasks/events 的 health 口径问题同源）。
+        _expire_stale_photos(conn)
+        conn.commit()
         where, args = "", []
         if device_id:
             where, args = " WHERE device_id=?", [device_id]
@@ -1759,7 +1871,29 @@ def list_photos(request: Request):
         status_code=200,
         content={"code": "OK", "ok": True, "count": len(rows), "total": total,
                  "device_id": device_id or None,
+                 "retention": photo_retention_policy(),
                  "photos": [_photo_view(r) for r in rows]},
+    )
+
+
+@app.post("/api/v1/photos/cleanup")
+async def cleanup_photos():
+    """手动触发一次保留期清理（隐私：超期照片连库行带 JPEG 一起删掉）。
+
+    日常不需要调用：列表 / 取图 / health / 上传都会惰性清理一次。这个入口
+    用于演示、验收和「想立刻清干净」的场景。
+    """
+    deleted, files_deleted = await run_in_threadpool(cleanup_expired_photos)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "code": "OK",
+            "ok": True,
+            "deleted": deleted,
+            "files_deleted": files_deleted,
+            "retention": photo_retention_policy(),
+            "cleanup": dict(_photo_cleanup_state),
+        },
     )
 
 
@@ -1778,6 +1912,9 @@ def get_photo(photo_id: str):
         )
     conn = _connect()
     try:
+        # 取图前先清理：一张刚过期的照片不应该再被当成「文件丢失(410)」返回。
+        _expire_stale_photos(conn)
+        conn.commit()
         row = conn.execute(
             "SELECT * FROM photos WHERE id=?", (int(photo_id),)
         ).fetchone()
@@ -2948,6 +3085,7 @@ def health():
             # 于是每条读路径都重算一遍、状态永远落不了库。
             _expire_stale_tasks(conn)
             _expire_stale_events(conn)
+            _expire_stale_photos(conn)
             conn.commit()
             n_uploads = conn.execute(
                 "SELECT COUNT(*) FROM uploads"
@@ -3011,6 +3149,8 @@ def health():
             "total_tasks": sum(r["n"] for r in task_rows),
             "tasks_by_status": {r["status"]: r["n"] for r in task_rows},
             "total_photos": n_photos,
+            "photo_retention": dict(photo_retention_policy(),
+                                    cleanup=dict(_photo_cleanup_state)),
             "latest_photo": latest_photo,
             "total_events": sum(r["n"] for r in event_rows),
             "events_by_status": {r["status"]: r["n"] for r in event_rows},
