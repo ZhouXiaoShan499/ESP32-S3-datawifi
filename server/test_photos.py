@@ -4,6 +4,8 @@
 
 用独立的临时 SQLite 与临时照片根目录（server/data/test_photos.db +
 server/data/test_photos/），不污染正式库与 server/photos/。
+另外覆盖隐私保留：超过 SENSOR_PHOTO_RETENTION_DAYS 的照片被惰性清理（库行 + 磁盘 JPEG），
+但每台设备至少保留最近 SENSOR_PHOTO_MIN_KEEP 张。
 运行：python server/test_photos.py
 """
 
@@ -420,7 +422,50 @@ def main_run():
     assert r.status_code == 413 and r.json()["code"] == "TOO_LARGE", r.text
     print("[PASS] 直播单帧超限 413 TOO_LARGE（上限 %s B）" % main.LIVE_MAX_FRAME_BYTES)
 
-    # 23) 清理临时库与临时照片目录（正式库/正式 photos 目录从未被写入）
+    # 23) 隐私保留（照片自动清理）：超过保留期的照片被惰性删除，
+    #     但每台设备至少保留最近 PHOTO_RETENTION_MIN_KEEP 张（画廊不会被清空）。
+    RET_DEV = "esp32s3-eye-retention"
+    ret_ids = []
+    for _ in range(main.PHOTO_RETENTION_MIN_KEEP + 3):
+        r = post_photo(RET_DEV)
+        assert r.status_code == 201, r.text
+        ret_ids.append(r.json()["photo_id"])
+    # 刚上传的照片还在保留期内，一张都不该少
+    fresh = client.get("/api/v1/photos", params={"device_id": RET_DEV}).json()
+    assert fresh["total"] == len(ret_ids), fresh
+    assert fresh["retention"]["enabled"] is True, fresh["retention"]
+    # 把这一批的回执时间整体推到保留期之外（模拟「放了很多天」）
+    stale_at = time.time() - main.PHOTO_RETENTION_DAYS * 86400 - 86400
+    conn = main._connect()
+    try:
+        conn.execute("UPDATE photos SET received_at=? WHERE device_id=?",
+                     (stale_at, RET_DEV))
+        conn.commit()
+    finally:
+        conn.close()
+    r = client.post("/api/v1/photos/cleanup")
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    body = r.json()
+    assert body["deleted"] == 3, body
+    assert body["files_deleted"] == 3, body
+    assert body["cleanup"]["last_run"] is not None, body
+    kept = client.get("/api/v1/photos", params={"device_id": RET_DEV}).json()
+    assert kept["total"] == main.PHOTO_RETENTION_MIN_KEEP, kept["total"]
+    # 被删的是最旧的 3 张：库行 404，磁盘文件也不在了
+    for pid in ret_ids[:3]:
+        assert client.get("/api/v1/photos/%d" % pid).status_code == 404, pid
+        assert not os.path.isfile(photo_abs_path(RET_DEV, pid)), pid
+    # 最近 N 张连磁盘文件一起保留
+    for pid in ret_ids[3:]:
+        assert os.path.isfile(photo_abs_path(RET_DEV, pid)), pid
+    # health 暴露同一份策略与清理状态
+    h = client.get("/api/v1/health").json()
+    assert h["photo_retention"]["enabled"] is True, h["photo_retention"]
+    assert h["photo_retention"]["retention_days"] == main.PHOTO_RETENTION_DAYS, h
+    print("[PASS] 隐私保留：超期照片自动删除（库行+磁盘文件），"
+          "每台设备至少保留最近 %d 张" % main.PHOTO_RETENTION_MIN_KEEP)
+
+    # 24) 清理临时库与临时照片目录（正式库/正式 photos 目录从未被写入）
     shutil.rmtree(_TEST_PHOTO_DIR, ignore_errors=True)
     _remove_db_files(_TEST_DB)
     print("[PASS] 临时库/临时照片目录已清理")
