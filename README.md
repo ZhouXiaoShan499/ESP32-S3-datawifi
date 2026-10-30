@@ -123,6 +123,11 @@ idf.py build
 idf.py -p COMx flash monitor     # COMx = 实际串口
 ```
 
+> 分区表用根目录的 `partitions.csv`：8 MB flash 上给 app 6 MB。IDF 自带的
+> `singleapp_large` 只有 1.5 MB，链接 LVGL + 摄像头 + 板端语音后会超出约 23 KB
+> （`app partition is too small ... overflow 0x59a0`）。第一次用新分区表刷机时
+> `idf.py flash` 会自动写入 `partition-table.bin`，`nvs` 偏移不变，原有 WiFi 配网数据不受影响。
+
 `menuconfig` 里需要改的：
 
 | 配置项 | 值 |
@@ -158,6 +163,23 @@ server\start_https_proxy.bat
 `https://<电脑IP>:8443/ui/`。本机访问 `http://127.0.0.1:8000/ui/` 本身是安全上下文，
 无需代理。代理不改变板端协议，也不要求 VPS。
 
+### 板端语音（用板子自己的麦克风，推荐）
+
+浏览器拿不到 ESP32-S3-EYE 的麦克风（Web Speech API 只认系统采集设备），所以板端语音
+走「板子录音 → 电脑本地离线识别」：
+
+```powershell
+pip install -r server\requirements-voice.txt
+python server\download_voice_model.py      # 约 42 MB，Vosk 中文小模型；慢可手动下 zip 再用 --zip
+python server\main.py
+```
+
+板端按 **BOOT**（GPIO0）录 5 秒 → `POST /api/v1/voice` → 服务端 Vosk 识别 →
+网页「语音助手 → 板端麦克风」卡片显示文字、自动填进输入框（勾选“自动发送任务”时直接执行）。
+没有板子时可先用卡片里的「上传 WAV 自测」验证整条链路；没装 vosk 也能启动服务，
+接口返回 `asr_unavailable` 并提示缺什么，音频照样保存在 `server/data/voice/`。
+详见 [`docs/local_no_key_voice.md`](docs/local_no_key_voice.md)。
+
 ---
 
 ## 四、板端操作
@@ -172,6 +194,7 @@ server\start_https_proxy.bat
 | 短按 C | 触发闭环事件 |
 | 短按 D | 回应闭环事件 |
 | 长按 D（2s） | 取消闭环事件 |
+| 短按 BOOT（GPIO0） | 录 5 秒 → `POST /api/v1/voice` → 电脑本地识别 |
 
 ### 动作采集协议
 
@@ -301,7 +324,9 @@ pip install -r server/requirements-agent.txt   # 可选依赖，不进 CI
 Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音识别结果走同一个输入框；
 录音、识别中间结果、任务执行、播报状态都会显示。录音与播报使用浏览器
 `SpeechRecognition` / `SpeechSynthesis`，音频源是当前浏览器麦克风，运行位置是当前页面所在浏览器。
-浏览器不支持识别时仍可用文字入口。停止操作会同时中止识别/播报、`Abort` 当前请求并通过
+浏览器不支持识别（或麦克风权限拿不到）时，还可以用「板端麦克风」入口：板子录 5 秒上传，
+电脑本地 Vosk 识别后同样填进输入框，见上一节。浏览器两条入口都不支持时仍可用文字入口。
+停止操作会同时中止识别/播报、`Abort` 当前请求并通过
 `/api/v1/agent/cancel` 通知服务端；页面用单调递增 generation 丢弃迟到结果。
 
 自测 `python server/test_agent.py` **不需要 `openai`、不联网**（内部强制走关键词回退分支）。
@@ -324,8 +349,10 @@ Web 页的「语音助手」分区已经接入同一套 Agent：文字和语音�
 | `SENSOR_DB` | `server/data/upload.db` | SQLite 路径 |
 | `SENSOR_TOKEN` | 空（不鉴权） | 可选上传鉴权 |
 | `SENSOR_PHOTO_DIR` | `server/photos` | 照片目录 |
+| `SENSOR_VOICE_DIR` | `server/data/voice` | 板端语音音频目录（`<request_id>.wav`） |
+| `VOICE_MODEL_DIR` | `server/models/vosk-model-small-cn-0.22` | 离线识别模型目录，换模型时指这里 |
 
-数据库共 6 张表：`uploads`（上传批次）、`samples`（采样点）、`tasks`（任务）、`device_control`（暂停状态）、`photos`（照片记录）、`events`（闭环事件）。
+数据库共 7 张表：`uploads`（上传批次）、`samples`（采样点）、`tasks`（任务）、`device_control`（暂停状态）、`photos`（照片记录）、`events`（闭环事件）、`voice_notes`（板端语音识别记录）。
 
 ---
 
@@ -336,6 +363,7 @@ python server/test_receive.py      # 单元自测（校验/入库/查询/任务�
 python server/test_photos.py       # 拍照链路自测
 python server/test_events.py       # 闭环事件自测（23 项）
 python server/test_agent.py        # AI Agent 自测（24 项；不需要 openai、不联网）
+python server/test_voice.py        # 板端语音自测（不需要 vosk/麦克风，合成音频 + mock 识别）
 python server/e2e_server_check.py  # 真实 HTTP 端到端自检
 python server/e2e_ui_check.py      # 界面自检（可选；无浏览器则 SKIP）
 python server/e2e_device_check.py  # 真机验收（可选；无板则 SKIP）

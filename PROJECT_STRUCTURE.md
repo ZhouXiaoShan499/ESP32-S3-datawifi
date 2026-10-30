@@ -57,6 +57,9 @@ data_capture_sim/                  # 仓库根目录
     ├── main.py                    # FastAPI 服务（约 2600 行：接收 + 存储 + 查询 + 任务 + 照片 + 闭环事件）
     ├── requirements.txt           # 依赖（fastapi、uvicorn、httpx）
     ├── requirements-agent.txt     # 可选真实 LLM 依赖（OpenAI 兼容协议）
+    ├── requirements-voice.txt     # 可选离线识别依赖（vosk）
+    ├── voice_asr.py               # Vosk 封装：WAV/PCM 归一化、重采样、识别、引擎状态
+    ├── download_voice_model.py    # 下载 Vosk 中文小模型到 server/models/
     ├── https_proxy.py             # 浏览器 HTTPS → 本机 HTTP Uvicorn 代理
     ├── make_dev_https.ps1         # 本地 CA + 局域网 IP 开发证书
     ├── start_https_proxy.bat      # 启动浏览器 HTTPS 入口
@@ -65,10 +68,12 @@ data_capture_sim/                  # 仓库根目录
     ├── test_receive.py            # 本地联调自测脚本（含按需采集任务全流程）
     ├── test_photos.py             # 拍照链路自测脚本（临时库 + 临时照片目录）
     ├── test_events.py             # 闭环事件自测脚本（临时库，23 项断言）
+    ├── test_voice.py              # 板端语音自测脚本（合成音频 + mock 识别，不依赖 vosk）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检脚本
     ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
     ├── e2e_live_check.py          # 摄像头直播自检（HTTP + 可选无头页面断言）
     ├── photos/                    # 照片落盘目录（运行时生成，已 gitignore）
+    ├── data/voice/                # 板端语音 wav 落盘目录（运行时生成，已 gitignore）
     └── static/                    # 实时监控页面（静态资源）
         ├── index.html             # 页面结构 + 样式（含任务卡片、闭环事件卡片、拍照画廊与三维视图画布）
         └── app.js                 # 轮询 + 渲染 + 任务跟踪 + 事件卡片 + 照片画廊 + Canvas 2D 三维姿态视图
@@ -79,14 +84,15 @@ data_capture_sim/                  # 仓库根目录
 | 文件 | 说明 |
 |------|------|
 | `CMakeLists.txt` | ESP-IDF 工程的顶层入口，引入 `$IDF_PATH/tools/cmake/project.cmake`，声明项目名 `data_capture_sim`。 |
-| `sdkconfig.defaults` | 提交到仓库的默认配置：目标芯片 `esp32s3`、`single app large` 分区方案、启用 FATFS 长文件名。 |
+| `sdkconfig.defaults` | 提交到仓库的默认配置：目标芯片 `esp32s3`、PSRAM/FATFS/摄像头/SNTP 等参数、`partitions.csv` 自定义分区。 |
+| `partitions.csv` | 8 MB flash 的分区表：`nvs`(0x9000) / `phy_init`(0xf000) 保持 IDF 默认偏移，`factory` 给到 6 MB。IDF 自带的 `singleapp_large` 只有 1.5 MB，加入板端语音后链接超出 0x59a0。 |
 | `.gitignore` | 忽略构建产物（`build/`）、本地配置（`sdkconfig`）、托管组件（`managed_components/`）以及服务端运行时数据（`server/data/`、`*.db`）。 |
 
 ### 2.2 `main/` —— 板端固件（ESP-IDF 组件）
 
 | 文件 | 说明 |
 |------|------|
-| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。另含 **任务链路**：`task_poll_task` 每 3s 轮询 `/api/v1/tasks/next`；`kind=capture` 由 `sampler_task` 按任务节拍采一批数据（期间暂停周期上报）并带 `request_id` 回传；`kind=pause/resume`（Web「暂停周期 / 恢复周期」）由 `task_apply_control()` 切换周期上报闸门（双时钟惰性到点恢复）并 `POST /applied` 确认生效。另含 **摄像头实时直播**：长按 Button A（2 s）开关 `live_stream_task`，每 ~250 ms 拍一帧 JPEG 并 `POST /api/v1/live`（服务端只在内存里留最新一帧），与按需单帧拍照共用相机并用 `s_camera_mutex` 串行化。另含 **闭环事件**（按键触发 → 本地反馈 → 远端显示 → 回应/取消）：`loop_module_init()` 把 GPIO3 配成**开漏**输出并起 `loop_led`（闪烁反馈，队列驱动、非阻塞）与 `loop_task`（1 s 一轮：发 trigger / 发 respond / 轮询远端状态）；按键 `BSP_BUTTON_3` = 触发、`BSP_BUTTON_4` = 单击回应（accept）/ 长按 2 s 取消（cancel），回调只置标志 + 闪灯 + 改屏，HTTP 全部交给 `loop_task`，与 `sampler_task`/`uploader_task`/`live_stream_task` 完全旁路。 |
+| `main.c` | 主固件，整合多项功能：QMA6100P 加速度计读取、WiFi STA 连接、SNTP 时间同步、SD 卡 CSV 落盘、LVGL 实时显示、六面标定，以及 **真实传感数据定时上传**（100 Hz 采样，每 1s 打包 100 个样本点 POST 上传）。另含 **任务链路**：`task_poll_task` 每 3s 轮询 `/api/v1/tasks/next`；`kind=capture` 由 `sampler_task` 按任务节拍采一批数据（期间暂停周期上报）并带 `request_id` 回传；`kind=pause/resume`（Web「暂停周期 / 恢复周期」）由 `task_apply_control()` 切换周期上报闸门（双时钟惰性到点恢复）并 `POST /applied` 确认生效。另含 **摄像头实时直播**：长按 Button A（2 s）开关 `live_stream_task`，每 ~250 ms 拍一帧 JPEG 并 `POST /api/v1/live`（服务端只在内存里留最新一帧），与按需单帧拍照共用相机并用 `s_camera_mutex` 串行化。另含 **闭环事件**（按键触发 → 本地反馈 → 远端显示 → 回应/取消）：`loop_module_init()` 把 GPIO3 配成**开漏**输出并起 `loop_led`（闪烁反馈，队列驱动、非阻塞）与 `loop_task`（1 s 一轮：发 trigger / 发 respond / 轮询远端状态）；按键 `BSP_BUTTON_3` = 触发、`BSP_BUTTON_4` = 单击回应（accept）/ 长按 2 s 取消（cancel），回调只置标志 + 闪灯 + 改屏，HTTP 全部交给 `loop_task`，与 `sampler_task`/`uploader_task`/`live_stream_task` 完全旁路。另含 **板端语音**：`voice_module_init()` 用板载数字 I2S 麦克风（GPIO41/42/2）在 `voice_task` 里录 5 s（16 kHz/16 bit 单声道，160 KB PSRAM），补 WAV 头后 `POST /api/v1/voice`；**BOOT 键（BSP_BUTTON_5 / GPIO0）** 触发，回调只投队列，初始化失败只告警、不影响采样/上传/任务/直播。 |
 | `CMakeLists.txt` | 通过 `idf_component_register` 注册组件，声明 `SRCS "main.c"`，并 `REQUIRES` 大量依赖（`json`、`esp_http_client`、`esp_netif`、`esp_wifi`、`sdmmc`、`fatfs`、`esp_timer`、`esp_lcd` 等）。 |
 | `Kconfig.projbuild` | 定义 `menuconfig` 菜单：WiFi SSID/密码、设备 ID（`SENSOR_DEVICE_ID`）、上传 URL（`SENSOR_SERVER_URL`）、可选上传鉴权 Token（`SENSOR_TOKEN`）。真实值通过本地 `sdkconfig` 配置，**不入库**。 |
 | `idf_component.yml` | ESP 组件注册表依赖：`espressif/esp32_s3_eye`（BSP）、`espressif/esp_video`（相机/视频，BSP 传递依赖）、`idf >= 5.4`。 |
@@ -95,9 +101,12 @@ data_capture_sim/                  # 仓库根目录
 
 | 文件 | 说明 |
 |------|------|
-| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、任务接口（含控制任务 `/applied` 与 `/api/v1/control`）、**摄像头直播内存接口（`/api/v1/live`）**、托管监控页面。 |
+| `main.py` | FastAPI 应用：接收上传、校验字段、写入 SQLite、提供查询接口、任务接口（含控制任务 `/applied` 与 `/api/v1/control`）、**摄像头直播内存接口（`/api/v1/live`）**、**板端语音接口（`/api/v1/voice`，含 latest/status/audio）**、托管监控页面。 |
 | `requirements.txt` | Python 依赖：`fastapi`、`uvicorn[standard]`、`httpx`（自测用）。 |
 | `requirements-agent.txt` | 在基础依赖上增加 `openai`；真实 LLM 仍通过环境变量配置，不把密钥写入仓库。 |
+| `requirements-voice.txt` | 板端语音的离线识别依赖（`vosk`）；不装只影响 `/api/v1/voice`，其它接口照常。 |
+| `voice_asr.py` | Vosk 封装：模型发现/懒加载、WAV 与裸 PCM 归一化、非 16 kHz 重采样、识别、引擎状态；缺库/缺模型时抛可读的 `AsrUnavailable`，由接口降级为 `asr_unavailable`。 |
+| `download_voice_model.py` | 下载 Vosk 中文小模型（约 42 MB）到 `server/models/`，带进度、zip-slip 防护与 `--zip` 离线安装。 |
 | `https_proxy.py` | 标准库实现的本地 HTTPS 反向代理：浏览器访问 8443，转发到 Uvicorn 的 HTTP 8000；板端上传协议不用改。 |
 | `make_dev_https.ps1` | 为 `localhost` 和指定局域网 IP 生成本地 CA、服务器证书与私钥；输出位于 gitignore 的 `server/certs/`。 |
 | `start_https_proxy.bat` | 默认将 `https://0.0.0.0:8443` 转发到 `http://127.0.0.1:8000`，端口可通过参数或环境变量覆盖。 |
@@ -106,6 +115,7 @@ data_capture_sim/                  # 仓库根目录
 | `test_receive.py` | 本地联调自测：用独立临时库验证「接收 → 校验 → 存储 → 查询」全流程，含可选鉴权分支与任务全流程（创建/领取/回执/回传/幂等/去重/超时/失败/控制任务 applied/暂停状态惰性归零），43 项断言。 |
 | `test_photos.py` | 拍照链路自测（临时库 + 临时照片目录）：JPEG 上传校验/落盘/取图/列表/404+410/删除/camera 任务收尾/幂等，16 项断言。 |
 | `test_events.py` | 闭环事件自测（临时库）：触发校验/板端重试幂等/状态机单向性（accept→ack、cancel→cancelled、confirm→completed）/终态不可回退/超 TTL 惰性过期/列表过滤与分页/设备侧鉴权/health 汇总，23 项断言。 |
+| `test_voice.py` | 板端语音自测（临时库 + 临时音频目录，不需要 vosk/麦克风）：合成 WAV 上传、裸 PCM、幂等重试、`latest` 游标、回放、参数与体积闸门、缺引擎降级，17 项断言。 |
 | `test_agent.py` | AI Agent 自测（临时库、不联网）：安全意图回退/强制 keyword 模式/设备白名单/防幻觉/澄清闭环/多轮上下文/慢 NLU 与在飞任务 `request_id` 取消/异常输入，24 项断言。 |
 | `e2e_server_check.py` | 以子进程真实启动 uvicorn，用标准库 urllib 走真实 HTTP 完成端到端自检（含任务创建-领取-ack-回传-幂等，pause/resume 的 `/applied` 收尾与 `/devices` 暂停标注，以及闭环事件「触发 → 幂等重试 → 轮询 → 回应 → 确认完成 → 终态不可回退」9 项），23 项断言。 |
 | `e2e_ui_check.py` | 可选：用无头 Edge/Chrome 打开页面并 dump DOM（15 次），断言页面 JS 真正执行（设备下拉、trigger/request_id、波形点数、三维视图、任务与历史、控制与事件闭环，以及**语音分区的文字→Agent→结果/耗时链路、解析模式、麦克风权限、录音/停止/播报入口和 request_id 时序**），110 项断言；未装浏览器时打印 SKIP。 |
@@ -114,7 +124,7 @@ data_capture_sim/                  # 仓库根目录
 | `static/index.html` | 监控页面结构（顶部常驻设备下拉 + 仅刷新、**7 个功能分区按钮（实时数据 / 历史记录 / 语音助手 / 采集任务 / 周期控制 / 摄像头 / 事件闭环）**、采集参数表单、暂停时长 + 暂停周期/恢复周期按钮、数据卡片、样本表、波形画布、历史记录批次表 + 单批详情、**语音输入/录音/停止/播报控件 + 澄清选项 + request_id 时序**、任务卡片、周期控制卡片、手动/周期对照表、任务历史表、摄像头实时画面、拍照画廊、三维视图画布）。 |
 | `static/app.js` | 轮询逻辑（设备列表 / 最新数据 / 波形 / 三维视图 / 暂停状态 / 直播 / 闭环事件）、任务历史与数据历史、照片画廊与 Canvas、分区切换，以及**语音助手：Web Speech 识别/合成、文字与语音共用 Agent、澄清/重输、Abort + request_id 取消及服务端确认、迟到结果 generation 隔离、本地反馈/Agent 完成分段耗时与时序日志**。 |
 
-#### 服务端数据库（SQLite，六张表）
+#### 服务端数据库（SQLite，七张表）
 
 | 表 | 说明 |
 |----|------|
@@ -124,6 +134,7 @@ data_capture_sim/                  # 仓库根目录
 | `device_control` | 周期上报暂停状态（`device_id + source` 主键）：`periodic_paused`、`paused_until`、`request_id`、`updated_at`——「是否真的暂停」的真相源，由板端 `POST /tasks/{id}/applied` 写入。 |
 | `photos` | 照片数据（`id` 主键、`device_id`、`request_id`、`ts_ms`、`received_at`、`bytes`、`width`、`height`、`ip`、`path`、`note`）：图片字节不入库，文件落在 `server/photos/<device_id>/<id>.jpg`。 |
 | `events` | 闭环事件（板端按键发起）：`request_id` 主键（**由板端生成**）、`device_id`、`source`、`kind`、`status`（`pending`/`ack`/`cancelled`/`completed`/`expired`）、`created_at`、`device_ts_ms`、`responded_at`/`response`/`responded_by`、`closed_at`、`expires_at`、`ip`、`note`。与 `tasks` **刻意分表**：`tasks` 的语义是「服务端派发、板端执行」，事件塞进去会被 `/tasks/next` 领回来形成回环。 |
+| `voice_notes` | 板端语音记录：`request_id`（唯一，板端生成，重试幂等）、`device_id`、`source`（`device`/`upload`）、采样率/时长/字节数、识别文字 `text`、`status`（`ok`/`no_speech`/`asr_unavailable`/…）、`engine`、`error`、`audio_path`（相对 `server/data/voice/`）、`ip`、`created_at`。音频字节不入库，文件按 `<request_id>.wav` 落盘。 |
 
 - **老库迁移**：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列。`init_db()` 在 `executescript`
   之后用 `PRAGMA table_info(...)` 判断并 `ALTER TABLE` 补 `uploads.request_id` / `uploads.trigger`
@@ -150,6 +161,10 @@ data_capture_sim/                  # 仓库根目录
 | `POST` | `/api/v1/agent/clarify` | 回答追问：`session_id` + `choice` + `request_id`，继续执行所选意图。 |
 | `POST` | `/api/v1/agent/cancel` | 按 Agent `request_id` 设置取消事件；正在轮询设备的采集/拍照/控制工具尽快退出。 |
 | `GET` | `/api/v1/agent/status` | 当前语言解析模式（真实 LLM / 关键词回退）、模型、端点和回退原因；不返回 API Key。 |
+| `POST` | `/api/v1/voice?device_id=…&request_id=…&sample_rate=…` | 板端上传一段录音（body 为 WAV 或裸 PCM16LE）：落盘 `server/data/voice/` + 本地 Vosk 识别 + 写 `voice_notes`；同 `request_id` 幂等，缺引擎时降级为 `asr_unavailable`。 |
+| `GET` | `/api/v1/voice/latest?device_id=…&after_id=…&limit=…` | 网页按 `id > after_id` 游标轮询新的识别记录（升序，最多 50 条）。 |
+| `GET` | `/api/v1/voice/status` | 识别引擎状态（`vosk` 是否安装、模型目录、是否就绪、缺什么）+ 最近一条记录。 |
+| `GET` | `/api/v1/voice/{id}/audio` | 回放该条录音（`audio/wav`）；未知 id 或文件丢失 404。 |
 | `POST` | `/api/v1/tasks` | 创建任务（`kind=capture`/`pause`/`resume`；同 `device+source+kind` 已有未完成任务时复用，返回 `duplicate=true`；控制任务返回 `superseded` 计数）。 |
 | `GET` | `/api/v1/tasks` | 任务列表（`?device_id=…&limit=n`）。 |
 | `GET` | `/api/v1/tasks/next?device_id=…` | 板端领取任务（原子 `UPDATE … WHERE status='submitted'`；声明在 `/tasks/{request_id}` 之前）。 |
@@ -173,7 +188,7 @@ data_capture_sim/                  # 仓库根目录
 | `GET` | `/ui/` | 实时监控面板（托管 `server/static/` 下的静态文件）。 |
 
 > 鉴权范围：设备侧接口（`/api/v1/upload`、`/api/v1/tasks/next`、`/tasks/{id}/ack`、
-> `/tasks/{id}/fail`、`/tasks/{id}/applied`、`/api/v1/live`）在配置了 `SENSOR_TOKEN` 时要求
+> `/tasks/{id}/fail`、`/tasks/{id}/applied`、`/api/v1/live`、`/api/v1/voice`）在配置了 `SENSOR_TOKEN` 时要求
 > `Authorization: Bearer <token>`；Web 侧查询/建任务接口与既有查询接口一样不做 Token 校验。
 
 ---
