@@ -1,8 +1,10 @@
 CONFIG_IDF_TARGET="esp32s3"
 # 选择目标芯片为 ESP32-S3（影响可用外设、Kconfig 默认值、编译工具链等）
 
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
-# 使用 “single app large” 分区方案：给应用留更大的 Flash 空间，适合带 LVGL/BSP 的工程
+# 8 MB flash 上给 app 6 MB（见 partitions.csv）。IDF 自带的 singleapp_large
+# 只给 1.5 MB，加入板端语音（esp_codec_dev/I2S）后链接超出 0x59a0。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 CONFIG_FATFS_VFS_FSTAT_BLKSIZE=4096
 # FATFS 通过 VFS 报告的块大小（用于 fstat 等接口，偏性能/兼容性参数）

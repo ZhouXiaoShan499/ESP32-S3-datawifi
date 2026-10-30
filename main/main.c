@@ -6707,6 +6707,412 @@ static void sampler_task(void *arg)
 }
 
 /* ================================================================
+ *  板端语音：ESP32-S3-EYE 数字 I2S 麦克风 → WAV → POST /api/v1/voice
+ *
+ *  为什么在板子上录：浏览器的 Web Speech API 只认「浏览器所在系统」的采集
+ *  设备，拿不到板子的麦克风；所以语音入口改成板端录音 + 电脑本地识别。
+ *
+ *  硬件：板载数字 MEMS 麦克风，I2S 直连（BCLK=GPIO41 / WS=GPIO42 /
+ *        DIN=GPIO2，见 BSP_I2S_*），没有 ES8311 之类的 codec 控制寄存器，
+ *        因此 bsp_audio_codec_microphone_init() 建出来的设备 codec_if 为
+ *        NULL，数据通路就是 I2S RX。
+ *
+ *  流程：BOOT 键（BSP_BUTTON_5 / GPIO0）按一下
+ *          → 录 5 s，16 kHz / 16 bit / 单声道（160 KB，放 PSRAM）
+ *          → 补 44 字节 WAV 头 → POST /api/v1/voice?...（与原图上传同一套
+ *            esp_http_client 打开-写入-关闭写法，避免把 160 KB 再拷一遍）
+ *          → 服务端落盘 + Vosk 识别 + 入库；网页轮询 /api/v1/voice/latest
+ *            把文字填进语音助手输入框
+ *
+ *  实时性/内存：录音在独立任务里做，按键回调只投队列（iot_button 的任务栈
+ *  很小，严禁在回调里 vTaskDelay 或发 HTTP）。录制期间采样任务照常跑；
+ *  I2S 与摄像头 DVP、SD、LCD 都不共用引脚。
+ * ================================================================ */
+#define VOICE_SAMPLE_RATE_HZ    16000
+#define VOICE_CHANNELS          1
+#define VOICE_BITS_PER_SAMPLE   16
+#define VOICE_RECORD_MS         5000
+#define VOICE_BYTES_PER_SAMPLE  (VOICE_BITS_PER_SAMPLE / 8)
+#define VOICE_PCM_BYTES         ((VOICE_SAMPLE_RATE_HZ * VOICE_BYTES_PER_SAMPLE * VOICE_RECORD_MS) / 1000)
+#define VOICE_WAV_HEADER_BYTES  44
+#define VOICE_API_PATH          "/api/v1/voice"
+#define VOICE_HTTP_TIMEOUT_MS   20000
+#define VOICE_READ_CHUNK        4096      /* 128 ms @16 kHz/16 bit */
+#define VOICE_TASK_STACK        8192      /* 录音 + esp_http_client 的余量 */
+#define VOICE_TASK_PRIO         3
+#define VOICE_BUTTON            BSP_BUTTON_5
+/* 开机自动录一段并上传的验证钩子：默认关闭，只有做无人工按键的产线自检时才置 1 */
+#define VOICE_BOOT_SELFTEST     0
+
+static QueueHandle_t s_voice_queue = NULL;          /* 元素 uint8_t：待录音请求 */
+static TaskHandle_t  s_voice_task_handle = NULL;
+static esp_codec_dev_handle_t s_voice_mic = NULL;
+static uint8_t      *s_voice_pcm = NULL;            /* PSRAM：160 KB */
+static volatile bool s_voice_ready = false;
+static volatile bool s_voice_busy = false;          /* 录音/上传期间忽略重复按键 */
+
+static void voice_put_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void voice_put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+/* 标准 44 字节 PCM WAV 头（服务端也接受裸 PCM，这里给 WAV 是为了能直接回放） */
+static void voice_wav_header(uint8_t *h, uint32_t data_bytes)
+{
+    memcpy(h, "RIFF", 4);
+    voice_put_le32(h + 4, 36 + data_bytes);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    voice_put_le32(h + 16, 16);                                  /* fmt chunk size */
+    voice_put_le16(h + 20, 1);                                   /* PCM */
+    voice_put_le16(h + 22, VOICE_CHANNELS);
+    voice_put_le32(h + 24, VOICE_SAMPLE_RATE_HZ);
+    voice_put_le32(h + 28, VOICE_SAMPLE_RATE_HZ * VOICE_CHANNELS * VOICE_BYTES_PER_SAMPLE);
+    voice_put_le16(h + 32, VOICE_CHANNELS * VOICE_BYTES_PER_SAMPLE);
+    voice_put_le16(h + 34, VOICE_BITS_PER_SAMPLE);
+    memcpy(h + 36, "data", 4);
+    voice_put_le32(h + 40, data_bytes);
+}
+
+/* 初始化 I2S + 麦克风设备。只做一次；失败后 s_voice_ready 保持 false。 */
+static esp_err_t voice_mic_init(void)
+{
+    if (s_voice_mic) {
+        return ESP_OK;
+    }
+    /* bsp_audio_init() 内部的默认配置是 48 kHz；识别模型要 16 kHz，
+     * 必须在第一次初始化时就把时钟传对（该函数有「已初始化直接返回」的短路）。 */
+    const i2s_std_config_t i2s_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(VOICE_SAMPLE_RATE_HZ),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                       I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S_MCLK,
+            .bclk = BSP_I2S_SCLK,
+            .ws   = BSP_I2S_LCLK,
+            .dout = BSP_I2S_DOUT,
+            .din  = BSP_I2S_DSIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    esp_err_t err = bsp_audio_init(&i2s_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[voice] bsp_audio_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_voice_mic = bsp_audio_codec_microphone_init();
+    if (!s_voice_mic) {
+        ESP_LOGE(TAG, "[voice] microphone device init failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* 录满 cap 字节（约 5 s）。返回实际字节数，<=0 表示失败。 */
+static int voice_record(uint8_t *buf, size_t cap)
+{
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate     = VOICE_SAMPLE_RATE_HZ,
+        .channel         = VOICE_CHANNELS,
+        .bits_per_sample = VOICE_BITS_PER_SAMPLE,
+    };
+    int err = esp_codec_dev_open(s_voice_mic, &fs);
+    if (err != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "[voice] esp_codec_dev_open failed: %d", err);
+        return -1;
+    }
+
+    size_t got = 0;
+    while (got < cap) {
+        size_t want = cap - got;
+        if (want > VOICE_READ_CHUNK) {
+            want = VOICE_READ_CHUNK;
+        }
+        /* esp_codec_dev_read() 返回状态码而不是字节数：成功 = 本次 want 字节已填满 */
+        int ret = esp_codec_dev_read(s_voice_mic, buf + got, (int)want);
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "[voice] read failed at %u/%u B (ret=%d)",
+                     (unsigned)got, (unsigned)cap, ret);
+            break;
+        }
+        got += want;
+    }
+    esp_codec_dev_close(s_voice_mic);
+    return (int)got;
+}
+
+/* 上传 WAV：body = 44 字节头 + PCM，Content-Length 定长，避免分块编码。 */
+static bool voice_post_wav(const uint8_t *pcm, size_t pcm_bytes,
+                           const char *request_id, int *status_out)
+{
+    char path[256];
+    char url[352];
+    uint8_t header[VOICE_WAV_HEADER_BYTES];
+    int status = 0;
+
+    if (status_out) {
+        *status_out = 0;
+    }
+    if (!pcm || pcm_bytes == 0 || !request_id) {
+        return false;
+    }
+
+    snprintf(path, sizeof(path),
+             VOICE_API_PATH "?device_id=%s&request_id=%s&sample_rate=%d&duration_ms=%d",
+             CONFIG_SENSOR_DEVICE_ID, request_id,
+             VOICE_SAMPLE_RATE_HZ, VOICE_RECORD_MS);
+    if (!server_api_url(url, sizeof(url), path)) {
+        ESP_LOGW(TAG, "[voice] cannot derive API base from '%s'", CONFIG_SENSOR_SERVER_URL);
+        return false;
+    }
+    voice_wav_header(header, (uint32_t)pcm_bytes);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = VOICE_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    task_http_common(client);        /* 可选 Bearer token，与其它板端接口一致 */
+
+    bool ok = false;
+    int total = (int)(VOICE_WAV_HEADER_BYTES + pcm_bytes);
+    if (esp_http_client_open(client, total) == ESP_OK) {
+        int written = esp_http_client_write(client, (const char *)header,
+                                            VOICE_WAV_HEADER_BYTES);
+        if (written == VOICE_WAV_HEADER_BYTES) {
+            size_t sent = 0;
+            while (sent < pcm_bytes) {
+                size_t chunk = pcm_bytes - sent;
+                if (chunk > 16384) {
+                    chunk = 16384;
+                }
+                int w = esp_http_client_write(client, (const char *)(pcm + sent), (int)chunk);
+                if (w <= 0) {
+                    break;
+                }
+                sent += (size_t)w;
+            }
+            if (sent == pcm_bytes) {
+                esp_http_client_fetch_headers(client);
+                status = esp_http_client_get_status_code(client);
+                ok = (status >= 200 && status < 300);
+                if (!ok) {
+                    char resp[256] = {0};
+                    esp_http_client_read_response(client, resp, sizeof(resp) - 1);
+                    ESP_LOGW(TAG, "[voice] upload rejected: http=%d body=%s",
+                             status, resp[0] ? resp : "-");
+                }
+            } else {
+                ESP_LOGW(TAG, "[voice] short write %u/%u B",
+                         (unsigned)sent, (unsigned)pcm_bytes);
+            }
+        } else {
+            ESP_LOGW(TAG, "[voice] header write failed: %d", written);
+        }
+        esp_http_client_close(client);
+    } else {
+        ESP_LOGW(TAG, "[voice] HTTP open failed: %s", url);
+    }
+    esp_http_client_cleanup(client);
+
+    if (status_out) {
+        *status_out = status;
+    }
+    return ok;
+}
+
+/* 板端生成 request_id：服务端用它做幂等键，重复上传同一段录音只记一行 */
+static void voice_make_request_id(char *out, size_t out_len)
+{
+    snprintf(out, out_len, "voice-%08" PRIx32 "-%08" PRIx32,
+             (uint32_t)(esp_timer_get_time() / 1000000ULL),
+             (uint32_t)esp_random());
+}
+
+/* 开机自检：真正打开一次麦克风读 16 ms，确认 I2S 数据通路可用。
+ * 只打印字节数与峰值，不保存音频；失败时明确告警但不阻塞启动。 */
+static void voice_mic_selftest(void)
+{
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate     = VOICE_SAMPLE_RATE_HZ,
+        .channel         = VOICE_CHANNELS,
+        .bits_per_sample = VOICE_BITS_PER_SAMPLE,
+    };
+    if (esp_codec_dev_open(s_voice_mic, &fs) != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "[voice] selftest: open failed");
+        return;
+    }
+    /* static：app_main 的任务栈只有 ~3.5 KB，512 B 的临时缓冲放 .bss 更稳 */
+    static uint8_t buf[512];
+    /* 注意：esp_codec_dev_read() 返回的是状态码（ESP_CODEC_DEV_OK = 0），不是字节数
+     * —— 数据接口内部把 i2s_channel_read() 的 bytes_read 丢掉了。成功即表示
+     * 请求的 512 B 已填满（i2s_channel_read 要么读满，要么超时返回错误）。 */
+    int ret = esp_codec_dev_read(s_voice_mic, buf, sizeof(buf));
+    esp_codec_dev_close(s_voice_mic);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "[voice] selftest: read failed (ret=%d)", ret);
+        return;
+    }
+    int got = (int)sizeof(buf);
+    int peak = 0;
+    for (int i = 0; i + 1 < got; i += 2) {
+        int16_t sample = (int16_t)(buf[i] | (buf[i + 1] << 8));
+        int magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > peak) {
+            peak = magnitude;
+        }
+    }
+    ESP_LOGI(TAG, "[voice] selftest: %d B read, peak=%d (16 kHz/16 bit mono)",
+             got, peak);
+}
+
+static void voice_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint8_t cmd = 0;
+        if (xQueueReceive(s_voice_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!s_voice_ready || !s_voice_pcm || !s_voice_mic) {
+            ESP_LOGW(TAG, "[voice] not ready (init failed), ignore");
+            s_voice_busy = false;
+            continue;
+        }
+
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            set_status_locked("Voice: rec 5s");
+            xSemaphoreGive(s_state_mutex);
+        }
+        refresh_ui();
+        ESP_LOGI(TAG, "[voice] recording %d ms (%d Hz/%d bit mono) ...",
+                 VOICE_RECORD_MS, VOICE_SAMPLE_RATE_HZ, VOICE_BITS_PER_SAMPLE);
+
+        int got = voice_record(s_voice_pcm, VOICE_PCM_BYTES);
+        if (got <= 0) {
+            ESP_LOGE(TAG, "[voice] recording failed (%d B)", got);
+            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                set_status_locked("Voice: mic error");
+                xSemaphoreGive(s_state_mutex);
+            }
+            refresh_ui();
+            s_voice_busy = false;
+            continue;
+        }
+
+        char request_id[40];
+        voice_make_request_id(request_id, sizeof(request_id));
+        int status = 0;
+        bool ok = voice_post_wav(s_voice_pcm, (size_t)got, request_id, &status);
+        ESP_LOGI(TAG, "[voice] %s %d B, http=%d, request_id=%s",
+                 ok ? "uploaded" : "upload failed", got, status, request_id);
+
+        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            set_status_locked(ok ? "Voice: sent" : "Voice: net error");
+            xSemaphoreGive(s_state_mutex);
+        }
+        refresh_ui();
+        s_voice_busy = false;
+        log_heap("after voice upload");
+    }
+}
+
+/* 按键回调：只投队列。iot_button 的回调任务栈很小，不能阻塞。 */
+static void voice_button_cb(void *arg, void *data)
+{
+    (void)arg;
+    (void)data;
+    if (!s_voice_queue || s_voice_busy) {
+        return;
+    }
+    uint8_t cmd = 1;
+    if (xQueueSend(s_voice_queue, &cmd, 0) != pdTRUE) {
+        return;
+    }
+    s_voice_busy = true;       /* 录音+上传期间再按无效，避免排队叠加 */
+}
+
+static void voice_module_init(void)
+{
+    /* 160 KB 缓冲放 PSRAM；PSRAM 不可用时退回内部 RAM（大概率失败，但要报得清楚） */
+    s_voice_pcm = heap_caps_malloc(VOICE_PCM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_voice_pcm) {
+        ESP_LOGW(TAG, "[voice] PSRAM alloc %d B failed, trying internal RAM",
+                 VOICE_PCM_BYTES);
+        s_voice_pcm = heap_caps_malloc(VOICE_PCM_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (!s_voice_pcm) {
+        ESP_LOGE(TAG, "[voice] no memory for %d B PCM buffer, voice disabled",
+                 VOICE_PCM_BYTES);
+        return;
+    }
+
+    if (voice_mic_init() != ESP_OK) {
+        ESP_LOGE(TAG, "[voice] microphone init failed, voice disabled");
+        heap_caps_free(s_voice_pcm);
+        s_voice_pcm = NULL;
+        return;
+    }
+    voice_mic_selftest();
+
+    s_voice_queue = xQueueCreate(1, sizeof(uint8_t));
+    if (!s_voice_queue) {
+        ESP_LOGE(TAG, "[voice] queue create failed");
+        heap_caps_free(s_voice_pcm);
+        s_voice_pcm = NULL;
+        return;
+    }
+    if (xTaskCreate(voice_task, "voice_task", VOICE_TASK_STACK, NULL,
+                    VOICE_TASK_PRIO, &s_voice_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "[voice] task create failed");
+        vQueueDelete(s_voice_queue);
+        s_voice_queue = NULL;
+        heap_caps_free(s_voice_pcm);
+        s_voice_pcm = NULL;
+        return;
+    }
+
+    /* BOOT 键（GPIO0）在 init_buttons() 里没被占用；这里单独注册单击 */
+    if (s_buttons[VOICE_BUTTON]) {
+        ESP_ERROR_CHECK(iot_button_register_cb(s_buttons[VOICE_BUTTON],
+                                               BUTTON_SINGLE_CLICK,
+                                               NULL,
+                                               voice_button_cb,
+                                               NULL));
+        ESP_LOGI(TAG, "[voice] ready: press BOOT (BSP_BUTTON_%d) to record %d ms,"
+                      " upload %s, %d B PSRAM buffer",
+                 (int)VOICE_BUTTON + 1, VOICE_RECORD_MS, VOICE_API_PATH, VOICE_PCM_BYTES);
+    } else {
+        ESP_LOGW(TAG, "[voice] BOOT button not available, recording disabled");
+    }
+    s_voice_ready = true;
+
+#if VOICE_BOOT_SELFTEST
+    /* 临时验证钩子：模拟按一次 BOOT（验证完把 VOICE_BOOT_SELFTEST 改回 0） */
+    if (s_voice_queue && !s_voice_busy) {
+        uint8_t cmd = 1;
+        if (xQueueSend(s_voice_queue, &cmd, 0) == pdTRUE) {
+            s_voice_busy = true;
+            ESP_LOGW(TAG, "[voice] boot selftest: record+upload once");
+        }
+    }
+#endif
+}
+
+/* ================================================================
  *  Main — Boot Sequence
  * ================================================================ */
 void app_main(void)
@@ -6786,6 +7192,12 @@ void app_main(void)
 
     /* 6. Buttons */
     init_buttons();
+
+    /* 6b. 板端语音（BOOT 键录音 → POST /api/v1/voice）。
+     *     用板载数字 I2S 麦克风，录音缓冲 160 KB 放 PSRAM；初始化失败只告警，
+     *     不影响采样/上传/任务/直播。放在 init_buttons() 之后：按键句柄要先建好。 */
+    voice_module_init();
+    log_heap("after voice_module_init");
 
     /* 7. Refresh UI once */
     refresh_ui();

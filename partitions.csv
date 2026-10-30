@@ -1,0 +1,13 @@
+# ESP32-S3-EYE（8 MB flash）分区表。
+#
+# 为什么不用 IDF 自带的 singleapp_large：那张表只给 app 0x177000（约 1.5 MB），
+# 本工程 LVGL + 摄像头 + 板端语音（esp_codec_dev/I2S）链接后是 0x17c9a0，
+# 直接超出 0x59a0。板子实际有 8 MB flash，没必要卡在 1.5 MB 上。
+#
+# nvs / phy_init 的偏移与 IDF 默认表一致，升级只改 factory 大小，
+# 原有 NVS 数据（WiFi 配网等）不受影响；`idf.py flash` 会一并写入新分区表。
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x600000,
