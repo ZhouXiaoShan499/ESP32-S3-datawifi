@@ -1,0 +1,16 @@
+# 视觉推理（第 8 周）运行与训练依赖
+#
+# 运行时只需要 numpy + Pillow（Anaconda 自带）和 torch（加载 TorchScript 模型）：
+#   pip install -r requirements-vision.txt
+#
+# 训练额外需要 torchvision（MobileNetV3-Small 的预训练权重 + 结构）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# 为什么运行时是 TorchScript 而不是 ONNX：见 docs/vision_week8.md「一·2」。
+# 本机环境里 onnx 与 numpy 2.4 的 ABI 不匹配（import onnx 直接段错误），
+# 而 TorchScript 不需要额外依赖；train/train_vision.py 仍会尝试导出 .onnx，
+# 成功时 server/vision/engine.py 会优先用 ONNX。
+torch>=2.0
+torchvision>=0.15
+numpy>=1.21
+Pillow>=9.0

@@ -73,4 +73,9 @@ __pycache__/
 
 
 # ---- 板端语音模型（约 42 MB，由 server/download_voice_model.py 下载）----
-server/models/
+server/models/*
+# 视觉推理模型（3.6 MB）直接进仓库：clone 下来就能推理，不必再下载一次。
+# 训练检查点（state_dict, 3.9 MB）只在复训时有意义，忽略；运行时用的是 .ts.pt。
+!server/models/vision/
+server/models/vision/*.pt
+!server/models/vision/*.ts.pt

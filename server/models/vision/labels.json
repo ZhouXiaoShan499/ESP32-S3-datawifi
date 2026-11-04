@@ -1,0 +1,33 @@
+{
+  "model_name": "vision-mnv3",
+  "model_version": "vision-mnv3-v1.2.0",
+  "labels": [
+    "clear",
+    "blocked",
+    "degraded"
+  ],
+  "scene_labels": [
+    "indoor",
+    "outdoor"
+  ],
+  "input_size": 224,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "thresholds": {
+    "ok": 0.75,
+    "low": 0.55
+  },
+  "runtime": {
+    "format": "torchscript",
+    "file": "vision-mnv3-v1.2.0.ts.pt"
+  },
+  "onnx": null
+}

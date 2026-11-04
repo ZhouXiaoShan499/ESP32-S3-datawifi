@@ -1,0 +1,245 @@
+{
+  "model_name": "vision-mnv3",
+  "model_version": "vision-mnv3-v1.2.0",
+  "created_at": "2026-11-04T09:41:03",
+  "runtime": {
+    "format": "torchscript",
+    "file": "vision-mnv3-v1.2.0.ts.pt",
+    "size_mb": 3.56
+  },
+  "onnx_export": "ModuleNotFoundError: No module named 'onnxscript'",
+  "labels": [
+    "clear",
+    "blocked",
+    "degraded"
+  ],
+  "scene_labels": [
+    "indoor",
+    "outdoor"
+  ],
+  "thresholds": {
+    "ok": 0.75,
+    "low": 0.55
+  },
+  "dataset": {
+    "source": "D:/Datasets/house/indoor_out/indoor_outdoor_set",
+    "base_images": {
+      "train": 800,
+      "val": 200,
+      "test": 200
+    },
+    "samples": {
+      "train": 4800,
+      "val": 1200,
+      "test": 1200
+    },
+    "synth": "退化样本在 __getitem__ 现场合成（blocked 4 种 / degraded 5 种 / clear 轻微抖动）"
+  },
+  "train": {
+    "epochs": 6,
+    "batch": 32,
+    "lr": 0.0003,
+    "pretrained": true,
+    "history": [
+      {
+        "epoch": 1,
+        "loss": 0.4437,
+        "train_acc": 0.9417,
+        "val_loss": 0.5486,
+        "val_acc": 0.9108,
+        "sec": 76.8
+      },
+      {
+        "epoch": 2,
+        "loss": 0.2853,
+        "train_acc": 0.9817,
+        "val_loss": 0.3413,
+        "val_acc": 0.9725,
+        "sec": 77.1
+      },
+      {
+        "epoch": 3,
+        "loss": 0.2343,
+        "train_acc": 0.9898,
+        "val_loss": 0.3162,
+        "val_acc": 0.9808,
+        "sec": 77.5
+      },
+      {
+        "epoch": 4,
+        "loss": 0.2118,
+        "train_acc": 0.9883,
+        "val_loss": 0.2576,
+        "val_acc": 0.9942,
+        "sec": 77.5
+      },
+      {
+        "epoch": 5,
+        "loss": 0.1899,
+        "train_acc": 0.9919,
+        "val_loss": 0.2502,
+        "val_acc": 0.995,
+        "sec": 77.6
+      },
+      {
+        "epoch": 6,
+        "loss": 0.1762,
+        "train_acc": 0.9917,
+        "val_loss": 0.2398,
+        "val_acc": 0.9942,
+        "sec": 77.0
+      }
+    ]
+  },
+  "metrics": {
+    "availability_acc": 1.0,
+    "per_class_recall": {
+      "clear": 1.0,
+      "blocked": 1.0,
+      "degraded": 1.0
+    },
+    "confusion": [
+      [
+        400,
+        0,
+        0
+      ],
+      [
+        0,
+        400,
+        0
+      ],
+      [
+        0,
+        0,
+        400
+      ]
+    ],
+    "clear_binary_acc": 1.0,
+    "clear_false_positive": 0,
+    "clear_false_negative": 0,
+    "scene_acc": 0.8113
+  },
+  "real_photos": [
+    {
+      "label": "degraded",
+      "score": 0.5102,
+      "scene": "outdoor",
+      "scene_score": 0.6377,
+      "probs": {
+        "clear": 0.4872,
+        "blocked": 0.0026,
+        "degraded": 0.5102
+      },
+      "file": "photos/esp32s3-eye-0001/21.jpg"
+    },
+    {
+      "label": "clear",
+      "score": 0.5578,
+      "scene": "outdoor",
+      "scene_score": 0.5998,
+      "probs": {
+        "clear": 0.5578,
+        "blocked": 0.0012,
+        "degraded": 0.441
+      },
+      "file": "photos/esp32s3-eye-0001/22.jpg"
+    },
+    {
+      "label": "clear",
+      "score": 0.5855,
+      "scene": "outdoor",
+      "scene_score": 0.7299,
+      "probs": {
+        "clear": 0.5855,
+        "blocked": 0.1804,
+        "degraded": 0.234
+      },
+      "file": "photos/esp32s3-eye-0001/24.jpg"
+    },
+    {
+      "label": "blocked",
+      "score": 0.7516,
+      "scene": "outdoor",
+      "scene_score": 0.5452,
+      "probs": {
+        "clear": 0.1956,
+        "blocked": 0.7516,
+        "degraded": 0.0528
+      },
+      "file": "photos/esp32s3-eye-0001/28.jpg"
+    },
+    {
+      "label": "clear",
+      "score": 0.977,
+      "scene": "outdoor",
+      "scene_score": 0.8541,
+      "probs": {
+        "clear": 0.977,
+        "blocked": 0.0018,
+        "degraded": 0.0212
+      },
+      "file": "photos/esp32s3-eye-0001/29.jpg"
+    },
+    {
+      "label": "clear",
+      "score": 0.5108,
+      "scene": "outdoor",
+      "scene_score": 0.6429,
+      "probs": {
+        "clear": 0.5108,
+        "blocked": 0.3238,
+        "degraded": 0.1654
+      },
+      "file": "photos/esp32s3-eye-0001/31.jpg"
+    },
+    {
+      "label": "degraded",
+      "score": 0.8888,
+      "scene": "indoor",
+      "scene_score": 0.6969,
+      "probs": {
+        "clear": 0.0739,
+        "blocked": 0.0374,
+        "degraded": 0.8888
+      },
+      "file": "photos/esp32s3-eye-0001/32.jpg"
+    },
+    {
+      "label": "degraded",
+      "score": 0.9862,
+      "scene": "indoor",
+      "scene_score": 0.6909,
+      "probs": {
+        "clear": 0.0095,
+        "blocked": 0.0043,
+        "degraded": 0.9862
+      },
+      "file": "photos/esp32s3-eye-0001/33.jpg"
+    },
+    {
+      "label": "clear",
+      "score": 0.5629,
+      "scene": "indoor",
+      "scene_score": 0.6257,
+      "probs": {
+        "clear": 0.5629,
+        "blocked": 0.0461,
+        "degraded": 0.391
+      },
+      "file": "photos/esp32s3-eye-0001/34.jpg"
+    },
+    {
+      "label": "degraded",
+      "score": 0.7694,
+      "scene": "outdoor",
+      "scene_score": 0.7739,
+      "probs": {
+        "clear": 0.1635,
+        "blocked": 0.0671,
+        "degraded": 0.7694
+      },
+      "file": "photos/esp32s3-eye-0001/35.jpg"
+    }
+  ]
+}
