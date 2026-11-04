@@ -51,6 +51,32 @@ jobs:
       - name: 真实网络端到端（e2e_server_check.py，自起 uvicorn 子进程）
         run: python server/e2e_server_check.py
 
+  # 视觉推理自测单独立一个 job：torch 有 200 MB 上下，塞进主 job 会让
+  # 「改个接口字段也要等 4 分钟装 torch」。这里只在真的需要时才付出这个代价。
+  vision-tests:
+    name: 视觉推理自测（torch CPU）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: server/requirements-vision.txt
+
+      - name: 安装依赖（torch 走 CPU 轮子，别拉 CUDA）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r server/requirements.txt
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch torchvision
+          python -m pip install numpy Pillow
+
+      # 模型（3.6 MB TorchScript）在仓库里，job 不需要任何下载或训练步骤。
+      - name: 推理 / 反馈 / 重拍闭环（test_vision.py）
+        run: python server/test_vision.py
+
   secret-scan:
     name: 机密扫描（gitleaks）
     runs-on: ubuntu-latest

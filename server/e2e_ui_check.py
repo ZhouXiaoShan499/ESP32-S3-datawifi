@@ -205,10 +205,38 @@ def field(dom, elem_id):
     return m.group(1).strip() if m else ""
 
 
+def inner_html(dom, elem_id):
+    """取出带指定 id 的元素的内层 HTML，**按标签嵌套深度配对**。
+
+    不能用 `<tag id=x>(.*?)</tag>` 那种非贪婪写法：一旦元素内部第一个子节点是
+    同名标签（照片卡片里第一个子节点从 <img> 变成 <div class="vision-badge">），
+    正则就会在子节点闭合处收尾，把后半个卡片切掉 —— 断言于是看到「没有尺寸信息」，
+    明明是页面正常、测试自己看漏了。
+    """
+    m = re.search(r'<(\w+)[^>]*\bid="%s"[^>]*>' % elem_id, dom)
+    if not m:
+        return ""
+    tag = m.group(1)
+    start = m.end()          # 内层内容的起点（固定不动）
+    scan = start             # 扫描游标（随每次命中前进）
+    depth = 1
+    pat = re.compile(r'<(/?)%s\b[^>]*>' % tag, re.I)
+    while True:
+        mm = pat.search(dom, scan)
+        if not mm:
+            return dom[start:]
+        if mm.group(1):                       # 闭合标签
+            depth -= 1
+            if depth == 0:
+                return dom[start:mm.start()]
+        else:
+            depth += 1
+        scan = mm.end()
+
+
 def any_text(dom, elem_id):
     """取出任意标签（span / p / td …）且带指定 id 的元素文本。"""
-    m = re.search(r'<(\w+)[^>]*id="%s"[^>]*>(.*?)</\1>' % elem_id, dom, re.S)
-    return m.group(2).strip() if m else ""
+    return inner_html(dom, elem_id).strip()
 
 
 def elem_class(dom, elem_id):
