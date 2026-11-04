@@ -19,6 +19,8 @@ Web 界面端到端自检（可选，需要本机已安装 Edge 或 Chrome 的�
     模拟板端领取并 POST /api/v1/photos 上传一帧 JPEG → 任务 completed 且详情带 photo、
     画廊出现缩略图/尺寸/删除按钮、任务卡片显示关联照片；DELETE 后画廊回到空态、计数归零
     （第七/八/九次 dump）
+  * 视觉推理：「视觉」tab 深链直达（/ui/#tab=vision）能渲染汇总条、四类样例按钮、
+    模型/后端信息行，并把那条照片列进结果表（第十次 dump）
 
   * 数据采集历史（第 12/13 次 dump）：#tab=history 列出 uploads 表每一批（批号 / 点数 /
     触发方式 / request_id / 来源），?upload=<批号> 深链展开该批的全部原始样本 + 波形 +
@@ -548,6 +550,26 @@ def main_run():
     check("task card links the photo",
           ("照片 #%d" % photo_id) in field(dom8, "taskUploadId"),
           field(dom8, "taskUploadId"))
+
+    # 17') 视觉 tab：照片入库就该有推理结果，页面必须把它渲染出来。
+    #      深链直达 + 首屏 noRefresh ⇒ 数据要等首轮轮询拿到设备后再补刷，
+    #      这里正好把那条时序也钉住（曾经停在「请先选择设备」不动）。
+    domv = dump_dom(browser, BASE + "/ui/#tab=vision")
+    summary = any_text(domv, "visionSummary")
+    check("vision tab activated", "active" in elem_class(domv, "panel-vision"),
+          elem_class(domv, "panel-vision"))
+    check("vision tab renders summary", "条结果" in summary, summary[:200])
+    check("vision bucket buttons present",
+          all(k in any_text(domv, "visionBuckets")
+              for k in ("正常", "低分", "错误", "未知")),
+          any_text(domv, "visionBuckets")[:200])
+    vinfo = any_text(domv, "visionInfo")
+    check("vision info line shows model and backend",
+          "模型" in vinfo and ("torchscript" in vinfo or "onnx" in vinfo), vinfo[:200])
+    vtable = any_text(domv, "visionTableWrap")
+    # 这张是合成图，模型可能解不出内容而拒识 —— 拒识同样是合法结论，
+    # 断言只要求「这一行被渲染出来」，不要求某个具体标签。
+    check("vision table lists the new photo", ("#%d" % photo_id) in vtable, vtable[:200])
 
     # 18) 删除：DELETE 后画廊回到空态、计数归零（服务端同时删库行与磁盘文件）
     st, body = delete_json("/api/v1/photos/%d" % photo_id)
