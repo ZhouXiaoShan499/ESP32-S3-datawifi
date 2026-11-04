@@ -180,6 +180,24 @@ python server\main.py
 接口返回 `asr_unavailable` 并提示缺什么，音频照样保存在 `server/data/voice/`。
 详见 [`docs/local_no_key_voice.md`](docs/local_no_key_voice.md)。
 
+### 视觉推理（照片能不能用，入库即判）
+
+模型（3.6 MB TorchScript）**已经在仓库里**，不需要下载；只缺运行时依赖：
+
+```powershell
+pip install -r server\requirements-vision.txt   # torch / torchvision / Pillow（CPU 版即可）
+python server\main.py
+```
+
+照片 `POST /api/v1/photos` 入库后立刻推理，结果写进 `vision_results`：
+`clear / blocked / degraded` 三分类 + 置信度，再按 0.75 / 0.55 两档折成
+**可用 / 把握不足 / 未知** 三档结论（拒识时不给标签）。网页「摄像头」画廊每张缩略图
+右上角有角标，「视觉」tab 能按 **正常 / 低分 / 错误 / 未知** 四类看样例、一键纠正、
+对不可用的画面直接下发重拍任务，并统计**高分误判率**。
+
+没装 torch 也能启动服务：`GET /api/v1/vision/status` 返回 `ready=false` 并说明缺什么，
+照片照常入库，其它功能不受影响。详见 [`docs/vision_week8.md`](docs/vision_week8.md)。
+
 ---
 
 ## 四、板端操作
@@ -391,4 +409,5 @@ python server/e2e_live_check.py    # 直播自检
 - **AI Agent（需求 · 修复 · 验证记录）** → `docs/ai_agent_work_log.md`
 - **语音任务助手（入口 · 状态 · 取消 · 验收）** → `docs/voice_assistant_ui.md`
 - **无 API Key 语音流程与麦克风权限排查** → `docs/local_no_key_voice.md`
+- **视觉推理与反馈闭环（第 8 周：遮挡/可用性判别 · 拒识 · 人工纠正 · 高分误判）** → `docs/vision_week8.md`
 - **崩溃修复、上传修复等工作记录** → `docs/`

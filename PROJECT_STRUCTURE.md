@@ -50,6 +50,7 @@ data_capture_sim/                  # 仓库根目录
 │   ├── static_ip_fallback_fix.md       # 静态 IP 兜底复盘：条件编译缺陷 + sdkconfig 回写陷阱
 │   ├── loop_trigger_callback.md        # 闭环事件：按键触发 → 本地反馈 → 远端显示 → 回应/取消
 │   ├── local_no_key_voice.md           # 无 API Key 使用流程与麦克风 not-allowed 排查
+│   ├── vision_week8.md                 # 视觉推理与反馈闭环（可用性/遮挡判别 · 拒识 · 人工纠正 · 高分误判）
 │   ├── camera_bad_frame_fix_work_log.md # 相机坏帧/拍照失败治理：一轮基线 → 定位改写 → 修复 → 一轮验证
 │   └── camera_frame_truncation_fix_work_log.md # 直播/预览帧尾部截断（下半幅灰带/中段撕裂）：根因 → 修复 → 验证
 │
@@ -69,6 +70,11 @@ data_capture_sim/                  # 仓库根目录
     ├── test_photos.py             # 拍照链路自测脚本（临时库 + 临时照片目录）
     ├── test_events.py             # 闭环事件自测脚本（临时库，23 项断言）
     ├── test_voice.py              # 板端语音自测脚本（合成音频 + mock 识别，不依赖 vosk）
+    ├── test_vision.py             # 视觉推理与反馈闭环自测（分档阈值 / 反馈幂等 / 重拍 / 降级）
+    ├── requirements-vision.txt    # 视觉推理依赖（torch 运行时 + torchvision 训练）
+    ├── vision/                    # 视觉推理包：engine（加载/预处理/推理）+ decision（分档口径）
+    ├── train/                     # 离线训练：vision_dataset（含退化合成）+ train_vision（训练/导出/报告）
+    ├── models/vision/             # 视觉模型产物（.ts.pt 进仓库，labels.json 是阈值唯一口径）
     ├── e2e_server_check.py        # 真实 HTTP 端到端自检脚本
     ├── e2e_ui_check.py            # 无头浏览器界面自检（可选，需本机 Edge/Chrome）
     ├── e2e_live_check.py          # 摄像头直播自检（HTTP + 可选无头页面断言）
