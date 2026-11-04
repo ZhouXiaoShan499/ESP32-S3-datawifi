@@ -371,7 +371,7 @@ _initialized = False
 
 # _table_columns() 的白名单（见该函数 docstring）。
 _SQL_TABLES = ("uploads", "samples", "tasks", "device_control", "photos", "events",
-               "voice_notes")
+               "voice_notes", "vision_results", "vision_feedback")
 
 
 # ---------------------------------------------------------------------------
@@ -397,12 +397,54 @@ def _tune_conn(conn):
         print(f"[sensor-server] WAL/busy_timeout 设置失败（继续用默认日志模式）: {e}")
 
 
-def _connect():
-    os.makedirs(_DATA_DIR, exist_ok=True)
+# 「首次附加 WAL」的串行化锁，见 _connect()。
+_wal_attach_lock = threading.Lock()
+
+
+def _open_conn():
     conn = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_MS / 1000.0)
     conn.row_factory = sqlite3.Row
     _tune_conn(conn)
     return conn
+
+
+def _connect():
+    """打开一个连接；-wal 不存在时把「建连接 + 首次写」整段串行化。
+
+    WAL 的 -wal / -shm 是**随最后一个连接关闭而删除**的附属文件。库里一条连接都不剩
+    时，两个线程同时建连接、同时做第一个写事务，其中一个会拿到
+    `sqlite3.OperationalError: attempt to write a readonly database`（错误码 8 /
+    SQLITE_READONLY）。库文件和目录都可写，这纯粹是共享内存初始化的竞态 —— 实测在
+    Windows + SQLite 3.41 上必现，且只在「-wal 不存在」的那一瞬间出现。
+
+    关键是**锁必须包住 sqlite3.connect() 本身**：先连接再抢锁是不够的，抢先建出
+    -wal 的那个连接会让另一条「在 -wal 创建过程中完成 connect」的连接读到只读视图，
+    它后面的 BEGIN IMMEDIATE 照样报 readonly。所以这里在锁内完成「建连接 + 空写
+    事务」，空事务随后 rollback，不写任何数据；-wal 已存在时只多一次 os.path.exists，
+    热路径不退化。
+    """
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    if os.path.exists(DB_PATH + "-wal"):
+        return _open_conn()
+    with _wal_attach_lock:
+        conn = _open_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        except sqlite3.Error as e:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            # 这条连接可能拿到的是「只读视图」，直接交给调用方等于把隐患往后传；
+            # 关掉重开一条（此时 -wal 一般已被别的线程建好，快路径直接返回可用连接）。
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            print(f"[sensor-server] WAL 预附加失败，已换新连接: {e}")
+            return _open_conn()
+        return conn
 
 
 def _table_columns(conn, table):
@@ -645,6 +687,40 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_voice_created
                     ON voice_notes (created_at);
+                -- 视觉推理结果：一行 = 一张照片的**当前**结论（photo_id 一对一）。
+                -- 用 photos.id 当主键而不是自增 id，是为了让「输入 → 结果」天然可反查，
+                -- 也不会因为重跑推理而在同一张照片上堆出多条互相矛盾的历史。
+                -- label 在拒识时为空：模型说"不知道"时，宁可不给标签，也不硬答一个。
+                CREATE TABLE IF NOT EXISTS vision_results (
+                    photo_id      INTEGER PRIMARY KEY,   -- = photos.id
+                    device_id     TEXT NOT NULL,
+                    label         TEXT,                  -- clear/blocked/degraded；拒识时 NULL
+                    score         REAL,                  -- 该标签的 softmax 概率
+                    decision      TEXT NOT NULL,         -- ok/low/rejected
+                    scene_label   TEXT,                  -- indoor/outdoor；拒识/遮挡时 NULL
+                    scene_score   REAL,
+                    probabilities TEXT,                  -- JSON：三类概率全量留档
+                    model_name    TEXT,
+                    model_version TEXT,                  -- 换模型不影响旧行
+                    backend       TEXT,                  -- torchscript/onnx
+                    latency_ms    INTEGER,
+                    error         TEXT,                  -- 推理失败原因（照片本身仍有效）
+                    created_at    REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_vision_decision
+                    ON vision_results (device_id, decision, created_at);
+                CREATE INDEX IF NOT EXISTS idx_vision_created
+                    ON vision_results (created_at);
+                -- 人工反馈：一行 = 一张照片的最新人工判断（photo_id 唯一，UPSERT 覆盖）。
+                -- verdict=wrong 时 corrected_label 才是"正确答案"，这是算高分误判率的依据。
+                CREATE TABLE IF NOT EXISTS vision_feedback (
+                    photo_id        INTEGER PRIMARY KEY,   -- = photos.id
+                    verdict         TEXT NOT NULL,         -- correct/wrong/unknown
+                    corrected_label TEXT,                  -- clear/blocked/degraded
+                    note            TEXT,
+                    created_by      TEXT DEFAULT 'web',
+                    updated_at      REAL NOT NULL
+                );
                 """
             )
             _migrate_uploads_columns(conn)
@@ -1146,7 +1222,7 @@ def cleanup_expired_photos():
         conn.close()
 
 
-def store_photo(data):
+def _store_photo_row(data):
     """一个事务内写 photos 行 + 落盘 JPEG；带 request_id 时联动 camera 任务收尾。
 
     data 由 validate_photo_payload() 产出（含已读进内存的 jpeg 字节）。
@@ -1240,6 +1316,24 @@ def store_photo(data):
         raise
     finally:
         conn.close()
+
+
+def store_photo(data):
+    """photos 入库 + 立刻跑一次视觉推理。
+
+    推理失败**绝不影响照片入库**：训练好的模型、缺 onnxruntime、JPEG 解不开……
+    这些都不该让一次成功的采集在服务端变成一个 500。失败只写进
+    vision_results.error，页面照常显示"推理不可用"。
+
+    幂等命中（同一 request_id 第二次上传）不重复推理：那张图上一轮已经算过了。
+    """
+    photo_id, idempotent = _store_photo_row(data)
+    if not idempotent:
+        try:
+            analyze_photo(photo_id)
+        except Exception as e:                      # noqa: BLE001
+            print(f"[sensor-server] vision: photo {photo_id} 推理跳过: {e}")
+    return photo_id, idempotent
 
 
 # ---------------------------------------------------------------------------
@@ -1994,6 +2088,509 @@ def delete_photo(photo_id: str):
                  "photo_id": int(photo_id), "file_deleted": file_deleted,
                  "warning": warning, "photo": photo},
     )
+
+
+# ---------------------------------------------------------------------------
+# 视觉推理路由（第 8 周：把视觉结果变成可理解、可纠正、可统计的反馈）
+#
+#   POST /api/v1/vision/analyze                        补跑推理（单张 / 某设备最新一张）
+#   GET  /api/v1/vision/status                         模型就绪状态与阈值
+#   GET  /api/v1/vision/results                        结果列表（按 decision/label 过滤）
+#   GET  /api/v1/vision/results/{photo_id}             单张结果 + 人工反馈
+#   POST /api/v1/vision/results/{photo_id}/feedback    人工纠正（幂等 UPSERT）
+#   POST /api/v1/vision/recapture                      低分/遮挡 → 建 camera 任务重拍
+#   GET  /api/v1/vision/summary                        四类计数 + 混淆矩阵 + 高分误判率
+#
+# 设计口径（与 docs/vision_week8.md 一致）：
+#   · decision 只表示**置信档位**（ok/low/rejected），label 才是内容判断；
+#   · 拒识时 label 为空 —— 不确定就不硬答，这是"未知样例"的来源；
+#   · 人工反馈一张照片只保留最新一条（photo_id 唯一），历史判断不进库。
+# ---------------------------------------------------------------------------
+try:
+    from vision import DECISIONS as VISION_DECISIONS
+    from vision import engine as vision_engine
+    from vision.decision import describe as vision_describe
+except Exception as _vision_exc:                    # noqa: BLE001 - 缺依赖不该让服务起不来
+    VISION_DECISIONS = ("ok", "low", "rejected")
+    vision_engine = None
+    vision_describe = None
+    print(f"[sensor-server] 视觉推理不可用（主服务不受影响）: {_vision_exc}")
+
+VISION_VERDICTS = ("correct", "wrong", "unknown")
+VISION_LIST_LIMIT = 200
+PHOTO_ID_INT_RE = re.compile(r"^\d{1,12}$")
+
+
+def vision_policy():
+    """对外暴露的视觉策略（阈值 + 版本），页面和 /summary 共用一份口径。"""
+    if vision_engine is None:
+        return {"available": False, "reason": "vision 模块导入失败"}
+    st = vision_engine.status()
+    return {
+        "available": bool(st.get("ready")),
+        "enabled": st.get("enabled"),
+        "model_version": st.get("model_version"),
+        "labels": st.get("labels"),
+        "scene_labels": st.get("scene_labels"),
+        "thresholds": st.get("thresholds"),
+        "backend": st.get("backend"),
+        "reason": st.get("error") or st.get("reason"),
+    }
+
+
+def _vision_label_text(label):
+    return {"clear": "画面可用", "blocked": "镜头被遮挡",
+            "degraded": "画面不可用"}.get(label or "", label or "未知")
+
+
+def _vision_view(row, feedback=None):
+    """vision_results 行 → 对外结构（含一句人话与照片 URL）。"""
+    data = dict(row)
+    raw = data.pop("probabilities", None)
+    if raw:
+        try:
+            data["probabilities"] = json.loads(raw)
+        except (TypeError, ValueError):
+            data["probabilities"] = None
+    data["created_at_str"] = _fmt_time(data.get("created_at"))
+    data["label_text"] = _vision_label_text(data.get("label"))
+    data["score_pct"] = int(round((data.get("score") or 0) * 100))
+    data["photo_url"] = f"/api/v1/photos/{data.get('photo_id')}"
+    if vision_describe is not None:
+        try:
+            data["feedback"] = vision_describe(data.get("decision") or "rejected",
+                                               data.get("label"),
+                                               data.get("score") or 0.0)
+        except Exception:                           # noqa: BLE001
+            data["feedback"] = None
+    data["human"] = dict(feedback) if feedback is not None else None
+    return data
+
+
+def _vision_write_result(conn, photo_id, device_id, payload, error=None):
+    """把一次推理（或一次失败）落到 vision_results。同一张照片只留最新结论。"""
+    now = time.time()
+    probs = json.dumps(payload.get("probabilities") or {}, ensure_ascii=False) \
+        if payload else None
+    conn.execute(
+        "INSERT INTO vision_results (photo_id, device_id, label, score, decision,"
+        " scene_label, scene_score, probabilities, model_name, model_version,"
+        " backend, latency_ms, error, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(photo_id) DO UPDATE SET"
+        "  label=excluded.label, score=excluded.score, decision=excluded.decision,"
+        "  scene_label=excluded.scene_label, scene_score=excluded.scene_score,"
+        "  probabilities=excluded.probabilities, model_name=excluded.model_name,"
+        "  model_version=excluded.model_version, backend=excluded.backend,"
+        "  latency_ms=excluded.latency_ms, error=excluded.error,"
+        "  created_at=excluded.created_at",
+        (
+            photo_id, device_id,
+            payload.get("label") if payload else None,
+            payload.get("score") if payload else None,
+            payload.get("decision") if payload else "rejected",
+            payload.get("scene_label") if payload else None,
+            payload.get("scene_score") if payload else None,
+            probs,
+            payload.get("model_name") if payload else None,
+            payload.get("model_version") if payload else None,
+            payload.get("backend") if payload else None,
+            payload.get("latency_ms") if payload else None,
+            error,
+            now,
+        ),
+    )
+
+
+def analyze_photo(photo_id, jpeg=None):
+    """对一张已入库照片跑推理并落库；返回结果视图（失败也返回，error 非空）。
+
+    jpeg 为 None 时从磁盘读。调用方（store_photo）刚写完文件，直接传字节可以
+    省一次读盘，也避免"文件刚 replace 完、读到的却是旧 inode"这类边角问题。
+    """
+    conn = _connect()
+    try:
+        photo = conn.execute("SELECT * FROM photos WHERE id=?", (int(photo_id),)).fetchone()
+    finally:
+        conn.close()
+    if photo is None:
+        raise LookupError(f"unknown photo_id: {photo_id}")
+
+    payload, error = None, None
+    if vision_engine is None:
+        error = "vision 模块导入失败"
+    else:
+        try:
+            if jpeg is None:
+                with open(os.path.join(PHOTO_DIR, photo["path"]), "rb") as fh:
+                    jpeg = fh.read()
+            payload = vision_engine.predict(jpeg)
+        except Exception as e:                      # noqa: BLE001 - 任何失败都降级
+            error = f"{type(e).__name__}: {e}"
+
+    conn = _connect()
+    try:
+        _vision_write_result(conn, int(photo_id), photo["device_id"], payload, error)
+        conn.commit()
+        row = conn.execute("SELECT * FROM vision_results WHERE photo_id=?",
+                           (int(photo_id),)).fetchone()
+        fb = conn.execute("SELECT * FROM vision_feedback WHERE photo_id=?",
+                          (int(photo_id),)).fetchone()
+    finally:
+        conn.close()
+    return _vision_view(row, fb)
+
+
+@app.get("/api/v1/vision/status")
+def vision_status():
+    if vision_engine is None:
+        return JSONResponse(status_code=200,
+                            content={"code": "OK", "ok": True,
+                                     "ready": False, "reason": "vision 模块导入失败"})
+    st = vision_engine.status()
+    st["code"] = "OK"
+    st["ok"] = True
+    return JSONResponse(status_code=200, content=st)
+
+
+@app.post("/api/v1/vision/analyze")
+async def vision_analyze(request: Request):
+    """补跑一次推理。body: {"photo_id": 12} 或 {"device_id": "esp32s3-eye-0001"}。"""
+    body_raw, too_large = await _read_body_limited(request, MAX_JSON_BODY_BYTES)
+    if too_large is not None:
+        return too_large
+    try:
+        body = json.loads(body_raw.decode("utf-8")) if body_raw else {}
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "body must be an object"})
+
+    photo_id = body.get("photo_id")
+    device_id = (body.get("device_id") or "").strip()
+    if photo_id is None and not device_id:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "需要 photo_id 或 device_id"})
+
+    conn = _connect()
+    try:
+        if photo_id is None:
+            # 不指定照片时取该设备最新一张：这正是"重新采集后立刻复核"的用法
+            row = conn.execute(
+                "SELECT id FROM photos WHERE device_id=? ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return JSONResponse(status_code=404,
+                                    content={"code": "NOT_FOUND", "ok": False,
+                                             "error": f"设备 {device_id} 还没有照片"})
+            photo_id = row["id"]
+        else:
+            if not PHOTO_ID_INT_RE.match(str(photo_id)):
+                return JSONResponse(status_code=400,
+                                    content={"code": "INVALID", "ok": False,
+                                             "error": "invalid photo_id"})
+            photo_id = int(photo_id)
+    finally:
+        conn.close()
+
+    try:
+        result = await run_in_threadpool(analyze_photo, photo_id)
+    except LookupError as e:
+        return JSONResponse(status_code=404,
+                            content={"code": "NOT_FOUND", "ok": False, "error": str(e)})
+    return JSONResponse(status_code=200,
+                        content={"code": "OK", "ok": True, "result": result})
+
+
+@app.get("/api/v1/vision/results")
+def vision_results(request: Request):
+    device_id = (request.query_params.get("device_id") or "").strip()
+    decision = (request.query_params.get("decision") or "").strip()
+    label = (request.query_params.get("label") or "").strip()
+    try:
+        limit = int(request.query_params.get("limit") or 50)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "invalid 'limit'"})
+    if limit < 1 or limit > VISION_LIST_LIMIT:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": f"invalid 'limit' (expect 1-{VISION_LIST_LIMIT})"})
+    if decision and decision not in VISION_DECISIONS:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": f"unknown decision: {decision}"})
+
+    where, args = [], []
+    if device_id:
+        where.append("r.device_id=?")
+        args.append(device_id)
+    if decision:
+        where.append("r.decision=?")
+        args.append(decision)
+    if label:
+        where.append("r.label=?")
+        args.append(label)
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = _connect()
+    try:
+        # 与 photos 保持同一口径：过期照片的结论不该再出现在列表里
+        _expire_stale_photos(conn)
+        conn.commit()
+        rows = conn.execute(
+            "SELECT r.*, p.ts_ms, p.received_at, p.width, p.height, p.bytes"
+            " FROM vision_results r JOIN photos p ON p.id = r.photo_id"
+            + sql_where + " ORDER BY r.photo_id DESC LIMIT ?", args + [limit],
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM vision_results r JOIN photos p ON p.id = r.photo_id"
+            + sql_where, args).fetchone()[0]
+        fbs = {}
+        if rows:
+            ids = [r["photo_id"] for r in rows]
+            for fb in conn.execute(
+                    "SELECT * FROM vision_feedback WHERE photo_id IN (%s)"
+                    % ",".join("?" * len(ids)), ids):
+                fbs[fb["photo_id"]] = fb
+    finally:
+        conn.close()
+    return JSONResponse(status_code=200,
+                        content={"code": "OK", "ok": True, "count": len(rows),
+                                 "total": total, "policy": vision_policy(),
+                                 "results": [_vision_view(r, fbs.get(r["photo_id"]))
+                                             for r in rows]})
+
+
+@app.get("/api/v1/vision/results/{photo_id}")
+def vision_result_detail(photo_id: str):
+    if not PHOTO_ID_INT_RE.match(photo_id or ""):
+        return JSONResponse(status_code=404,
+                            content={"code": "NOT_FOUND", "ok": False,
+                                     "error": f"unknown photo id: {photo_id}"})
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM vision_results WHERE photo_id=?",
+                           (int(photo_id),)).fetchone()
+        fb = conn.execute("SELECT * FROM vision_feedback WHERE photo_id=?",
+                          (int(photo_id),)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return JSONResponse(status_code=404,
+                            content={"code": "NOT_FOUND", "ok": False,
+                                     "error": f"photo {photo_id} 还没有推理结果"})
+    return JSONResponse(status_code=200,
+                        content={"code": "OK", "ok": True,
+                                 "result": _vision_view(row, fb)})
+
+
+@app.post("/api/v1/vision/results/{photo_id}/feedback")
+async def vision_feedback(photo_id: str, request: Request):
+    """人工纠正。verdict: correct（模型对）/ wrong（模型错，必须给 corrected_label）
+    / unknown（人也判断不了）。同一张照片只保留最新一条。"""
+    if not PHOTO_ID_INT_RE.match(photo_id or ""):
+        return JSONResponse(status_code=404,
+                            content={"code": "NOT_FOUND", "ok": False,
+                                     "error": f"unknown photo id: {photo_id}"})
+    body_raw, too_large = await _read_body_limited(request, MAX_JSON_BODY_BYTES)
+    if too_large is not None:
+        return too_large
+    try:
+        body = json.loads(body_raw.decode("utf-8")) if body_raw else {}
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "body must be JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "body must be an object"})
+
+    verdict = (body.get("verdict") or "").strip()
+    if verdict not in VISION_VERDICTS:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": f"verdict 必须是 {list(VISION_VERDICTS)}"})
+    labels = (vision_policy().get("labels") or [])
+    corrected = body.get("corrected_label")
+    if corrected is not None:
+        corrected = str(corrected).strip() or None
+        if corrected and labels and corrected not in labels:
+            return JSONResponse(status_code=400,
+                                content={"code": "INVALID", "ok": False,
+                                         "error": f"unknown corrected_label: {corrected}"})
+    if verdict == "wrong" and not corrected:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "verdict=wrong 必须给 corrected_label"})
+    note = (body.get("note") or "")
+    note = note.strip()[:256] if isinstance(note, str) else None
+
+    pid = int(photo_id)
+    conn = _connect()
+    try:
+        if conn.execute("SELECT 1 FROM vision_results WHERE photo_id=?",
+                        (pid,)).fetchone() is None:
+            return JSONResponse(status_code=404,
+                                content={"code": "NOT_FOUND", "ok": False,
+                                         "error": f"photo {pid} 还没有推理结果"})
+        conn.execute(
+            "INSERT INTO vision_feedback (photo_id, verdict, corrected_label, note,"
+            " created_by, updated_at) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(photo_id) DO UPDATE SET"
+            "  verdict=excluded.verdict, corrected_label=excluded.corrected_label,"
+            "  note=excluded.note, updated_at=excluded.updated_at",
+            (pid, verdict, corrected, note, "web", time.time()),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM vision_results WHERE photo_id=?",
+                           (pid,)).fetchone()
+        fb = conn.execute("SELECT * FROM vision_feedback WHERE photo_id=?",
+                          (pid,)).fetchone()
+    finally:
+        conn.close()
+    return JSONResponse(status_code=200,
+                        content={"code": "OK", "ok": True,
+                                 "result": _vision_view(row, fb)})
+
+
+@app.post("/api/v1/vision/recapture")
+async def vision_recapture(request: Request):
+    """对一张不理想的照片发起重拍：建 kind=camera 任务，走的是同一条拍照链路。"""
+    body_raw, too_large = await _read_body_limited(request, MAX_JSON_BODY_BYTES)
+    if too_large is not None:
+        return too_large
+    try:
+        body = json.loads(body_raw.decode("utf-8")) if body_raw else {}
+    except Exception:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "body must be JSON"})
+    photo_id = (body or {}).get("photo_id")
+    if not PHOTO_ID_INT_RE.match(str(photo_id or "")):
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False,
+                                     "error": "invalid photo_id"})
+    conn = _connect()
+    try:
+        photo = conn.execute("SELECT * FROM photos WHERE id=?",
+                             (int(photo_id),)).fetchone()
+    finally:
+        conn.close()
+    if photo is None:
+        return JSONResponse(status_code=404,
+                            content={"code": "NOT_FOUND", "ok": False,
+                                     "error": f"unknown photo id: {photo_id}"})
+
+    ok, result = validate_task_request({"device_id": photo["device_id"],
+                                        "kind": "camera"})
+    if not ok:
+        return JSONResponse(status_code=400,
+                            content={"code": "INVALID", "ok": False, "error": result})
+    request_id = uuid.uuid4().hex
+    now = time.time()
+    conn = _connect()
+    try:
+        _expire_stale_tasks(conn, result["device_id"])
+        conn.execute(
+            "INSERT INTO tasks (request_id, device_id, source, unit, sample_rate_hz,"
+            " sample_count, trigger, kind, duration_s, status, created_at, expires_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (request_id, result["device_id"], result["source"], result["unit"],
+             result["sample_rate_hz"], result["sample_count"], "manual",
+             result["kind"], result["duration_s"], "submitted", now,
+             now + result["timeout_s"]))
+        conn.commit()
+        task = conn.execute("SELECT * FROM tasks WHERE request_id=?",
+                            (request_id,)).fetchone()
+    finally:
+        conn.close()
+    print(f"[sensor-server] vision: recapture for photo {photo_id} -> task {request_id}")
+    return JSONResponse(status_code=201,
+                        content={"code": "OK", "ok": True,
+                                 "photo_id": int(photo_id),
+                                 "task": _task_view(task)})
+
+
+@app.get("/api/v1/vision/summary")
+def vision_summary(request: Request):
+    """四类样例计数 + 混淆矩阵 + 高分误判率 —— 第 8 周结论就出在这里。"""
+    device_id = (request.query_params.get("device_id") or "").strip()
+    where, args = "", []
+    if device_id:
+        where, args = " WHERE r.device_id=?", [device_id]
+
+    conn = _connect()
+    try:
+        _expire_stale_photos(conn)
+        conn.commit()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM vision_results r JOIN photos p ON p.id=r.photo_id"
+            + where, args).fetchone()[0]
+        by_decision = {row["decision"]: row["n"] for row in conn.execute(
+            "SELECT r.decision, COUNT(*) AS n FROM vision_results r"
+            " JOIN photos p ON p.id=r.photo_id" + where + " GROUP BY r.decision", args)}
+        by_label = {row["label"] or "unknown": row["n"] for row in conn.execute(
+            "SELECT r.label, COUNT(*) AS n FROM vision_results r"
+            " JOIN photos p ON p.id=r.photo_id" + where + " GROUP BY r.label", args)}
+
+        # 人工反馈：verdict + 模型当时的 label/decision/score，一次查回来在内存里算
+        rows = conn.execute(
+            "SELECT r.photo_id, r.label, r.decision, r.score, f.verdict,"
+            " f.corrected_label FROM vision_results r"
+            " JOIN photos p ON p.id=r.photo_id"
+            " JOIN vision_feedback f ON f.photo_id=r.photo_id" + where, args).fetchall()
+    finally:
+        conn.close()
+
+    labels = (vision_policy().get("labels") or [])
+    reviewed = len(rows)
+    correct = sum(1 for r in rows if r["verdict"] == "correct")
+    wrong = sum(1 for r in rows if r["verdict"] == "wrong")
+    unsure = sum(1 for r in rows if r["verdict"] == "unknown")
+
+    # 高分误判率：只看 decision=ok（模型有把握）的那批，人工判错的比例。
+    # 这是"自信地错"的量化指标 —— 比整体准确率更能说明能不能直接信模型。
+    high = [r for r in rows if r["decision"] == "ok"]
+    high_wrong = sum(1 for r in high if r["verdict"] == "wrong")
+
+    confusion = {lab: {t: 0 for t in labels + ["unknown"]} for lab in labels + ["unknown"]}
+    for r in rows:
+        pred = r["label"] or "unknown"
+        if r["verdict"] == "correct":
+            truth = pred
+        elif r["verdict"] == "wrong":
+            truth = r["corrected_label"] or "unknown"
+        else:
+            truth = "unknown"
+        if pred not in confusion:
+            confusion[pred] = {}
+        confusion.setdefault(pred, {})
+        confusion[pred][truth] = confusion[pred].get(truth, 0) + 1
+
+    return JSONResponse(status_code=200, content={
+        "code": "OK", "ok": True, "device_id": device_id or None,
+        "policy": vision_policy(),
+        "total": total,
+        "by_decision": {d: by_decision.get(d, 0) for d in VISION_DECISIONS},
+        "by_label": by_label,
+        "review": {"reviewed": reviewed, "correct": correct, "wrong": wrong,
+                   "unknown": unsure,
+                   "accuracy": round(correct / reviewed, 4) if reviewed else None},
+        "high_confidence": {
+            "total": len(high), "wrong": high_wrong,
+            "wrong_rate": round(high_wrong / len(high), 4) if high else None,
+        },
+        "confusion": confusion,
+    })
 
 
 # ---------------------------------------------------------------------------
