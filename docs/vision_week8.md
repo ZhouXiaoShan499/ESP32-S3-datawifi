@@ -250,7 +250,9 @@ start_server.bat
 | `server/main.py` | 两张新表、`store_photo` 后挂推理、7 个接口、`vision_policy()` |
 | `server/static/index.html` / `app.js` | 第 8 个 tab、四类样例、纠正弹层、画廊角标 |
 | `server/test_vision.py` | 15 项断言（推理 / 反馈 / 闭环 / 降级） |
+| `server/e2e_ui_check.py` | 补一组「视觉」tab 断言（深链激活 / 汇总条 / 四类按钮 / 信息行 / 结果行） |
 | `server/requirements-vision.txt` | torch / torchvision / numpy / Pillow |
+| `.github/workflows/ci.yml` | 新增 `vision-tests` job（torch 走 CPU 轮子，模型在仓库里，不需要训练） |
 
 ---
 
