@@ -196,6 +196,12 @@ const $ = {
 const state = { busy: false, devices: [], current: '', lastPoints: [], unit: '',
                 eventRid: '' };
 
+// 视觉结果页的状态放这里（而不是挨着它的渲染函数）：poll() 在 663 行就第一次跑，
+// 深链直达「视觉」tab 时要在首轮轮询里补刷一次，那时代码还没走到文件后半段，
+// 声明放在后面会命中 TDZ。device 用来判断「设备变了才需要重拉」。
+const visionState = { filter: 'all', rows: [], summary: null, pendingId: null,
+                      device: '' };
+
 /* ------------------------------------------------------------------ *
  * 工具
  * ------------------------------------------------------------------ */
@@ -568,6 +574,13 @@ async function poll() {
       state.current = ids.length ? ids[0] : '';
     }
     rebuildSelect(devs);
+
+    // 深链直达「视觉」tab（#tab=vision）时，首轮轮询还在等设备列表，那时的
+    // refreshVision() 只能显示「请先选择设备」。设备到手后补刷一次；只在设备
+    // 变化时触发，所以不会每 800 ms 打一遍 /vision/summary。
+    if (activeTab === 'vision' && state.current && visionState.device !== state.current) {
+      refreshVision();
+    }
 
     // 3') 摄像头实时画面：主轮询里也顺手试一次（内部有 LIVE_POLL_MIN_MS 最小
     //     间隔 + busy 保护，与下面的独立定时器重复调用无副作用，还顺带覆盖了
@@ -1629,7 +1642,7 @@ async function deletePhoto(photoId) {
  *   unknown  decision=rejected（拒识，模型自己说不知道）
  * ==================================================================== */
 
-const visionState = { filter: 'all', rows: [], summary: null, pendingId: null };
+// visionState 声明在文件靠上处（poll 会在脚本求值完成前就引用它，见那里的注释）。
 
 const VISION_BUCKETS = [
   { key: 'all', name: '全部' },
@@ -1687,6 +1700,7 @@ async function refreshVision() {
   }
   visionState.rows = (data && data.results) || [];
   visionState.summary = summary || null;
+  visionState.device = state.current;      // poll 用它判断「设备变了才重拉」
   const policy = (data && data.policy) || (summary && summary.policy) || {};
   if (badge) {
     const ready = policy.available !== false;
