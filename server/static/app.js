@@ -32,6 +32,9 @@ const CHART_AXES = ['ax', 'ay', 'az'];
 const CHART_COLORS = { ax: '#cf222e', ay: '#1a7f37', az: '#2563eb' };
 /* 照片画廊：一次拉最近 N 张（对应 GET /api/v1/photos?limit=），点删除走 DELETE */
 const PHOTO_LIMIT = 12;
+/* 视觉推理结果：一次拉最近 N 条（GET /api/v1/vision/results?limit=），
+   与画廊共用 photo_id 对齐，所以上限不小于 PHOTO_LIMIT 才能给每张缩略图都配上角标 */
+const VISION_LIMIT = 50;
 /* 摄像头实时画面（直播）：板端长按 Button A 推流，服务端只在内存里保留最新一帧。
    本页用**独立节拍**（liveTickLoop）轮询 GET /api/v1/live：新帧一到就尽快换
    <img src>，不再被 800 ms 的主轮询拖带（板端约 250 ms/帧，见 main.c
@@ -1500,6 +1503,15 @@ async function refreshGallery() {
     return;
   }
   const list = (data && data.photos) || [];
+
+  // 视觉结果按 photo_id 与照片对齐（缩略图右上角角标）。推理没开、模型没装、接口
+  // 报错都只是「没有角标」，绝不能影响画廊本体 —— 照片才是用户来看的东西。
+  let vmap = {};
+  try {
+    const v = await apiGet('/api/v1/vision/results?device_id=' +
+                           encodeURIComponent(state.current) + '&limit=' + PHOTO_LIMIT);
+    for (const r of ((v && v.results) || [])) vmap[r.photo_id] = r;
+  } catch (e) { /* 静默降级 */ }
   if ($.photoInfo) {
     let info = '· ' + state.current + ' · 共 ' + (data.total ?? 0) +
       ' 张（显示最近 ' + list.length + ' 张）';
@@ -1522,13 +1534,13 @@ async function refreshGallery() {
     return;
   }
   const frag = document.createDocumentFragment();
-  for (const p of list) frag.appendChild(photoCard(p));
+  for (const p of list) frag.appendChild(photoCard(p, vmap[p.id]));
   grid.innerHTML = '';
   grid.appendChild(frag);
 }
 
-/** 单张照片卡片：缩略图（点击看原图）+ 元数据 + 原图/删除按钮 */
-function photoCard(p) {
+/** 单张照片卡片：缩略图（点击看原图）+ 元数据 + 原图/删除按钮；可选视觉角标 */
+function photoCard(p, vision) {
   const url = p.url || ('/api/v1/photos/' + p.id);
   const wrap = document.createElement('div');
   wrap.className = 'photo-card';
@@ -1540,6 +1552,14 @@ function photoCard(p) {
   img.alt = 'photo #' + p.id;
   img.title = '点击查看原图';
   img.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+
+  if (vision) {
+    const badge = document.createElement('div');
+    badge.className = 'vision-badge ' + visionBadgeClass(vision);
+    badge.textContent = visionBadgeText(vision);
+    badge.title = (vision.feedback && vision.feedback.text) || '';
+    wrap.appendChild(badge);
+  }
 
   const meta = document.createElement('div');
   meta.className = 'photo-meta';
@@ -1593,6 +1613,320 @@ async function deletePhoto(photoId) {
   refreshGallery();
 }
 
+/* ======================================================================
+ * 视觉推理（第 8 周）：照片 → 标签/分数/拒识 → 可理解反馈 → 人工纠正/重拍
+ *
+ * 数据来源：
+ *   GET  /api/v1/vision/results?device_id=&limit=   结果列表（含一句人话 feedback）
+ *   GET  /api/v1/vision/summary?device_id=          四类计数 / 混淆矩阵 / 高分误判率
+ *   POST /api/v1/vision/results/{id}/feedback       人工纠正（一张照片只留最新一条）
+ *   POST /api/v1/vision/recapture                   重拍（建 kind=camera 任务）
+ *
+ * 四类样例的口径（页面与 docs/vision_week8.md 必须一致）：
+ *   normal   decision=ok      模型有把握
+ *   low      decision=low     分数落在 0.55~0.75，提示建议重拍
+ *   wrong    人工 verdict=wrong（模型答错，正确答案在 corrected_label 里）
+ *   unknown  decision=rejected（拒识，模型自己说不知道）
+ * ==================================================================== */
+
+const visionState = { filter: 'all', rows: [], summary: null, pendingId: null };
+
+const VISION_BUCKETS = [
+  { key: 'all', name: '全部' },
+  { key: 'normal', name: '正常' },
+  { key: 'low', name: '低分' },
+  { key: 'wrong', name: '错误' },
+  { key: 'unknown', name: '未知' },
+];
+
+/** 角标配色：遮挡最红，其次低分，拒识灰，可用绿 */
+function visionBadgeClass(v) {
+  if (!v || v.decision === 'rejected') return 'rejected';
+  if (v.label === 'blocked') return 'blocked';
+  if (v.decision === 'low') return 'low';
+  return 'ok';
+}
+
+/** 角标文案：遮挡/不可用/可用 + 百分数；拒识只说「未知」，不给标签 */
+function visionBadgeText(v) {
+  if (!v) return '';
+  if (v.decision === 'rejected') return '未知';
+  const name = ({ clear: '可用', blocked: '遮挡', degraded: '不可用' })[v.label] || v.label || '?';
+  const pct = (v.score_pct != null) ? v.score_pct : Math.round((v.score || 0) * 100);
+  return name + ' ' + pct + '%';
+}
+
+/** 一条结果归到哪一类样例；wrong 优先（人工判错的即使分数高也算错误） */
+function visionBucketOf(r) {
+  if (r.human && r.human.verdict === 'wrong') return 'wrong';
+  if (r.decision === 'rejected') return 'unknown';
+  if (r.decision === 'low') return 'low';
+  return 'normal';
+}
+
+/** 拉一次结果 + 汇总，然后整块重画（数据量小，全量重画比局部增量更好维护） */
+async function refreshVision() {
+  const wrap = el('visionTableWrap');
+  const badge = el('visionBadge');
+  if (!state.current) {
+    if (wrap) wrap.innerHTML = '<div class="photo-empty">—（请先选择设备）</div>';
+    if (badge) { badge.className = 'badge off'; badge.textContent = '未选择设备'; }
+    return;
+  }
+  let data, summary;
+  try {
+    const q = '?device_id=' + encodeURIComponent(state.current) + '&limit=' + VISION_LIMIT;
+    [data, summary] = await Promise.all([
+      apiGet('/api/v1/vision/results' + q),
+      apiGet('/api/v1/vision/summary?device_id=' + encodeURIComponent(state.current)),
+    ]);
+  } catch (e) {
+    if (wrap) wrap.innerHTML = '<div class="photo-empty">—（视觉结果查询失败：' + e.message + '）</div>';
+    if (badge) { badge.className = 'badge off'; badge.textContent = '不可用'; }
+    return;
+  }
+  visionState.rows = (data && data.results) || [];
+  visionState.summary = summary || null;
+  const policy = (data && data.policy) || (summary && summary.policy) || {};
+  if (badge) {
+    const ready = policy.available !== false;
+    badge.className = 'badge ' + (ready ? 'ok' : 'off');
+    badge.textContent = ready
+      ? (visionState.rows.length + ' 条结果')
+      : '模型未就绪';
+  }
+  const info = el('visionInfo');
+  if (info) {
+    info.textContent = policy.available === false
+      ? '· 推理未启用：' + (policy.reason || '模型文件缺失')
+      : '· 模型 ' + (policy.model_version || '—') + ' · 后端 ' + (policy.backend || '—') +
+        ' · 版本随每次推理写入结果，换模型不影响旧行';
+  }
+  const th = policy.thresholds || {};
+  if (el('visionThOk')) el('visionThOk').textContent = th.ok ?? '0.75';
+  if (el('visionThLow')) el('visionThLow').textContent = th.low ?? '0.55';
+
+  renderVisionSummary(summary || {});
+  renderVisionBuckets();
+  renderVisionTable();
+}
+
+/** 汇总条：四类计数 + 人工复核准确率 + 高分误判率（第 8 周的核心结论） */
+function renderVisionSummary(s) {
+  const box = el('visionSummary');
+  if (!box) return;
+  if (!s || !s.total) {
+    box.innerHTML = '—（还没有推理结果：先在「摄像头」拍一张照片，入库后会自动推理）';
+    return;
+  }
+  const dec = s.by_decision || {};
+  const rev = s.review || {};
+  const high = s.high_confidence || {};
+  const pct = (x) => (x == null ? '—' : (x * 100).toFixed(1) + '%');
+  let html = '共 <b>' + s.total + '</b> 条结果：' +
+    '有把握 <b>' + (dec.ok || 0) + '</b> · ' +
+    '低分 <b>' + (dec.low || 0) + '</b> · ' +
+    '拒识/未知 <b>' + (dec.rejected || 0) + '</b>';
+  html += '<br>人工复核 <b>' + (rev.reviewed || 0) + '</b> 条：' +
+    '判对 ' + (rev.correct || 0) + ' · 判错 ' + (rev.wrong || 0) +
+    ' · 也判断不了 ' + (rev.unknown || 0) +
+    '（复核准确率 <b>' + pct(rev.accuracy) + '</b>）';
+  if (high && high.total) {
+    const cls = (high.wrong_rate || 0) > 0.1 ? 'warn' : '';
+    html += '<br><span class="' + cls + '">高分误判率 <b>' + pct(high.wrong_rate) +
+      '</b>（' + high.wrong + '/' + high.total + '，只统计模型给了 ok 档、人工判错的）</span>';
+  } else {
+    html += '<br><span class="warn">高分误判率 —（还没有「ok 档 + 人工复核」的样本）</span>';
+  }
+  box.innerHTML = html;
+}
+
+/** 四类样例切换条；计数来自汇总（不是当前这 50 条），避免翻页后数字跳变 */
+function renderVisionBuckets() {
+  const box = el('visionBuckets');
+  if (!box) return;
+  const s = visionState.summary || {};
+  const dec = s.by_decision || {};
+  const rev = s.review || {};
+  const counts = {
+    all: s.total || 0,
+    normal: dec.ok || 0,
+    low: dec.low || 0,
+    wrong: rev.wrong || 0,
+    unknown: dec.rejected || 0,
+  };
+  box.innerHTML = '';
+  for (const b of VISION_BUCKETS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'vision-bucket' + (visionState.filter === b.key ? ' active' : '');
+    btn.innerHTML = b.name + ' <b>' + (counts[b.key] || 0) + '</b>';
+    btn.addEventListener('click', () => {
+      visionState.filter = b.key;
+      renderVisionBuckets();
+      renderVisionTable();
+    });
+    box.appendChild(btn);
+  }
+}
+
+/** 结果表：缩略图 / 判定 / 场景 / 版本 / 人工反馈 / 操作 */
+function renderVisionTable() {
+  const wrap = el('visionTableWrap');
+  if (!wrap) return;
+  const rows = visionState.rows.filter((r) =>
+    visionState.filter === 'all' ? true : visionBucketOf(r) === visionState.filter);
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="photo-empty">—（这一类还没有样本）</div>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'vision-table';
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>照片</th><th>判定</th><th>场景</th><th>模型版本</th>' +
+    '<th>结论</th><th>人工反馈</th><th>操作</th></tr>';
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+
+    const tdImg = document.createElement('td');
+    const img = document.createElement('img');
+    img.src = r.photo_url;
+    img.alt = 'photo #' + r.photo_id;
+    img.title = '点击查看原图';
+    img.addEventListener('click', () => window.open(r.photo_url, '_blank', 'noopener'));
+    tdImg.appendChild(img);
+    tr.appendChild(tdImg);
+
+    const tdChip = document.createElement('td');
+    const chip = document.createElement('span');
+    chip.className = 'vision-chip ' + visionBadgeClass(r);
+    chip.textContent = visionBadgeText(r);
+    tdChip.appendChild(chip);
+    tdChip.appendChild(document.createTextNode(' #' + r.photo_id));
+    tr.appendChild(tdChip);
+
+    const tdScene = document.createElement('td');
+    tdScene.textContent = r.scene_label
+      ? ({ indoor: '室内', outdoor: '室外' })[r.scene_label] + ' ' +
+        Math.round((r.scene_score || 0) * 100) + '%'
+      : '—';
+    tr.appendChild(tdScene);
+
+    const tdVer = document.createElement('td');
+    tdVer.textContent = r.model_version || '—';
+    tr.appendChild(tdVer);
+
+    // 结论列用服务端返回的 feedback.text（前后端口径只此一份，页面不自己拼话术）
+    const tdText = document.createElement('td');
+    tdText.textContent = (r.feedback && r.feedback.text) || '—';
+    if (r.error) tdText.textContent = '推理失败：' + r.error;
+    tr.appendChild(tdText);
+
+    const tdHuman = document.createElement('td');
+    if (r.human && r.human.verdict) {
+      const v = ({ correct: '判对', wrong: '判错', unknown: '也判断不了' })[r.human.verdict] ||
+        r.human.verdict;
+      tdHuman.textContent = v + (r.human.corrected_label
+        ? '（应为 ' + r.human.corrected_label + '）' : '');
+      if (r.human.note) tdHuman.title = r.human.note;
+    } else {
+      tdHuman.textContent = '未复核';
+    }
+    tr.appendChild(tdHuman);
+
+    const tdAct = document.createElement('td');
+    const box = document.createElement('div');
+    box.className = 'vision-actions';
+    const btnFix = document.createElement('button');
+    btnFix.type = 'button';
+    btnFix.textContent = '纠正';
+    btnFix.addEventListener('click', () => openVisionFeedback(r));
+    const btnShot = document.createElement('button');
+    btnShot.type = 'button';
+    btnShot.textContent = '重新采集';
+    btnShot.title = '建一条 kind=camera 任务，板端拍完会自动重新推理';
+    btnShot.addEventListener('click', () => visionRecapture(r.photo_id));
+    box.appendChild(btnFix);
+    box.appendChild(btnShot);
+    tdAct.appendChild(box);
+    tr.appendChild(tdAct);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.innerHTML = '';
+  wrap.appendChild(table);
+}
+
+/** 重拍：复用采集任务的同一条链路（建任务 → 板端轮询领取 → 拍照上传 → 自动推理） */
+async function visionRecapture(photoId) {
+  if (!window.confirm('对照片 #' + photoId + ' 的判定结果发起重新采集？\n' +
+                      '会新建一条拍照任务，板端拍完上传后会自动跑一次推理。')) return;
+  try {
+    const res = await apiPost('/api/v1/vision/recapture', { photo_id: photoId });
+    const task = res && res.task;
+    renderStatus('已下发重拍任务 ' + (task ? shortRid(task.request_id) : '') +
+                 '（板端 ≤3 s 轮询领取）', 'info');
+    if (task && task.request_id) watchTask(task.request_id);
+    // 拍照要等板端，这里先刷一次让用户看到"任务已下发"，新结果由主轮询补上
+    setTimeout(() => { refreshVision(); refreshGallery(); }, 4000);
+  } catch (e) {
+    renderStatus('⚠ 重拍任务下发失败：' + e.message, 'error');
+  }
+}
+
+/** 打开人工纠正弹层 */
+function openVisionFeedback(r) {
+  visionState.pendingId = r.photo_id;
+  const modal = el('visionModal');
+  if (!modal) return;
+  const sub = el('visionModalSub');
+  if (sub) {
+    sub.textContent = '#' + r.photo_id + ' · 模型判定「' + visionBadgeText(r) +
+      '」· ' + (r.model_version || '—');
+  }
+  if (el('visionVerdict')) el('visionVerdict').value = r.human ? r.human.verdict : 'correct';
+  if (el('visionCorrected')) el('visionCorrected').value = (r.human && r.human.corrected_label) || '';
+  if (el('visionNote')) el('visionNote').value = (r.human && r.human.note) || '';
+  modal.classList.remove('hidden');
+}
+
+function closeVisionFeedback() {
+  const modal = el('visionModal');
+  if (modal) modal.classList.add('hidden');
+  visionState.pendingId = null;
+}
+
+/** 保存人工反馈：verdict=wrong 时后端强制要求 corrected_label（前端先挡一道，给更快的提示） */
+async function saveVisionFeedback() {
+  const pid = visionState.pendingId;
+  if (!pid) return;
+  const verdict = el('visionVerdict') ? el('visionVerdict').value : 'correct';
+  const corrected = el('visionCorrected') ? el('visionCorrected').value : '';
+  const note = el('visionNote') ? el('visionNote').value : '';
+  if (verdict === 'wrong' && !corrected) {
+    renderStatus('⚠ 判错时必须选一个正确答案（clear / blocked / degraded）', 'error');
+    return;
+  }
+  try {
+    await apiPost('/api/v1/vision/results/' + pid + '/feedback', {
+      verdict: verdict,
+      corrected_label: corrected || null,
+      note: note || null,
+    });
+    renderStatus('已记录对照片 #' + pid + ' 的人工判断：' +
+                 ({ correct: '判对', wrong: '判错', unknown: '也判断不了' })[verdict], 'info');
+    closeVisionFeedback();
+    await refreshVision();
+    refreshGallery();          // 角标不随人工判断变化，但保持两处数据同源
+  } catch (e) {
+    renderStatus('⚠ 保存人工反馈失败：' + e.message, 'error');
+  }
+}
+
 /** /api/v1/latest 现在带回 trigger / request_id，回填到数据卡片 */
 function renderTrace(latest) {
   const up = (latest && latest.upload) || {};
@@ -1611,6 +1945,21 @@ $.pauseBtn.addEventListener('click', () => pausePeriodic());
 $.resumeBtn.addEventListener('click', () => resumePeriodic());
 $.photoBtn.addEventListener('click', () => capturePhoto());
 $.previewBtn.addEventListener('click', () => togglePreview());
+
+// 视觉结果：人工纠正弹层的保存/取消。弹层元素在 index.html 里是常驻 DOM，
+// 所以这里可以一次性绑定；pendingId 为空的保存请求直接返回，不会打空接口。
+if (el('visionFeedbackSave')) {
+  el('visionFeedbackSave').addEventListener('click', () => saveVisionFeedback());
+}
+if (el('visionFeedbackCancel')) {
+  el('visionFeedbackCancel').addEventListener('click', () => closeVisionFeedback());
+}
+if (el('visionModal')) {
+  // 点遮罩关闭；点弹层内部不关（事件冒泡到 modal 才判定）
+  el('visionModal').addEventListener('click', (ev) => {
+    if (ev.target === el('visionModal')) closeVisionFeedback();
+  });
+}
 
 // 切换设备后回填该设备最近的任务、任务历史与对照区（等待 poll() 完成设备切换）
 $.deviceSel.addEventListener('change', () => {
@@ -3417,7 +3766,7 @@ initBoardVoice();
  *      同步代码只碰 DOM；所有刷新调用都发生在初始化之后或事件回调里。
  * ------------------------------------------------------------------ */
 
-const TABS = ['data', 'history', 'voice', 'task', 'control', 'camera', 'event'];
+const TABS = ['data', 'history', 'voice', 'task', 'control', 'camera', 'vision', 'event'];
 const TAB_KEY = 'imu_web_tab';    // localStorage：记住上次停留的分区，下次打开还停在那页
 let activeTab = 'data';
 
@@ -3464,6 +3813,8 @@ function refreshTab(id) {
   } else if (id === 'camera') {
     refreshLive();             // 直播最新一帧
     refreshGallery();          // 照片画廊
+  } else if (id === 'vision') {
+    refreshVision();           // 推理结果 + 四类样例 + 汇总
   } else if (id === 'event') {
     refreshEvents(true);       // 闭环事件卡片 + 流水表
   }

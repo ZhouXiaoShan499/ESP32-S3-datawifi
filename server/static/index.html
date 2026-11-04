@@ -250,6 +250,73 @@
     .voice-composer-buttons { min-width: 0; }
   }
   footer { color: var(--muted); font-size: var(--fs-xs); margin-top: 8px; }
+
+  /* ---------- 视觉推理（第 8 周） ---------- */
+  .vision-summary {
+    font-size: var(--fs-sm); color: var(--muted); line-height: 1.9;
+    padding: 8px 10px; background: #f6f8fa; border-radius: 6px; margin-bottom: 10px;
+  }
+  .vision-summary b { color: var(--text); }
+  .vision-summary .warn { color: #9a6700; }
+  .vision-buckets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .vision-bucket {
+    border: 1px solid var(--border); border-radius: 14px; background: #fff;
+    padding: 4px 12px; font-size: var(--fs-xs); color: var(--muted); cursor: pointer;
+  }
+  .vision-bucket.active { border-color: #0969da; color: #0969da; background: #ddf4ff; }
+  .vision-bucket b { color: var(--text); }
+  .vision-table-wrap { overflow-x: auto; }
+  .vision-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
+  .vision-table th, .vision-table td {
+    border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left;
+    vertical-align: middle; white-space: nowrap;
+  }
+  .vision-table th { color: var(--muted); font-weight: 500; }
+  .vision-table img {
+    width: 64px; height: 48px; object-fit: cover; border-radius: 4px;
+    border: 1px solid var(--border); cursor: zoom-in; display: block;
+  }
+  .vision-table .vision-actions { display: flex; gap: 6px; }
+  .vision-table .vision-actions button { padding: 2px 9px; font-size: var(--fs-xs); }
+  .vision-chip {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: var(--fs-xs); border: 1px solid transparent;
+  }
+  .vision-chip.ok { background: #dafbe1; color: #1a7f37; border-color: #aceebb; }
+  .vision-chip.low { background: #fff8c5; color: #9a6700; border-color: #eed888; }
+  .vision-chip.rejected { background: #eaeef2; color: #57606a; border-color: #d0d7de; }
+  .vision-chip.blocked { background: #ffebe9; color: #cf222e; border-color: #ffcecb; }
+  /* 画廊缩略图右上角的判定角标 */
+  .photo-card { position: relative; }
+  .photo-card .vision-badge {
+    position: absolute; top: 6px; right: 6px; padding: 2px 7px;
+    border-radius: 10px; font-size: var(--fs-xs); background: #57606a; color: #fff;
+    pointer-events: none;
+  }
+  .photo-card .vision-badge.ok { background: #1a7f37; }
+  .photo-card .vision-badge.low { background: #9a6700; }
+  .photo-card .vision-badge.rejected { background: #57606a; }
+  .photo-card .vision-badge.blocked { background: #cf222e; }
+  /* 人工纠正弹层 */
+  .vision-modal {
+    position: fixed; inset: 0; background: rgba(27, 31, 36, .45);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+  }
+  .vision-modal.hidden { display: none; }
+  .vision-modal-box {
+    background: #fff; border-radius: 8px; padding: 18px 20px; width: 360px;
+    max-width: calc(100vw - 32px); box-shadow: 0 8px 28px rgba(0, 0, 0, .18);
+  }
+  .vision-modal-box h3 { margin: 0 0 4px; font-size: var(--fs-md); }
+  .vision-modal-sub { margin: 0 0 12px; color: var(--muted); font-size: var(--fs-xs); }
+  .vision-field {
+    display: block; font-size: var(--fs-xs); color: var(--muted); margin-bottom: 10px;
+  }
+  .vision-field select, .vision-field input {
+    display: block; width: 100%; margin-top: 4px; padding: 5px 7px;
+    font-size: var(--fs-sm); border: 1px solid var(--border); border-radius: 5px;
+  }
+  .vision-modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -282,6 +349,8 @@
           aria-controls="panel-control" aria-selected="false">周期控制</button>
   <button id="tab-camera" class="tab" type="button" role="tab" data-tab="camera"
           aria-controls="panel-camera" aria-selected="false">摄像头</button>
+  <button id="tab-vision" class="tab" type="button" role="tab" data-tab="vision"
+          aria-controls="panel-vision" aria-selected="false">视觉结果</button>
   <button id="tab-event" class="tab" type="button" role="tab" data-tab="event"
           aria-controls="panel-event" aria-selected="false">事件闭环</button>
 </nav>
@@ -591,6 +660,70 @@
     任务卡片会显示原因而不是静默超时。
   </p>
 </section>
+
+</div>
+
+<!-- ===================== 分区：视觉结果（推理 → 可理解反馈） ===================== -->
+<div id="panel-vision" class="tab-panel" role="tabpanel" aria-labelledby="tab-vision">
+
+<section class="card">
+  <h2>视觉推理结果<span id="visionBadge" class="badge off">未启用</span>
+      <span id="visionInfo" class="poll-hint"></span></h2>
+
+  <div id="visionSummary" class="vision-summary">—（正在读取视觉结果…）</div>
+
+  <div id="visionBuckets" class="vision-buckets"></div>
+
+  <div id="visionTableWrap" class="vision-table-wrap">
+    <div class="photo-empty">—（还没有推理结果：先拍一张照片）</div>
+  </div>
+
+  <p class="hint">
+    每张照片入库后自动跑一次推理（<code>server/vision/</code>，MobileNetV3-Small 双头）：
+    <b>head A</b> 判画面可用性（<code>clear</code> / <code>blocked</code> / <code>degraded</code>，第 8 周的保底任务），
+    <b>head B</b> 判室内/室外（<code>indoor</code> / <code>outdoor</code>，拓展任务）。<br>
+    <b>decision 只表示把握</b>：<code>ok</code>（≥ <span id="visionThOk">0.75</span>）直接给标签；
+    <code>low</code>（<span id="visionThLow">0.55</span> ~ ok）提示"可能不清晰"；
+    低于 <code>low</code> 一律<b>拒识</b>——<code>label</code> 置空、显示「未知」，
+    模型不确定时不硬答，这是「未知样例」这一类的来源。<br>
+    <b>人工纠正</b>（<code>POST /api/v1/vision/results/{id}/feedback</code>）一张照片只保留最新一条，
+    <code>verdict=wrong</code> 必须给正确答案；<b>重新采集</b>（<code>POST /api/v1/vision/recapture</code>）
+    建一条普通的 <code>kind=camera</code> 任务，走的还是板端同一条拍照链路。<br>
+    汇总里的 <b>高分误判率</b> = 「模型给了 ok 档、人工却判错」的比例 —— 它比整体准确率更能说明
+    这个模型能不能直接信。
+  </p>
+</section>
+
+<!-- 人工纠正弹层：原生 DOM，不依赖 <dialog>（部分内核/离线环境行为不一致） -->
+<div id="visionModal" class="vision-modal hidden" role="dialog" aria-modal="true"
+     aria-labelledby="visionModalTitle">
+  <div class="vision-modal-box">
+    <h3 id="visionModalTitle">人工纠正</h3>
+    <p class="vision-modal-sub" id="visionModalSub">—</p>
+    <label class="vision-field">你的判断
+      <select id="visionVerdict">
+        <option value="correct">模型判对了</option>
+        <option value="wrong">模型判错了</option>
+        <option value="unknown">我也判断不了</option>
+      </select>
+    </label>
+    <label class="vision-field">正确答案（判错时必填）
+      <select id="visionCorrected">
+        <option value="">— 不指定 —</option>
+        <option value="clear">画面可用 clear</option>
+        <option value="blocked">镜头被遮挡 blocked</option>
+        <option value="degraded">画面不可用 degraded</option>
+      </select>
+    </label>
+    <label class="vision-field">备注（可选）
+      <input id="visionNote" type="text" maxlength="256" placeholder="例如：镜头贴着桌面，实际是全黑">
+    </label>
+    <div class="vision-modal-actions">
+      <button id="visionFeedbackSave" type="button" class="primary">保存</button>
+      <button id="visionFeedbackCancel" type="button">取消</button>
+    </div>
+  </div>
+</div>
 
 </div>
 
